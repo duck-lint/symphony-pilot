@@ -36,16 +36,27 @@ finally { [void][SymphonyPower]::SetThreadExecutionState(0x80000000) }
 
 _NOTIFY_SCRIPT = r"""
 $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
-Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
-$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$escape = { param($value) [System.Security.SecurityElement]::Escape([string]$value) }
-$title = & $escape $payload.title
-$message = & $escape $payload.message
-$launch = if ($payload.url) { & $escape $payload.url } else { '' }
-$xml.LoadXml("<toast launch='$launch'><visual><binding template='ToastGeneric'><text>$title</text><text>$message</text></binding></visual></toast>")
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier([string]$payload.app).Show($toast)
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+  $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+  $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+  $escape = { param($value) [System.Security.SecurityElement]::Escape([string]$value) }
+  $title = & $escape $payload.title
+  $message = & $escape $payload.message
+  $launch = if ($payload.url) { & $escape $payload.url } else { '' }
+  $xml.LoadXml("<toast launch='$launch'><visual><binding template='ToastGeneric'><text>$title</text><text>$message</text></binding></visual></toast>")
+  $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier([string]$payload.app).Show($toast)
+} catch {
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+  Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+  $icon = New-Object System.Windows.Forms.NotifyIcon
+  $icon.Icon = [System.Drawing.SystemIcons]::Information
+  $icon.Visible = $true
+  $icon.ShowBalloonTip(8000, [string]$payload.title, [string]$payload.message, [System.Windows.Forms.ToolTipIcon]::Info)
+  Start-Sleep -Seconds 8
+  $icon.Dispose()
+}
 """.strip()
 
 
