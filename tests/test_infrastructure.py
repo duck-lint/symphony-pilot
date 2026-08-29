@@ -84,6 +84,20 @@ class InfrastructureTests(unittest.TestCase):
                 self.assertEqual(project_control.status(profile), 0)
             self.assertEqual(output.getvalue().strip(), "WORKING ON #GH-7 — DO NOT SHUT DOWN")
 
+    def test_status_after_crash_releases_awake_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)),
+                                        prevent_host_sleep=True)
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            with mock.patch.object(project_control, "_managed_identity", return_value=None), \
+                    mock.patch.object(project_control, "release_awake_guard") as release:
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.status(profile), 0)
+            release.assert_called_once_with(profile)
+            self.assertIn("STOPPED — SAFE TO SHUT DOWN", output.getvalue())
+
     def test_profile_rejects_credential_key(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "bad.toml"
@@ -356,6 +370,30 @@ class InfrastructureTests(unittest.TestCase):
                 self.assertEqual(project_control.start(profile), 1)
             release.assert_called_once_with(profile)
 
+    def test_start_identity_capture_failure_kills_unmanaged_child_and_retains_guard_if_needed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
+            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
+            child.wait.side_effect = [subprocess.TimeoutExpired("symphony", 5),
+                                      subprocess.TimeoutExpired("symphony", 5)]
+            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+                    mock.patch.object(project_control, "active_issues", return_value=[]), \
+                    mock.patch.object(project_control, "establish_awake_guard"), \
+                    mock.patch.object(project_control, "release_awake_guard") as release, \
+                    mock.patch.object(project_control.subprocess, "Popen", return_value=child), \
+                    mock.patch.object(project_control, "capture", return_value=None):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.start(profile), 1)
+            child.terminate.assert_called_once_with()
+            child.kill.assert_called_once_with()
+            release.assert_not_called()
+            self.assertIn("awake guard was retained", output.getvalue())
+            self.assertFalse(project_control.state_paths(profile)[0].exists())
+
     def test_start_timeout_terminates_child_before_releasing_awake_guard(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -471,11 +509,29 @@ class InfrastructureTests(unittest.TestCase):
             self.assertNotIn("SECRET123", payload)
             self.assertNotIn("PRIVATESECRET", payload)
             self.assertNotIn("URLSECRET", payload)
+            self.assertNotIn("QUERYSECRET", payload)
             self.assertNotIn("pass@example.invalid", payload)
+            self.assertNotIn("FAKESECRET", payload)
             state = (profile.state_root / host_integration.NOTIFICATION_STATE).read_text()
             self.assertNotIn("ABC123", state)
             self.assertNotIn("PRIVATESECRET", state)
             self.assertNotIn("URLSECRET", state)
+            self.assertNotIn("QUERYSECRET", state)
+
+    def test_notification_redacts_complete_authorization_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)),
+                                        notifications_enabled=True, display_name="Demo")
+            message = ("Authorization: Basic FAKESECRET\n"
+                       "Authorization: Foo FAKESECRET\n"
+                       "X-Api-Key: FAKESECRET")
+            with mock.patch.object(host_integration.subprocess, "run",
+                                   return_value=mock.Mock(returncode=0)) as run:
+                self.assertTrue(host_integration.notify(profile, "infrastructure", 7, message))
+            payload = run.call_args.kwargs["input"]
+            self.assertNotIn("FAKESECRET", payload)
+            state = (profile.state_root / host_integration.NOTIFICATION_STATE).read_text()
+            self.assertNotIn("FAKESECRET", state)
 
     def test_notification_transition_can_reblock_after_resolution(self):
         with tempfile.TemporaryDirectory() as directory:

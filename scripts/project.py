@@ -99,6 +99,41 @@ def _write_process_state(profile, identity):
         json.dumps({"schema": "symphony-pilot-process/v1", "identity": identity},
                    sort_keys=True) + "\n", encoding="utf-8")
 
+
+def _terminate_unverified_child(child, profile):
+    """Bound cleanup for a just-created child whose /proc identity is unavailable."""
+    try:
+        child.terminate()
+    except (PermissionError, OSError):
+        pass
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            child.kill()
+        except (PermissionError, OSError):
+            pass
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            print("Cannot start Symphony: its process identity could not be verified "
+                  "and the child did not exit after terminate/kill; the awake guard "
+                  "was retained for operator attention.")
+            return False
+    except OSError:
+        if child.poll() is None:
+            print("Cannot start Symphony: its process identity could not be verified "
+                  "and child exit could not be confirmed; the awake guard was retained "
+                  "for operator attention.")
+            return False
+    if child.poll() is None:
+        print("Cannot start Symphony: its process identity could not be verified "
+              "and child exit could not be confirmed; the awake guard was retained "
+              "for operator attention.")
+        return False
+    release_awake_guard(profile)
+    return True
+
 def dashboard(profile):
     if not profile.dashboard_port:
         return None
@@ -190,10 +225,9 @@ def start(profile):
             log.close()
     identity = capture(child.pid)
     if identity is None:
-        child.terminate()
-        child.wait(timeout=5)
-        release_awake_guard(profile)
-        print("Cannot start Symphony: its process identity could not be verified.")
+        if _terminate_unverified_child(child, profile):
+            print("Cannot start Symphony: its process identity could not be verified; "
+                  "the child exited and the awake guard was released.")
         return 1
     _write_process_state(profile, identity)
     deadline = time.monotonic() + 30
@@ -309,6 +343,7 @@ def status(profile):
     running = identity is not None
     if not running:
         pid_path.unlink(missing_ok=True)
+        release_awake_guard(profile)
         print("STOPPED — SAFE TO SHUT DOWN")
         return 0
     view = runtime_state(profile) or dashboard(profile)

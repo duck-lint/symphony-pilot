@@ -151,10 +151,10 @@ def _safe_summary(message: str) -> str:
     value = re.sub(r"\b(?:sk|pk|api[_-]?key|access[_-]?token|client[_-]?secret)[-_:=][A-Za-z0-9_\-./]+",
                    "[REDACTED CREDENTIAL]", value, flags=re.I)
     value = re.sub(r"(https?://)([^/@\s]+):([^/@\s]+)@", r"\1[REDACTED]@", value, flags=re.I)
-    value = re.sub(r"([?&](?:token|access_token|api_key|key|secret|password)=[^&#\s]+)",
-                   r"\1".split("=")[0] + "=[REDACTED]", value, flags=re.I)
+    value = re.sub(r"([?&](?:token|access_token|api_key|key|secret|password)=)[^&#\s]+",
+                   r"\1[REDACTED]", value, flags=re.I)
     value = re.sub(r"\bBearer\s+[^\s]+", "Bearer [REDACTED]", value, flags=re.I)
-    value = re.sub(r"\b(?:Authorization|X-Api-Key)\s*:\s*[^\s]+",
+    value = re.sub(r"\b(?:Authorization|X-Api-Key)\s*:\s*[^\r\n]*",
                    "[REDACTED AUTHORIZATION]", value, flags=re.I)
     return " ".join(value.split())[:240]
 
