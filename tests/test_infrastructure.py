@@ -82,7 +82,7 @@ class InfrastructureTests(unittest.TestCase):
                         "retrying": [],
                     }), redirect_stdout(output):
                 self.assertEqual(project_control.status(profile), 0)
-            self.assertEqual(output.getvalue().strip(), "WORKING ON #GH-7 — DO NOT SHUT DOWN")
+            self.assertEqual(output.getvalue().strip(), "WORKING ON #GH-7 - DO NOT SHUT DOWN")
 
     def test_status_after_crash_releases_awake_guard(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -96,7 +96,7 @@ class InfrastructureTests(unittest.TestCase):
                 with redirect_stdout(output):
                     self.assertEqual(project_control.status(profile), 0)
             release.assert_called_once_with(profile)
-            self.assertIn("STOPPED — SAFE TO SHUT DOWN", output.getvalue())
+            self.assertIn("STOPPED - SAFE TO SHUT DOWN", output.getvalue())
 
     def test_profile_rejects_credential_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -279,7 +279,7 @@ class InfrastructureTests(unittest.TestCase):
                 output = StringIO()
                 with redirect_stdout(output):
                     self.assertEqual(project_control.finish(profile), 0)
-            self.assertIn("STOPPED — SAFE TO SHUT DOWN", output.getvalue())
+            self.assertIn("STOPPED - SAFE TO SHUT DOWN", output.getvalue())
 
     def test_finish_drains_running_and_retrying_before_stop(self):
         with tempfile.TemporaryDirectory() as directory:

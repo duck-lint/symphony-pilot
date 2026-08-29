@@ -77,7 +77,7 @@ def _stop_process(profile, identity):
     except ProcessLookupError:
         state_paths(profile)[0].unlink(missing_ok=True)
         release_awake_guard(profile)
-        print("Symphony stopped — SAFE TO SHUT DOWN")
+        print("Symphony stopped - SAFE TO SHUT DOWN")
         return 0
     except (PermissionError, OSError) as exc:
         print(f"Cannot stop Symphony safely: {exc}")
@@ -90,7 +90,7 @@ def _stop_process(profile, identity):
         return 130
     state_paths(profile)[0].unlink(missing_ok=True)
     release_awake_guard(profile)
-    print("Symphony stopped — SAFE TO SHUT DOWN")
+    print("Symphony stopped - SAFE TO SHUT DOWN")
     return 0
 
 
@@ -275,7 +275,7 @@ def stop(profile, force=False):
     pid_path, _ = state_paths(profile)
     if not pid_path.exists():
         release_awake_guard(profile)
-        print("Symphony is stopped — SAFE TO SHUT DOWN")
+        print("Symphony is stopped - SAFE TO SHUT DOWN")
         return 0
     state = read(pid_path)
     identity = state.get("identity") if state else None
@@ -288,7 +288,7 @@ def stop(profile, force=False):
             return 1
         pid_path.unlink(missing_ok=True)
         release_awake_guard(profile)
-        print("Symphony is stopped — SAFE TO SHUT DOWN")
+        print("Symphony is stopped - SAFE TO SHUT DOWN")
         return 0
     if not force:
         view = runtime_state(profile)
@@ -306,7 +306,7 @@ def finish(profile):
     pid = _safe_pid(profile)
     if pid is None:
         release_awake_guard(profile)
-        print("STOPPED — SAFE TO SHUT DOWN")
+        print("STOPPED - SAFE TO SHUT DOWN")
         return 0
     view = runtime_state(profile)
     if view is None:
@@ -344,7 +344,7 @@ def status(profile):
     if not running:
         pid_path.unlink(missing_ok=True)
         release_awake_guard(profile)
-        print("STOPPED — SAFE TO SHUT DOWN")
+        print("STOPPED - SAFE TO SHUT DOWN")
         return 0
     view = runtime_state(profile) or dashboard(profile)
     if isinstance(view, dict):
@@ -358,17 +358,17 @@ def status(profile):
             issue = (entries[0].get("issue_identifier") or entries[0].get("issue_number")
                      or entries[0].get("identifier") or issue)
         if blocked or "human" in state or "blocked" in state:
-            print(f"NEEDS YOU #{issue} — WORK SAFELY PAUSED")
+            print(f"NEEDS YOU #{issue} - WORK SAFELY PAUSED")
         elif running_entries or retrying_entries:
-            print(f"WORKING ON #{issue} — DO NOT SHUT DOWN")
+            print(f"WORKING ON #{issue} - DO NOT SHUT DOWN")
         elif "finish" in state or "drain" in state:
-            print(f"FINISHING #{issue} — DO NOT SHUT DOWN YET")
+            print(f"FINISHING #{issue} - DO NOT SHUT DOWN YET")
         elif "work" in state or "run" in state:
-            print(f"WORKING ON #{issue} — DO NOT SHUT DOWN")
+            print(f"WORKING ON #{issue} - DO NOT SHUT DOWN")
         else:
-            print("IDLE — SAFE TO STOP")
+            print("IDLE - SAFE TO STOP")
     else:
-        print("WORKING — DO NOT SHUT DOWN")
+        print("WORKING - DO NOT SHUT DOWN")
     return 0
 
 def test(profile):
