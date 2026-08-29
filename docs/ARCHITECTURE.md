@@ -1,5 +1,4 @@
 # Architecture
-# Architecture
 
 symphony-pilot is a reusable host-side control plane around the official
 OpenAI Symphony runtime. It does not contain target-project semantics.
@@ -25,9 +24,8 @@ profile. scripts/deploy.py copies reviewed runtime, policy, and the operator
 command into an atomic deployment directory and records source hashes in
 DEPLOYMENT.json. Windows-facing controls invoke
 <deployment>/scripts/project.py, so a source checkout cannot silently change a
-live deployment. The
-architect policy is generic; the issue body and target repository remain the
-authority for project work.
+live deployment. The architect policy is generic; the issue body and target
+repository remain the authority for project work.
 
 The host owns Git, recovery archives, toolchain discovery, publication
 preflight, credential isolation, host-awake inhibition, and best-effort generic
