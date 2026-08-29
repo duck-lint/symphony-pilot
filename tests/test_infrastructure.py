@@ -429,9 +429,7 @@ class InfrastructureTests(unittest.TestCase):
 
     def test_process_identity_binds_boot_and_start_time(self):
         with mock.patch.object(process_identity, "_boot_id", return_value="boot"), \
-                mock.patch.object(process_identity, "_start_time", return_value="start"), \
-                mock.patch.object(process_identity, "_proc_value", return_value="cmd"), \
-                mock.patch.object(process_identity.os, "readlink", return_value="/bin/test"):
+                mock.patch.object(process_identity, "_start_time", return_value="start"):
             identity = process_identity.capture(os.getpid())
         self.assertIsNotNone(identity)
         with mock.patch.object(process_identity, "capture", return_value=identity):

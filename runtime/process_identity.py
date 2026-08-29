@@ -1,9 +1,7 @@
 """PID identity checks for pilot-owned processes on Linux/WSL."""
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import pathlib
 from typing import Any
 
@@ -27,27 +25,15 @@ def _start_time(pid: int) -> str | None:
         return None
 
 
-def _proc_value(pid: int, name: str) -> str | None:
-    try:
-        return pathlib.Path(f"/proc/{pid}/{name}").read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-
-
 def capture(pid: int) -> dict[str, Any] | None:
     boot = _boot_id()
     start = _start_time(pid)
     if not boot or not start:
         return None
-    executable = None
-    try:
-        executable = os.readlink(f"/proc/{pid}/exe")
-    except OSError:
-        pass
-    cmdline = _proc_value(pid, "cmdline")
-    return {"pid": pid, "boot_id": boot, "start_time": start,
-            "executable": executable,
-            "cmdline_sha256": hashlib.sha256((cmdline or "").encode()).hexdigest()}
+    # The official Burrito launcher replaces itself with beam.smp. Executable
+    # and cmdline are therefore not stable across the initial exec boundary;
+    # boot ID plus kernel process start time are the managed identity.
+    return {"pid": pid, "boot_id": boot, "start_time": start}
 
 
 def matches(record: object) -> bool:
