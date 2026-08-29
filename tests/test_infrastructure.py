@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "runtime"))
 import prepare_workspace as pw
 sys.path.insert(0, str(ROOT / "scripts"))
 import project as project_control
+import host_integration
 
 def make_profile(root: pathlib.Path) -> pw.Profile:
     return pw.Profile("demo", "example/project", "git@example:project.git",
@@ -30,6 +31,9 @@ def git_repo(path: pathlib.Path) -> None:
     subprocess.run(["git", "commit", "-qm", "initial"], cwd=path, check=True)
 
 class InfrastructureTests(unittest.TestCase):
+    def profile_with(self, profile, **changes):
+        return profile.__class__(**{**profile.__dict__, **changes})
+
     def test_idle_stop_is_allowed_after_runtime_state_is_verified(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = make_profile(pathlib.Path(directory))
@@ -243,6 +247,107 @@ class InfrastructureTests(unittest.TestCase):
             "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
             text=True, capture_output=True, check=True)
         self.assertIn('"profile": "cleanroom"', result.stdout)
+
+    def test_finish_already_stopped_is_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            with mock.patch.object(project_control, "_safe_pid", return_value=None), \
+                    mock.patch.object(project_control, "release_awake_guard"):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.finish(profile), 0)
+            self.assertIn("STOPPED — SAFE TO SHUT DOWN", output.getvalue())
+
+    def test_finish_drains_running_and_retrying_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            states = [
+                {"running": [{"issue_identifier": "GH-7"}], "retrying": []},
+                {"running": [], "retrying": [{"issue_identifier": "GH-7"}]},
+                {"running": [], "retrying": []},
+            ]
+            with mock.patch.object(project_control, "_safe_pid", return_value=123), \
+                    mock.patch.object(project_control, "runtime_state", side_effect=states), \
+                    mock.patch.object(project_control, "stop", return_value=0) as stop, \
+                    mock.patch.object(project_control.time, "sleep"):
+                self.assertEqual(project_control.finish(profile), 0)
+            stop.assert_called_once_with(profile)
+
+    def test_finish_fails_closed_when_runtime_state_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            with mock.patch.object(project_control, "_safe_pid", return_value=123), \
+                    mock.patch.object(project_control, "runtime_state", return_value=None), \
+                    mock.patch.object(project_control, "stop") as stop:
+                self.assertEqual(project_control.finish(profile), 1)
+            stop.assert_not_called()
+
+    def test_finish_rejects_unexpected_second_issue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            with mock.patch.object(project_control, "_safe_pid", return_value=123), \
+                    mock.patch.object(project_control, "runtime_state", return_value={
+                        "running": [{"issue_identifier": "GH-7"}, {"issue_identifier": "GH-8"}],
+                        "retrying": []}), \
+                    mock.patch.object(project_control, "stop") as stop:
+                self.assertEqual(project_control.finish(profile), 1)
+            stop.assert_not_called()
+
+    def test_finish_allows_human_blocked_issue_without_active_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            with mock.patch.object(project_control, "_safe_pid", return_value=123), \
+                    mock.patch.object(project_control, "runtime_state", return_value={
+                        "blocked": [{"issue_identifier": "GH-7"}],
+                        "running": [], "retrying": []}), \
+                    mock.patch.object(project_control, "stop", return_value=0) as stop:
+                self.assertEqual(project_control.finish(profile), 0)
+            stop.assert_called_once_with(profile)
+
+    def test_awake_guard_is_optional_and_records_no_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            disabled = make_profile(root)
+            with mock.patch.object(host_integration.subprocess, "Popen") as popen:
+                host_integration.establish_awake_guard(disabled)
+                popen.assert_not_called()
+            enabled = self.profile_with(disabled, prevent_host_sleep=True)
+            fake = mock.Mock(pid=456)
+            with mock.patch.object(host_integration.subprocess, "Popen", return_value=fake) as popen, \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False):
+                host_integration.establish_awake_guard(enabled)
+            data = json.loads((enabled.state_root / host_integration.AWAKE_STATE).read_text())
+            self.assertEqual(data["pid"], 456)
+            self.assertNotIn("github", json.dumps(popen.call_args).lower())
+
+    def test_awake_guard_releases_on_stale_or_normal_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            profile.state_root.mkdir(parents=True)
+            path.write_text('{"pid": 456}\n', encoding="utf-8")
+            with mock.patch.object(host_integration, "_pid_alive", return_value=False):
+                host_integration.recover_awake_guard(profile)
+            self.assertFalse(path.exists())
+
+    def test_notification_deduplication_is_project_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), notifications_enabled=True,
+                                        display_name="Demo")
+            result = mock.Mock(returncode=0)
+            with mock.patch.object(host_integration.subprocess, "run", return_value=result) as run:
+                self.assertTrue(host_integration.notify(profile, "human", 7, "needs attention"))
+                self.assertFalse(host_integration.notify(profile, "human", 7, "needs attention"))
+            run.assert_called_once()
+            self.assertNotIn("secret", (profile.state_root / host_integration.NOTIFICATION_STATE).read_text())
+
+    def test_deployment_contains_operator_cli_and_host_backend(self):
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
+            "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
+            text=True, capture_output=True, check=True)
+        self.assertIn('"source_commit"', result.stdout)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

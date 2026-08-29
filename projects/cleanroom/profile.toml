@@ -17,3 +17,7 @@ max_retry_backoff_ms = 300000
 codex_model = "gpt-5.6-luna"
 codex_reasoning_effort = "high"
 toolchain = "rust"
+prevent_host_sleep = true
+notifications_enabled = true
+display_name = "CLEANROOM"
+notification_backend = "windows-toast"

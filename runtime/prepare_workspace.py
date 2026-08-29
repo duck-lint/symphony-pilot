@@ -58,6 +58,10 @@ class Profile:
     codex_reasoning_effort: str
     toolchain: str | None
     deployment_root: pathlib.Path | None
+    prevent_host_sleep: bool = False
+    notifications_enabled: bool = False
+    display_name: str = ""
+    notification_backend: str = "windows-toast"
 
 
 @dataclasses.dataclass
@@ -99,8 +103,8 @@ def load_profile(path: pathlib.Path) -> Profile:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
         raise PreparationError("profile", "profile slug is not a safe identifier")
     for key in ("repository", "git_remote", "workspace_root", "state_root", "log_root",
-                "secret_reference", "blocked_label"):
-        if any(character in str(raw[key]) for character in ("\n", "\r", "\0")):
+                "secret_reference", "blocked_label", "display_name", "notification_backend"):
+        if any(character in str(raw.get(key, "")) for character in ("\n", "\r", "\0")):
             raise PreparationError("profile", f"profile field {key} contains control characters")
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", str(raw["repository"])):
         raise PreparationError("profile", "repository must be an owner/name pair")
@@ -119,6 +123,10 @@ def load_profile(path: pathlib.Path) -> Profile:
         raise PreparationError("profile", "the pilot permits exactly one concurrent agent")
     if not raw["dispatch_labels"]:
         raise PreparationError("profile", "at least one dispatch label is required")
+    if not isinstance(raw.get("prevent_host_sleep", False), bool):
+        raise PreparationError("profile", "prevent_host_sleep must be boolean")
+    if not isinstance(raw.get("notifications_enabled", False), bool):
+        raise PreparationError("profile", "notifications_enabled must be boolean")
     return Profile(
         slug=slug,
         repository=str(raw["repository"]),
@@ -140,6 +148,10 @@ def load_profile(path: pathlib.Path) -> Profile:
         toolchain=str(raw["toolchain"]) if raw.get("toolchain") else None,
         deployment_root=(configured_path(str(raw["deployment_root"]))
                          if raw.get("deployment_root") else None),
+        prevent_host_sleep=bool(raw.get("prevent_host_sleep", False)),
+        notifications_enabled=bool(raw.get("notifications_enabled", False)),
+        display_name=str(raw.get("display_name", slug)),
+        notification_backend=str(raw.get("notification_backend", "windows-toast")),
     )
 
 

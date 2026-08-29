@@ -33,7 +33,7 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
                                   capture_output=True, check=True).stdout.strip()
     if dry_run:
         print(json.dumps({"profile": profile.slug, "install_root": str(target),
-                          "source_commit": source_commit, "files": 8}, sort_keys=True))
+                          "source_commit": source_commit, "files": 10}, sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
@@ -48,8 +48,11 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
             for asset in (target / "bin").iterdir():
                 if asset.is_file() and (asset.name.startswith("symphony-") or asset.name.endswith(".sha256")):
                     shutil.copy2(asset, stage / "bin" / asset.name)
-        for name in ("prepare_workspace.py", "after_run.py", "before_remove.py", "launch_codex.sh"):
+        for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
+                     "host_integration.py", "launch_codex.sh"):
             shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
+        (stage / "scripts").mkdir()
+        shutil.copy2(ROOT / "scripts" / "project.py", stage / "scripts" / "project.py")
         shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
         shutil.copy2(profile_path, stage / "profile.toml")
         (stage / "runtime/launch_codex.sh").chmod(0o755)
@@ -57,6 +60,7 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
         workflow.write_text(render(profile, target, stage / "workflow/architect_policy.md"), encoding="utf-8")
         manifest = {"schema": "symphony-pilot-deployment/v1", "profile": profile.slug,
                     "source_commit": source_commit,
+                    "operator_cli": "scripts/project.py",
                     "deployed_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "files": {str(path.relative_to(stage)): file_digest(path)
                               for path in stage.rglob("*") if path.is_file()}}

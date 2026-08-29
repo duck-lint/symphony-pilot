@@ -21,6 +21,10 @@
     "codex_model": {"type": "string"},
     "codex_reasoning_effort": {"type": "string"},
     "toolchain": {"type": ["string", "null"]},
-    "dashboard_port": {"type": "integer", "minimum": 1, "maximum": 65535}
+    "dashboard_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "prevent_host_sleep": {"type": "boolean"},
+    "notifications_enabled": {"type": "boolean"},
+    "display_name": {"type": "string"},
+    "notification_backend": {"type": "string", "enum": ["windows-toast"]}
   }
 }

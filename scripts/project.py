@@ -2,6 +2,7 @@
 """Operator-facing lifecycle controls for one Symphony project."""
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ import urllib.parse
 import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
+from host_integration import establish_awake_guard, release_awake_guard
 from prepare_workspace import github, load_profile, read_secret
 
 def state_paths(profile):
@@ -29,6 +31,47 @@ def pid_alive(pid):
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _safe_pid(profile):
+    pid_path, _ = state_paths(profile)
+    if not pid_path.exists():
+        return None
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid and pid_alive(pid) else None
+
+
+def _issue_id(entry):
+    if not isinstance(entry, dict):
+        return None
+    for key in ("issue_identifier", "issue_number", "identifier", "issue"):
+        value = entry.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _active_entries(view):
+    if not isinstance(view, dict):
+        return []
+    return list(view.get("running") or []) + list(view.get("retrying") or [])
+
+
+def _stop_process(profile, pid):
+    os.kill(pid, signal.SIGTERM)
+    try:
+        while pid_alive(pid):
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("Stop cancelled; Symphony remains running.")
+        return 130
+    state_paths(profile)[0].unlink(missing_ok=True)
+    release_awake_guard(profile)
+    print("Symphony stopped — SAFE TO SHUT DOWN")
+    return 0
 
 def dashboard(profile):
     if not profile.dashboard_port:
@@ -65,9 +108,14 @@ def start(profile):
     if pid_path.exists():
         try:
             old = int(pid_path.read_text().strip())
-        except ValueError:
+        except (OSError, ValueError):
             old = 0
         if old and pid_alive(old):
+            try:
+                establish_awake_guard(profile)
+            except RuntimeError as exc:
+                print(f"Cannot keep CLEANROOM awake: {exc}")
+                return 1
             print("Symphony is already running.")
             return 0
         pid_path.unlink(missing_ok=True)
@@ -83,6 +131,11 @@ def start(profile):
     workflow = root / "projects" / profile.slug / "WORKFLOW.md"
     if not workflow.exists():
         print(f"Deployment is missing its generated workflow: {workflow}")
+        return 1
+    try:
+        establish_awake_guard(profile)
+    except RuntimeError as exc:
+        print(f"Cannot start CLEANROOM: {exc}")
         return 1
     env = os.environ.copy()
     env["SYMPHONY_PILOT_GITHUB_TOKEN"] = token
@@ -105,6 +158,7 @@ def start(profile):
                                  start_new_session=True, close_fds=True)
     except OSError as exc:
         log.close()
+        release_awake_guard(profile)
         print(f"Cannot start Symphony: {exc}. Check the official binary and deployment.")
         return 1
     finally:
@@ -119,14 +173,17 @@ def start(profile):
         if child.poll() is not None:
             print("Symphony exited during startup. Review the project log.")
             pid_path.unlink(missing_ok=True)
+            release_awake_guard(profile)
             return 1
         time.sleep(0.5)
     print("Symphony started but its dashboard did not become reachable within 30 seconds.")
+    release_awake_guard(profile)
     return 1
 
 def stop(profile, force=False):
     pid_path, _ = state_paths(profile)
     if not pid_path.exists():
+        release_awake_guard(profile)
         print("Symphony is stopped — SAFE TO SHUT DOWN")
         return 0
     try:
@@ -135,6 +192,7 @@ def stop(profile, force=False):
         pid = 0
     if not pid or not pid_alive(pid):
         pid_path.unlink(missing_ok=True)
+        release_awake_guard(profile)
         print("Symphony is stopped — SAFE TO SHUT DOWN")
         return 0
     if not force:
@@ -145,16 +203,44 @@ def stop(profile, force=False):
         if view.get("running") or view.get("retrying"):
             print("Finish/drain must be performed before stopping active work.")
             return 2
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and pid_alive(pid):
-        time.sleep(0.5)
-    if pid_alive(pid):
-        print("Stop requested, but Symphony has not exited; no force kill was attempted.")
+    return _stop_process(profile, pid)
+
+
+def finish(profile):
+    """Drain one pilot issue, then perform the normal stop operation."""
+    pid = _safe_pid(profile)
+    if pid is None:
+        release_awake_guard(profile)
+        print("STOPPED — SAFE TO SHUT DOWN")
+        return 0
+    view = runtime_state(profile)
+    if view is None:
+        print("Cannot finish safely: authoritative Symphony runtime state is unavailable.")
         return 1
-    pid_path.unlink(missing_ok=True)
-    print("Symphony stopped — SAFE TO SHUT DOWN")
-    return 0
+    initial = {_issue_id(entry) for entry in _active_entries(view)} - {None}
+    if len(initial) > 1:
+        print("Cannot finish safely: more than one issue is active in the one-issue pilot.")
+        return 1
+    if initial:
+        print("CLEANROOM is finishing; current work will be allowed to finish before Symphony stops.")
+    try:
+        while True:
+            active = _active_entries(view)
+            current = {_issue_id(entry) for entry in active} - {None}
+            if len(current) > 1 or (initial and current and current != initial):
+                print("Cannot finish safely: a different or additional issue appeared while draining.")
+                return 1
+            if not active:
+                break
+            time.sleep(max(0.5, profile.poll_interval_ms / 1000))
+            view = runtime_state(profile)
+            if view is None:
+                print("Cannot finish safely: authoritative Symphony runtime state became unavailable.")
+                return 1
+    except KeyboardInterrupt:
+        print("Finish cancelled; Symphony and active work remain running.")
+        return 130
+    return stop(profile)
 
 def status(profile):
     pid_path, _ = state_paths(profile)
@@ -193,21 +279,41 @@ def status(profile):
     return 0
 
 def test(profile):
-    subprocess.run([sys.executable, str(ROOT / "scripts/validate_profile.py"),
-                    str(ROOT / "projects" / profile.slug / "profile.toml")], check=True)
-    subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
-                    "--profile", str(ROOT / "projects" / profile.slug / "profile.toml"), "--dry-run"], check=True)
+    root = install_root(profile)
+    manifest_path = root / "DEPLOYMENT.json"
+    required = [root / "profile.toml", manifest_path,
+                root / "scripts" / "project.py", root / "runtime" / "prepare_workspace.py",
+                root / "runtime" / "host_integration.py",
+                root / "projects" / profile.slug / "WORKFLOW.md"]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        print("Deployment validation failed; missing: " + ", ".join(missing))
+        return 1
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        cli_name = manifest.get("operator_cli")
+        if cli_name != "scripts/project.py":
+            raise ValueError("manifest operator_cli is not scripts/project.py")
+        expected = manifest.get("files", {}).get(cli_name)
+        actual = hashlib.sha256((root / cli_name).read_bytes()).hexdigest()
+        if expected != actual:
+            raise ValueError("deployed operator command does not match its manifest")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Deployment validation failed: {exc}")
+        return 1
+    print(f"Deployment validation passed for {profile.slug} at {root}")
     return 0
 
 def main():
     parser = argparse.ArgumentParser(description="symphony-pilot project lifecycle")
     parser.add_argument("--profile", default=str(ROOT / "projects/cleanroom/profile.toml"))
-    parser.add_argument("action", choices=("start", "stop", "stop-now", "status", "test"))
+    parser.add_argument("action", choices=("start", "status", "stop", "stop-now", "finish", "test"))
     args = parser.parse_args()
     profile = load_profile(pathlib.Path(args.profile))
     if args.action == "start": return start(profile)
     if args.action == "stop": return stop(profile)
     if args.action == "stop-now": return stop(profile, force=True)
+    if args.action == "finish": return finish(profile)
     if args.action == "status": return status(profile)
     return test(profile)
 
