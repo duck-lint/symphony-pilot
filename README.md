@@ -124,6 +124,8 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the trust boundary.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Operations](docs/OPERATIONS.md)
 - [Project onboarding](docs/PROJECT_ONBOARDING.md)
+- [Human onboarding contract](docs/HUMAN_ONBOARDING.md)
+- [Codex onboarding contract](docs/CODEX_ONBOARDING.md)
 - [Security](docs/SECURITY.md)
 - [Recovery](docs/RECOVERY.md)
 
