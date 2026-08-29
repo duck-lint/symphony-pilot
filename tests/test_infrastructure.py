@@ -331,6 +331,33 @@ class InfrastructureTests(unittest.TestCase):
                 host_integration.recover_awake_guard(profile)
             self.assertFalse(path.exists())
 
+    def test_start_failure_releases_awake_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
+            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+                    mock.patch.object(project_control, "active_issues", return_value=[]), \
+                    mock.patch.object(project_control, "establish_awake_guard"), \
+                    mock.patch.object(project_control, "release_awake_guard") as release, \
+                    mock.patch.object(project_control.subprocess, "Popen", side_effect=OSError("missing")):
+                self.assertEqual(project_control.start(profile), 1)
+            release.assert_called_once_with(profile)
+
+    def test_stop_releases_awake_guard_after_process_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)), prevent_host_sleep=True)
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text("123\n", encoding="ascii")
+            with mock.patch.object(project_control, "pid_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control, "runtime_state", return_value={
+                        "running": [], "retrying": []}), \
+                    mock.patch.object(project_control.os, "kill"), \
+                    mock.patch.object(project_control, "release_awake_guard") as release:
+                self.assertEqual(project_control.stop(profile), 0)
+            release.assert_called_once_with(profile)
+
     def test_notification_deduplication_is_project_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
