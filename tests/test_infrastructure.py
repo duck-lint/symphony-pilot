@@ -1,6 +1,7 @@
 """Focused infrastructure regression tests for the reusable pilot runtime."""
 from __future__ import annotations
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -12,15 +13,23 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 import prepare_workspace as pw
+import after_run
 sys.path.insert(0, str(ROOT / "scripts"))
 import project as project_control
 import host_integration
+import process_identity
 
 def make_profile(root: pathlib.Path) -> pw.Profile:
     return pw.Profile("demo", "example/project", "git@example:project.git",
         root / "work", root / "state", root / "logs", "github.token",
         ("symphony:auto",), "symphony:human", "demo", 4040, 1, 8, 5000,
         300000, "gpt-5.6-luna", "high", None, root / "deployment")
+
+
+def process_state(pid: int = 123) -> dict:
+    return {"schema": "symphony-pilot-process/v1", "identity": {
+        "pid": pid, "boot_id": "boot", "start_time": "start",
+        "executable": "/bin/symphony", "cmdline_sha256": "cmd"}}
 
 def git_repo(path: pathlib.Path) -> None:
     subprocess.run(["git", "init", "-q", "-b", "master"], cwd=path, check=True)
@@ -38,8 +47,8 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile = make_profile(pathlib.Path(directory))
             pid_path, _ = project_control.state_paths(profile)
-            pid_path.write_text("123\n", encoding="ascii")
-            with mock.patch.object(project_control, "pid_alive", side_effect=[True, False, False]), \
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            with mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
                     mock.patch.object(project_control, "runtime_state", return_value={
                         "running": [], "retrying": []}), \
                     mock.patch.object(project_control.os, "kill") as kill:
@@ -51,8 +60,8 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile = make_profile(pathlib.Path(directory))
             pid_path, _ = project_control.state_paths(profile)
-            pid_path.write_text("123\n", encoding="ascii")
-            with mock.patch.object(project_control, "pid_alive", return_value=True), \
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            with mock.patch.object(project_control, "_identity_alive", return_value=True), \
                     mock.patch.object(project_control, "runtime_state", return_value={
                         "running": [{"issue_identifier": "GH-7"}], "retrying": []}), \
                     mock.patch.object(project_control.os, "kill") as kill:
@@ -64,9 +73,9 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile = make_profile(pathlib.Path(directory))
             pid_path, _ = project_control.state_paths(profile)
-            pid_path.write_text("123\n", encoding="ascii")
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
             output = StringIO()
-            with mock.patch.object(project_control, "pid_alive", return_value=True), \
+            with mock.patch.object(project_control, "_identity_alive", return_value=True), \
                     mock.patch.object(project_control, "runtime_state", return_value={
                         "blocked": [],
                         "running": [{"issue_identifier": "GH-7"}],
@@ -313,8 +322,10 @@ class InfrastructureTests(unittest.TestCase):
                 popen.assert_not_called()
             enabled = self.profile_with(disabled, prevent_host_sleep=True)
             fake = mock.Mock(pid=456)
+            identity = {"pid": 456, "boot_id": "boot", "start_time": "start"}
             with mock.patch.object(host_integration.subprocess, "Popen", return_value=fake) as popen, \
-                    mock.patch.object(host_integration, "_pid_alive", return_value=False):
+                    mock.patch.object(host_integration, "capture", return_value=identity), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False):
                 host_integration.establish_awake_guard(enabled)
             data = json.loads((enabled.state_root / host_integration.AWAKE_STATE).read_text())
             self.assertEqual(data["pid"], 456)
@@ -326,8 +337,8 @@ class InfrastructureTests(unittest.TestCase):
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
             path = profile.state_root / host_integration.AWAKE_STATE
             profile.state_root.mkdir(parents=True)
-            path.write_text('{"pid": 456}\n', encoding="utf-8")
-            with mock.patch.object(host_integration, "_pid_alive", return_value=False):
+            path.write_text(json.dumps({"pid": 456, "identity": {"pid": 456}}) + "\n", encoding="utf-8")
+            with mock.patch.object(host_integration, "_identity_alive", return_value=False):
                 host_integration.recover_awake_guard(profile)
             self.assertFalse(path.exists())
 
@@ -345,18 +356,154 @@ class InfrastructureTests(unittest.TestCase):
                 self.assertEqual(project_control.start(profile), 1)
             release.assert_called_once_with(profile)
 
+    def test_start_timeout_terminates_child_before_releasing_awake_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
+            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
+            identity = process_state()["identity"]
+            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+                    mock.patch.object(project_control, "active_issues", return_value=[]), \
+                    mock.patch.object(project_control, "establish_awake_guard"), \
+                    mock.patch.object(project_control, "release_awake_guard") as release, \
+                    mock.patch.object(project_control.subprocess, "Popen", return_value=child), \
+                    mock.patch.object(project_control, "capture", return_value=identity), \
+                    mock.patch.object(project_control, "dashboard", return_value=None), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.time, "monotonic", side_effect=[0, 31, 0, 31]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.start(profile), 1)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            release.assert_called_once_with(profile)
+            self.assertFalse(project_control.state_paths(profile)[0].exists())
+
+    def test_start_timeout_retains_pid_and_awake_guard_if_child_survives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
+            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
+            identity = process_state()["identity"]
+            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+                    mock.patch.object(project_control, "active_issues", return_value=[]), \
+                    mock.patch.object(project_control, "establish_awake_guard"), \
+                    mock.patch.object(project_control, "release_awake_guard") as release, \
+                    mock.patch.object(project_control.subprocess, "Popen", return_value=child), \
+                    mock.patch.object(project_control, "capture", return_value=identity), \
+                    mock.patch.object(project_control, "dashboard", return_value=None), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control.time, "monotonic", side_effect=[0, 31, 0, 31]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.start(profile), 1)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            release.assert_not_called()
+            self.assertTrue(project_control.state_paths(profile)[0].exists())
+
     def test_stop_releases_awake_guard_after_process_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = self.profile_with(make_profile(pathlib.Path(directory)), prevent_host_sleep=True)
             pid_path, _ = project_control.state_paths(profile)
-            pid_path.write_text("123\n", encoding="ascii")
-            with mock.patch.object(project_control, "pid_alive", side_effect=[True, False]), \
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            with mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
                     mock.patch.object(project_control, "runtime_state", return_value={
                         "running": [], "retrying": []}), \
                     mock.patch.object(project_control.os, "kill"), \
                     mock.patch.object(project_control, "release_awake_guard") as release:
                 self.assertEqual(project_control.stop(profile), 0)
             release.assert_called_once_with(profile)
+
+    def test_recycled_symphony_pid_is_never_terminated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            with mock.patch.object(project_control, "_identity_alive", return_value=False), \
+                    mock.patch.object(project_control, "pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.stop(profile, force=True), 1)
+            kill.assert_not_called()
+            self.assertTrue(pid_path.exists())
+
+    def test_process_identity_binds_boot_and_start_time(self):
+        with mock.patch.object(process_identity, "_boot_id", return_value="boot"), \
+                mock.patch.object(process_identity, "_start_time", return_value="start"), \
+                mock.patch.object(process_identity, "_proc_value", return_value="cmd"), \
+                mock.patch.object(process_identity.os, "readlink", return_value="/bin/test"):
+            identity = process_identity.capture(os.getpid())
+        self.assertIsNotNone(identity)
+        with mock.patch.object(process_identity, "capture", return_value=identity):
+            self.assertTrue(process_identity.matches(identity))
+        altered = {**identity, "start_time": "different"}
+        with mock.patch.object(process_identity, "capture", return_value={**identity, "start_time": "other"}):
+            self.assertFalse(process_identity.matches(altered))
+
+    def test_recycled_awake_pid_is_never_terminated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            profile.state_root.mkdir(parents=True)
+            path.write_text(json.dumps({"pid": 456, "identity": process_state(456)["identity"]}) + "\n")
+            with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                host_integration.release_awake_guard(profile)
+            kill.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_notification_redacts_credential_shapes_and_urls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)),
+                                        notifications_enabled=True, display_name="Demo")
+            secret_text = (
+                "github_pat_ABC123 ghp_FAKE123 sk-proj-SECRET123 "
+                "https://user:pass@example.invalid/x?token=QUERYSECRET "
+                "-----BEGIN PRIVATE KEY-----\nPRIVATESECRET\n-----END PRIVATE KEY-----"
+            )
+            result = mock.Mock(returncode=0)
+            with mock.patch.object(host_integration.subprocess, "run", return_value=result) as run:
+                self.assertTrue(host_integration.notify(
+                    profile, "infrastructure", 7, secret_text,
+                    "https://user:pass@example.invalid/?api_key=URLSECRET",
+                    secret_text))
+            payload = run.call_args.kwargs["input"]
+            self.assertNotIn("ABC123", payload)
+            self.assertNotIn("FAKE123", payload)
+            self.assertNotIn("SECRET123", payload)
+            self.assertNotIn("PRIVATESECRET", payload)
+            self.assertNotIn("URLSECRET", payload)
+            self.assertNotIn("pass@example.invalid", payload)
+            state = (profile.state_root / host_integration.NOTIFICATION_STATE).read_text()
+            self.assertNotIn("ABC123", state)
+            self.assertNotIn("PRIVATESECRET", state)
+            self.assertNotIn("URLSECRET", state)
+
+    def test_notification_transition_can_reblock_after_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)),
+                                        notifications_enabled=True, display_name="Demo")
+            result = mock.Mock(returncode=0)
+            with mock.patch.object(host_integration.subprocess, "run", return_value=result) as run:
+                self.assertTrue(host_integration.notify(profile, "human", 7, "blocked", fingerprint="state-a"))
+                self.assertFalse(host_integration.notify(profile, "human", 7, "blocked", fingerprint="state-a"))
+                host_integration.clear_notification(profile, "human", 7)
+                self.assertTrue(host_integration.notify(profile, "human", 7, "blocked", fingerprint="state-a"))
+                self.assertTrue(host_integration.notify(profile, "human", 8, "blocked", fingerprint="state-a"))
+            self.assertEqual(run.call_count, 3)
+
+    def test_historical_infrastructure_does_not_classify_current_human_block(self):
+        body = ("### Human decision required\n- decide the semantic question\n"
+                "### Preserved history\n### Infrastructure blocker\n- detail: old provider failure\n")
+        self.assertFalse(after_run.is_infrastructure_blocker(body))
+
+    def test_current_infrastructure_detail_comes_only_from_active_blocker(self):
+        body = ("### Infrastructure blocker\n- class: provider\n"
+                "- detail: local provider unavailable\n"
+                "### Preserved history\n- detail: stale credential value\n")
+        self.assertTrue(after_run.is_infrastructure_blocker(body))
+        self.assertIn("local provider unavailable", after_run.infrastructure_message(body))
+        self.assertNotIn("stale credential", after_run.infrastructure_message(body))
 
     def test_notification_deduplication_is_project_scoped(self):
         with tempfile.TemporaryDirectory() as directory:

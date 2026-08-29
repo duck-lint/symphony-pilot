@@ -16,6 +16,7 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import establish_awake_guard, release_awake_guard
+from process_identity import capture, matches, read
 from prepare_workspace import github, load_profile, read_secret
 
 def state_paths(profile):
@@ -29,19 +30,28 @@ def pid_alive(pid):
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError):
         return False
 
 
-def _safe_pid(profile):
+def _identity_alive(identity):
+    return matches(identity)
+
+
+def _managed_identity(profile):
     pid_path, _ = state_paths(profile)
     if not pid_path.exists():
         return None
-    try:
-        pid = int(pid_path.read_text().strip())
-    except (OSError, ValueError):
+    state = read(pid_path)
+    identity = state.get("identity") if state else None
+    if not identity or not _identity_alive(identity):
         return None
-    return pid if pid and pid_alive(pid) else None
+    return identity
+
+
+def _safe_pid(profile):
+    identity = _managed_identity(profile)
+    return int(identity["pid"]) if identity else None
 
 
 def _issue_id(entry):
@@ -60,10 +70,20 @@ def _active_entries(view):
     return list(view.get("running") or []) + list(view.get("retrying") or [])
 
 
-def _stop_process(profile, pid):
-    os.kill(pid, signal.SIGTERM)
+def _stop_process(profile, identity):
+    pid = int(identity["pid"])
     try:
-        while pid_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        state_paths(profile)[0].unlink(missing_ok=True)
+        release_awake_guard(profile)
+        print("Symphony stopped — SAFE TO SHUT DOWN")
+        return 0
+    except (PermissionError, OSError) as exc:
+        print(f"Cannot stop Symphony safely: {exc}")
+        return 1
+    try:
+        while _identity_alive(identity):
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("Stop cancelled; Symphony remains running.")
@@ -72,6 +92,12 @@ def _stop_process(profile, pid):
     release_awake_guard(profile)
     print("Symphony stopped — SAFE TO SHUT DOWN")
     return 0
+
+
+def _write_process_state(profile, identity):
+    state_paths(profile)[0].write_text(
+        json.dumps({"schema": "symphony-pilot-process/v1", "identity": identity},
+                   sort_keys=True) + "\n", encoding="utf-8")
 
 def dashboard(profile):
     if not profile.dashboard_port:
@@ -106,11 +132,9 @@ def start(profile):
     token = read_secret(profile)
     pid_path, log_path = state_paths(profile)
     if pid_path.exists():
-        try:
-            old = int(pid_path.read_text().strip())
-        except (OSError, ValueError):
-            old = 0
-        if old and pid_alive(old):
+        identity = read(pid_path)
+        identity = identity.get("identity") if identity else None
+        if identity and _identity_alive(identity):
             try:
                 establish_awake_guard(profile)
             except RuntimeError as exc:
@@ -164,7 +188,14 @@ def start(profile):
     finally:
         if not log.closed:
             log.close()
-    pid_path.write_text(str(child.pid) + "\n", encoding="ascii")
+    identity = capture(child.pid)
+    if identity is None:
+        child.terminate()
+        child.wait(timeout=5)
+        release_awake_guard(profile)
+        print("Cannot start Symphony: its process identity could not be verified.")
+        return 1
+    _write_process_state(profile, identity)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if dashboard(profile) is not None:
@@ -176,8 +207,34 @@ def start(profile):
             release_awake_guard(profile)
             return 1
         time.sleep(0.5)
-    print("Symphony started but its dashboard did not become reachable within 30 seconds.")
+    print("Symphony dashboard did not become reachable within 30 seconds; requesting normal shutdown.")
+    if not _identity_alive(identity):
+        if pid_alive(int(identity["pid"])):
+            print("Startup identity could not be confirmed; PID and awake guard were retained for operator attention.")
+            return 1
+        pid_path.unlink(missing_ok=True)
+        release_awake_guard(profile)
+        print("Symphony exited during startup; awake guard released.")
+        return 1
+    try:
+        os.kill(int(identity["pid"]), signal.SIGTERM)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and _identity_alive(identity):
+            time.sleep(0.5)
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError) as exc:
+        print(f"Startup cleanup could not signal Symphony; PID and awake guard were retained: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("Startup cleanup cancelled; Symphony may still be running. PID and awake guard were retained.")
+        return 1
+    if _identity_alive(identity):
+        print("Startup failed; Symphony may still be running. PID and awake guard were retained for operator attention.")
+        return 1
+    pid_path.unlink(missing_ok=True)
     release_awake_guard(profile)
+    print("Symphony exited after startup timeout; awake guard released.")
     return 1
 
 def stop(profile, force=False):
@@ -186,11 +243,15 @@ def stop(profile, force=False):
         release_awake_guard(profile)
         print("Symphony is stopped — SAFE TO SHUT DOWN")
         return 0
-    try:
-        pid = int(pid_path.read_text().strip())
-    except ValueError:
-        pid = 0
-    if not pid or not pid_alive(pid):
+    state = read(pid_path)
+    identity = state.get("identity") if state else None
+    if not identity:
+        print("Cannot stop safely: managed Symphony identity is missing or stale; no process was terminated.")
+        return 1
+    if not _identity_alive(identity):
+        if pid_alive(int(identity["pid"])):
+            print("Cannot stop safely: managed Symphony PID identity is stale or reused; no process was terminated.")
+            return 1
         pid_path.unlink(missing_ok=True)
         release_awake_guard(profile)
         print("Symphony is stopped — SAFE TO SHUT DOWN")
@@ -203,7 +264,7 @@ def stop(profile, force=False):
         if view.get("running") or view.get("retrying"):
             print("Finish/drain must be performed before stopping active work.")
             return 2
-    return _stop_process(profile, pid)
+    return _stop_process(profile, identity)
 
 
 def finish(profile):
@@ -244,13 +305,10 @@ def finish(profile):
 
 def status(profile):
     pid_path, _ = state_paths(profile)
-    running = False
-    if pid_path.exists():
-        try:
-            running = pid_alive(int(pid_path.read_text().strip()))
-        except ValueError:
-            pass
+    identity = _managed_identity(profile)
+    running = identity is not None
     if not running:
+        pid_path.unlink(missing_ok=True)
         print("STOPPED — SAFE TO SHUT DOWN")
         return 0
     view = runtime_state(profile) or dashboard(profile)
@@ -283,7 +341,7 @@ def test(profile):
     manifest_path = root / "DEPLOYMENT.json"
     required = [root / "profile.toml", manifest_path,
                 root / "scripts" / "project.py", root / "runtime" / "prepare_workspace.py",
-                root / "runtime" / "host_integration.py",
+                root / "runtime" / "host_integration.py", root / "runtime" / "process_identity.py",
                 root / "projects" / profile.slug / "WORKFLOW.md"]
     missing = [str(path) for path in required if not path.exists()]
     if missing:

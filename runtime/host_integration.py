@@ -14,6 +14,7 @@ import subprocess
 import time
 from typing import Any
 
+from process_identity import capture, matches, read
 from prepare_workspace import Profile
 
 
@@ -65,12 +66,8 @@ def _state_path(profile: Profile, name: str) -> pathlib.Path:
     return profile.state_root / name
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
+def _identity_alive(identity: object) -> bool:
+    return matches(identity)
 
 
 def recover_awake_guard(profile: Profile) -> None:
@@ -78,13 +75,10 @@ def recover_awake_guard(profile: Profile) -> None:
     path = _state_path(profile, AWAKE_STATE)
     if not path.exists():
         return
-    try:
-        pid = int(json.loads(path.read_text(encoding="utf-8"))["pid"])
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    identity = read(path)
+    if not identity or not _identity_alive(identity.get("identity")):
         path.unlink(missing_ok=True)
         return
-    if not _pid_alive(pid):
-        path.unlink(missing_ok=True)
 
 
 def establish_awake_guard(profile: Profile) -> None:
@@ -103,8 +97,14 @@ def establish_awake_guard(profile: Profile) -> None:
         )
     except OSError as exc:
         raise RuntimeError(f"Windows host-awake backend unavailable: {exc}") from exc
+    identity = capture(helper.pid)
+    if identity is None:
+        helper.terminate()
+        helper.wait(timeout=5)
+        raise RuntimeError("Windows host-awake helper identity could not be verified")
     path.write_text(json.dumps({"schema": "symphony-pilot-host-awake/v1",
-                                "pid": helper.pid, "backend": "windows-execution-state"},
+                                "pid": helper.pid, "identity": identity,
+                                "backend": "windows-execution-state"},
                                sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -112,28 +112,78 @@ def release_awake_guard(profile: Profile) -> None:
     path = _state_path(profile, AWAKE_STATE)
     if not path.exists():
         return
-    try:
-        pid = int(json.loads(path.read_text(encoding="utf-8"))["pid"])
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    state = read(path)
+    if not state:
         path.unlink(missing_ok=True)
         return
-    if _pid_alive(pid):
+    identity = state.get("identity")
+    if not _identity_alive(identity):
+        # A reused PID is not our helper and must never be terminated.
+        path.unlink(missing_ok=True)
+        return
+    pid = int(identity["pid"])
+    if _identity_alive(identity):
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             pass
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _pid_alive(pid):
+        while time.monotonic() < deadline and _identity_alive(identity):
             time.sleep(0.05)
-    if not _pid_alive(pid):
+    if not _identity_alive(identity):
         path.unlink(missing_ok=True)
 
 
+def _safe_url(url: str | None, profile: Profile, issue: int) -> str:
+    expected = f"https://github.com/{profile.repository}/issues/{issue}"
+    return url if url == expected else expected
+
+
 def _safe_summary(message: str) -> str:
-    lowered = message.lower()
-    if any(secret in lowered for secret in ("token", "authorization", "bearer", "password")):
-        return "The pilot stopped because an infrastructure service needs attention."
-    return " ".join(message.split())[:240]
+    """Redact credential-shaped data without relying on English keywords."""
+    import re
+
+    value = str(message)
+    value = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+                   "[REDACTED PRIVATE KEY]", value, flags=re.I | re.S)
+    value = re.sub(r"(?:github_pat|gh[pousr]|xox[baprs])-?[A-Za-z0-9_\-]+",
+                   "[REDACTED CREDENTIAL]", value, flags=re.I)
+    value = re.sub(r"\b(?:sk|pk|api[_-]?key|access[_-]?token|client[_-]?secret)[-_:=][A-Za-z0-9_\-./]+",
+                   "[REDACTED CREDENTIAL]", value, flags=re.I)
+    value = re.sub(r"(https?://)([^/@\s]+):([^/@\s]+)@", r"\1[REDACTED]@", value, flags=re.I)
+    value = re.sub(r"([?&](?:token|access_token|api_key|key|secret|password)=[^&#\s]+)",
+                   r"\1".split("=")[0] + "=[REDACTED]", value, flags=re.I)
+    value = re.sub(r"\bBearer\s+[^\s]+", "Bearer [REDACTED]", value, flags=re.I)
+    value = re.sub(r"\b(?:Authorization|X-Api-Key)\s*:\s*[^\s]+",
+                   "[REDACTED AUTHORIZATION]", value, flags=re.I)
+    return " ".join(value.split())[:240]
+
+
+def _notification_key(event: str, issue: int) -> str:
+    return f"{event}:GH-{issue}"
+
+
+def _read_notification_state(path: pathlib.Path) -> dict[str, str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    import re
+    return {key: value for key, value in raw.items()
+            if isinstance(key, str) and re.fullmatch(r"(?:human|infrastructure|completed):GH-\d+", key)
+            and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)}
+
+
+def clear_notification(profile: Profile, event: str, issue: int) -> None:
+    path = _state_path(profile, NOTIFICATION_STATE)
+    state = _read_notification_state(path)
+    state.pop(_notification_key(event, issue), None)
+    if state:
+        path.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
 
 
 def notify(profile: Profile, event: str, issue: int, message: str,
@@ -141,13 +191,16 @@ def notify(profile: Profile, event: str, issue: int, message: str,
     """Best-effort, deduplicated notification; never changes project state."""
     if not profile.notifications_enabled or profile.notification_backend != "windows-toast":
         return False
-    fingerprint = fingerprint or f"{event}:GH-{issue}:{message}"
+    fingerprint = fingerprint or message
     path = _state_path(profile, NOTIFICATION_STATE)
-    try:
-        old = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (OSError, ValueError, TypeError):
-        old = {}
-    if old.get(event) == fingerprint:
+    old = _read_notification_state(path)
+    import hashlib
+    safe_message = _safe_summary(message)
+    safe_url = _safe_url(url, profile, issue)
+    state_key = _notification_key(event, issue)
+    active_fingerprint = hashlib.sha256(
+        (event + "\0" + str(issue) + "\0" + fingerprint).encode()).hexdigest()
+    if old.get(state_key) == active_fingerprint:
         return False
     titles = {
         "human": f"{profile.display_name} needs you",
@@ -157,8 +210,8 @@ def notify(profile: Profile, event: str, issue: int, message: str,
     payload: dict[str, Any] = {
         "app": profile.display_name or profile.slug,
         "title": titles.get(event, f"{profile.display_name} needs attention"),
-        "message": _safe_summary(message),
-        "url": url or f"https://github.com/{profile.repository}/issues/{issue}",
+        "message": safe_message,
+        "url": safe_url,
     }
     try:
         result = subprocess.run(
@@ -170,7 +223,7 @@ def notify(profile: Profile, event: str, issue: int, message: str,
         if result.returncode:
             print(f"symphony-pilot notification warning: backend exit {result.returncode}")
             return False
-        old[event] = fingerprint
+        old[state_key] = active_fingerprint
         path.write_text(json.dumps(old, sort_keys=True) + "\n", encoding="utf-8")
         return True
     except (OSError, subprocess.TimeoutExpired) as exc:

@@ -33,7 +33,7 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
                                   capture_output=True, check=True).stdout.strip()
     if dry_run:
         print(json.dumps({"profile": profile.slug, "install_root": str(target),
-                          "source_commit": source_commit, "files": 10}, sort_keys=True))
+                          "source_commit": source_commit, "files": 11}, sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
@@ -49,7 +49,7 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
                 if asset.is_file() and (asset.name.startswith("symphony-") or asset.name.endswith(".sha256")):
                     shutil.copy2(asset, stage / "bin" / asset.name)
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
-                     "host_integration.py", "launch_codex.sh"):
+                     "host_integration.py", "process_identity.py", "launch_codex.sh"):
             shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
         (stage / "scripts").mkdir()
         shutil.copy2(ROOT / "scripts" / "project.py", stage / "scripts" / "project.py")
