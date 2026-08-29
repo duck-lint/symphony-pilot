@@ -6,9 +6,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 import prepare_workspace as pw
+sys.path.insert(0, str(ROOT / "scripts"))
+import project as project_control
 
 def make_profile(root: pathlib.Path) -> pw.Profile:
     return pw.Profile("demo", "example/project", "git@example:project.git",
@@ -25,6 +28,32 @@ def git_repo(path: pathlib.Path) -> None:
     subprocess.run(["git", "commit", "-qm", "initial"], cwd=path, check=True)
 
 class InfrastructureTests(unittest.TestCase):
+    def test_idle_stop_is_allowed_after_runtime_state_is_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text("123\n", encoding="ascii")
+            with mock.patch.object(project_control, "pid_alive", side_effect=[True, False, False]), \
+                    mock.patch.object(project_control, "runtime_state", return_value={
+                        "running": [], "retrying": []}), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.stop(profile), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            self.assertFalse(pid_path.exists())
+
+    def test_active_stop_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text("123\n", encoding="ascii")
+            with mock.patch.object(project_control, "pid_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state", return_value={
+                        "running": [{"issue_identifier": "GH-7"}], "retrying": []}), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.stop(profile), 2)
+            kill.assert_not_called()
+            self.assertTrue(pid_path.exists())
+
     def test_profile_rejects_credential_key(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "bad.toml"

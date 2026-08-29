@@ -43,6 +43,17 @@ def dashboard(profile):
     except (urllib.error.URLError, TimeoutError, ValueError):
         return None
 
+def runtime_state(profile):
+    if not profile.dashboard_port:
+        return None
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{profile.dashboard_port}/api/v1/state", timeout=2
+        ) as response:
+            return json.loads(response.read())
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return None
+
 def active_issues(profile, token):
     issues = github(profile, token, "GET", "/issues?state=open&labels=" +
                     urllib.parse.quote(",".join(profile.dispatch_labels)) + "&per_page=100")
@@ -127,8 +138,13 @@ def stop(profile, force=False):
         print("Symphony is stopped — SAFE TO SHUT DOWN")
         return 0
     if not force:
-        print("Finish/drain must be performed by the official Symphony lifecycle before stopping.")
-        return 2
+        view = runtime_state(profile)
+        if view is None:
+            print("Cannot verify Symphony activity; the process was not stopped.")
+            return 1
+        if view.get("running") or view.get("retrying"):
+            print("Finish/drain must be performed before stopping active work.")
+            return 2
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline and pid_alive(pid):
@@ -151,7 +167,7 @@ def status(profile):
     if not running:
         print("STOPPED — SAFE TO SHUT DOWN")
         return 0
-    view = dashboard(profile)
+    view = runtime_state(profile) or dashboard(profile)
     if isinstance(view, dict):
         state = str(view.get("state") or view.get("status") or "").lower()
         issue = view.get("issue") or view.get("issue_number") or "?"
