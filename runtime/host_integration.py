@@ -159,7 +159,8 @@ def notify(profile: Profile, event: str, issue: int, message: str,
         if result.returncode:
             print(f"symphony-pilot notification warning: backend exit {result.returncode}")
             return False
-        path.write_text(json.dumps({event: fingerprint}, sort_keys=True) + "\n", encoding="utf-8")
+        old[event] = fingerprint
+        path.write_text(json.dumps(old, sort_keys=True) + "\n", encoding="utf-8")
         return True
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"symphony-pilot notification warning: {type(exc).__name__}")
