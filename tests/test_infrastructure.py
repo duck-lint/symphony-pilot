@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
@@ -53,6 +55,21 @@ class InfrastructureTests(unittest.TestCase):
                 self.assertEqual(project_control.stop(profile), 2)
             kill.assert_not_called()
             self.assertTrue(pid_path.exists())
+
+    def test_status_maps_runtime_activity_arrays_to_safe_operator_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text("123\n", encoding="ascii")
+            output = StringIO()
+            with mock.patch.object(project_control, "pid_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state", return_value={
+                        "blocked": [],
+                        "running": [{"issue_identifier": "GH-7"}],
+                        "retrying": [],
+                    }), redirect_stdout(output):
+                self.assertEqual(project_control.status(profile), 0)
+            self.assertEqual(output.getvalue().strip(), "WORKING ON #GH-7 — DO NOT SHUT DOWN")
 
     def test_profile_rejects_credential_key(self):
         with tempfile.TemporaryDirectory() as directory:

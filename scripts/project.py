@@ -169,10 +169,19 @@ def status(profile):
         return 0
     view = runtime_state(profile) or dashboard(profile)
     if isinstance(view, dict):
+        blocked = view.get("blocked") or []
+        running_entries = view.get("running") or []
+        retrying_entries = view.get("retrying") or []
         state = str(view.get("state") or view.get("status") or "").lower()
         issue = view.get("issue") or view.get("issue_number") or "?"
-        if "human" in state or "blocked" in state:
+        entries = blocked or running_entries or retrying_entries
+        if entries and isinstance(entries[0], dict):
+            issue = (entries[0].get("issue_identifier") or entries[0].get("issue_number")
+                     or entries[0].get("identifier") or issue)
+        if blocked or "human" in state or "blocked" in state:
             print(f"NEEDS YOU #{issue} — WORK SAFELY PAUSED")
+        elif running_entries or retrying_entries:
+            print(f"WORKING ON #{issue} — DO NOT SHUT DOWN")
         elif "finish" in state or "drain" in state:
             print(f"FINISHING #{issue} — DO NOT SHUT DOWN YET")
         elif "work" in state or "run" in state:
