@@ -34,8 +34,12 @@ def dashboard(profile):
     if not profile.dashboard_port:
         return None
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{profile.dashboard_port}/api/status", timeout=2) as response:
-            return json.loads(response.read())
+        with urllib.request.urlopen(f"http://127.0.0.1:{profile.dashboard_port}/", timeout=2) as response:
+            payload = response.read()
+            try:
+                return json.loads(payload)
+            except ValueError:
+                return {"state": "running"}
     except (urllib.error.URLError, TimeoutError, ValueError):
         return None
 
