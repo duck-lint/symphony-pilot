@@ -367,7 +367,9 @@ class InfrastructureTests(unittest.TestCase):
             with mock.patch.object(host_integration.subprocess, "run", return_value=result) as run:
                 self.assertTrue(host_integration.notify(profile, "human", 7, "needs attention"))
                 self.assertFalse(host_integration.notify(profile, "human", 7, "needs attention"))
-            run.assert_called_once()
+                self.assertTrue(host_integration.notify(profile, "infrastructure", 7, "provider unavailable"))
+                self.assertTrue(host_integration.notify(profile, "completed", 7, "Issue #7 completed."))
+            self.assertEqual(run.call_count, 3)
             self.assertNotIn("secret", (profile.state_root / host_integration.NOTIFICATION_STATE).read_text())
 
     def test_deployment_contains_operator_cli_and_host_backend(self):
