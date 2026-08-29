@@ -68,10 +68,12 @@ def main() -> int:
         if profile.blocked_label in names:
             infrastructure = is_infrastructure_blocker(current_body)
             if infrastructure:
+                clear_notification(profile, "human", issue)
                 detail = infrastructure_message(current_body)
                 notify(profile, "infrastructure", issue, detail, issue_url,
                        f"infrastructure:GH-{issue}:{current_body}")
             else:
+                clear_notification(profile, "infrastructure", issue)
                 notify(profile, "human", issue,
                        f"Issue #{issue} is safely paused and requires human attention.",
                        issue_url, f"human:GH-{issue}:{current_body}")
@@ -83,6 +85,8 @@ def main() -> int:
             notify(profile, "completed", issue,
                    f"Issue #{issue} completed.", issue_url,
                    f"completed:GH-{issue}:{issue_json.get('updated_at', '')}")
+        elif isinstance(issue_json, dict):
+            clear_notification(profile, "completed", issue)
     except Exception as exc:  # after_run is best effort; never print a secret-bearing traceback
         print(f"symphony-pilot after_run warning: {type(exc).__name__}")
     return 0

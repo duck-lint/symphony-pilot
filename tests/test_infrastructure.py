@@ -503,6 +503,32 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("local provider unavailable", after_run.infrastructure_message(body))
         self.assertNotIn("stale credential", after_run.infrastructure_message(body))
 
+    def test_blocker_kind_transition_clears_opposite_notification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile_with(make_profile(pathlib.Path(directory)),
+                                        notifications_enabled=True, display_name="Demo")
+            state_path = profile.state_root / host_integration.NOTIFICATION_STATE
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({
+                "human:GH-7": "a" * 64,
+                "infrastructure:GH-7": "b" * 64,
+            }) + "\n", encoding="utf-8")
+            body = "<!-- symphony-workpad:v1 -->\n### Human decision required\n"
+            with mock.patch.object(after_run, "load_profile", return_value=profile), \
+                    mock.patch.object(after_run, "read_secret", return_value="redacted"), \
+                    mock.patch.object(after_run, "comments", return_value=[{"id": 1, "body": body}]), \
+                    mock.patch.object(after_run, "github", side_effect=[
+                        [{"name": "symphony:human"}], {"state": "open"}
+                    ]), \
+                    mock.patch.object(host_integration.subprocess, "run",
+                                      return_value=mock.Mock(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["after_run", "--profile", "x",
+                                                     "--workspace", "GH-7"]):
+                self.assertEqual(after_run.main(), 0)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("infrastructure:GH-7", state)
+            self.assertIn("human:GH-7", state)
+
     def test_notification_deduplication_is_project_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
