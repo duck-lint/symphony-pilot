@@ -5,6 +5,7 @@ import hashlib
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ import deploy
 import host_integration
 import process_identity
 import project_registry
+import provision_secret
 
 def make_profile(root: pathlib.Path) -> pw.Profile:
     return pw.Profile(
@@ -94,6 +96,18 @@ class InfrastructureTests(unittest.TestCase):
         with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
             deploy.deploy(profile_path, target, False)
         return pw.load_profile(profile_path), target
+
+    def write_recovery_state(self, path: pathlib.Path, dashboard_port: int = 4040) -> dict:
+        state = {
+            "schema": "symphony-pilot-process/v2",
+            "identity": {"pid": 123, "boot_id": "boot", "start_time": "start"},
+            "deployment_root": "/home/duck-lint/.local/share/symphony-pilot/deployments/alpha",
+            "deployment_identity": "a" * 64,
+            "deployed_profile_sha256": "b" * 64,
+            "dashboard_url": f"http://127.0.0.1:{dashboard_port}",
+        }
+        path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+        return state
 
     def test_idle_stop_is_allowed_after_runtime_state_is_verified(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -854,10 +868,129 @@ class InfrastructureTests(unittest.TestCase):
                 "dashboard_url": "http://127.0.0.1:4040",
             }) + "\n", encoding="utf-8")
             self.assertEqual(project_control._dashboard_url(profile), "http://127.0.0.1:4040")
+            with mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state_at", return_value={
+                        "running": [], "retrying": []}) as runtime_state_at:
+                self.assertEqual(project_control.status(profile), 0)
+            runtime_state_at.assert_called_once_with("http://127.0.0.1:4040")
             with mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
                     mock.patch.object(project_control.os, "kill") as kill:
                 self.assertEqual(project_control.stop(profile, force=True), 0)
             kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+
+    def test_invalid_registry_still_allows_recovery_status_and_stop_now(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            state_path = root / "alpha-state" / "symphony.pid"
+            state_path.parent.mkdir()
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state_at", return_value={"running": [], "retrying": []}), \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "github") as github, \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "status"]):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.main(), 0)
+            self.assertIn("RECOVERY alpha", output.getvalue())
+            read_secret.assert_not_called()
+            github.assert_not_called()
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "github") as github, \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "stop-now"]):
+                self.assertEqual(project_control.main(), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            read_secret.assert_not_called()
+            github.assert_not_called()
+
+    def test_removed_profile_still_allows_exact_recovery_stop_now(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "beta", dashboard_port=4041)
+            state_path = root / "alpha-state" / "symphony.pid"
+            state_path.parent.mkdir()
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                with mock.patch.object(sys, "argv", ["project", "--project", "alpha", "stop-now"]):
+                    self.assertEqual(project_control.main(), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+
+    def test_recovery_uses_persisted_dashboard_after_current_profile_port_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path, dashboard_port=4040)
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state_at", return_value=None):
+                state = project_control.read_recovery_state("alpha")
+                self.assertEqual(project_control.recovery_status("alpha", state), 0)
+            self.assertEqual(state["dashboard_url"], "http://127.0.0.1:4040")
+
+    def test_recovery_rejects_reused_pid_and_malformed_state_without_killing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=False), \
+                    mock.patch.object(project_control, "pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                state = project_control.read_recovery_state("alpha")
+                self.assertEqual(project_control.recovery_stop_now("alpha", state), 1)
+            kill.assert_not_called()
+            state_path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                with self.assertRaises(pw.PreparationError):
+                    project_control.read_recovery_state("alpha")
+            kill.assert_not_called()
+
+    def test_invalid_registry_has_no_recovery_fallback_for_authority_acquisition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            for action in ("start", "test"):
+                with mock.patch.object(project_control, "ROOT", root), \
+                        mock.patch.object(sys, "argv", ["project", "--project", "alpha", action]):
+                    self.assertEqual(project_control.main(), 78)
+            with mock.patch.object(deploy, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["deploy", "--project", "alpha", "--dry-run"]):
+                self.assertEqual(deploy.main(), 78)
+            with mock.patch.object(provision_secret, "ROOT", root), \
+                    mock.patch.object(provision_secret.getpass, "getpass") as getpass:
+                self.assertEqual(provision_secret.main(["--project", "alpha"]), 78)
+            getpass.assert_not_called()
+
+    def test_invalid_registry_without_process_state_fails_closed_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            missing_state = root / "missing" / "symphony.pid"
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=missing_state), \
+                    mock.patch.object(project_control, "_identity_alive") as identity_alive, \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                for action in ("status", "stop-now"):
+                    with mock.patch.object(sys, "argv", ["project", "--project", "alpha", action]):
+                        self.assertEqual(project_control.main(), 78)
+            identity_alive.assert_not_called()
+            kill.assert_not_called()
 
     def test_schema_has_no_credential_property(self):
         schema = json.loads((ROOT / "schemas/project-profile.schema.json").read_text())
@@ -1393,10 +1526,32 @@ class InfrastructureTests(unittest.TestCase):
             profiles = project_registry.validate_registry(root)
             self.assertEqual({p.slug: p.dashboard_port for p in profiles},
                              {"project-12": 4040, "project-157": 4041})
-            self.assertEqual(project_registry.suggest_dashboard_port(root), 4042)
+            self.assertEqual(project_registry.suggest_dashboard_port(root), 1024)
             write_registry_profile(root, "duplicate", dashboard_port=4040)
             with self.assertRaisesRegex(pw.PreparationError, "duplicate dashboard port"):
                 project_registry.validate_registry(root)
+
+    def test_dashboard_port_above_historical_range_is_valid_and_occupancy_is_not_renumbered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            write_registry_profile(root, "alpha", dashboard_port=5000)
+            profile = project_registry.resolve_project("alpha", root)
+            self.assertEqual(profile.dashboard_port, 5000)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+                occupied.bind(("127.0.0.1", 0))
+                port = occupied.getsockname()[1]
+                with self.assertRaisesRegex(pw.PreparationError, "occupied or unavailable"):
+                    project_control.ensure_dashboard_port_available(port)
+
+    def test_dashboard_allocator_fails_only_when_supported_domain_is_exhausted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for index, slug in enumerate(("alpha", "beta", "gamma")):
+                write_registry_profile(root, slug, dashboard_port=6000 + index)
+            with mock.patch.object(project_registry, "DASHBOARD_PORT_MIN", 6000), \
+                    mock.patch.object(project_registry, "DASHBOARD_PORT_MAX", 6002):
+                with self.assertRaisesRegex(pw.PreparationError, "range is exhausted"):
+                    project_registry.suggest_dashboard_port(root)
 
     def test_dashboard_port_assignments_survive_registry_add_and_remove(self):
         with tempfile.TemporaryDirectory() as directory:

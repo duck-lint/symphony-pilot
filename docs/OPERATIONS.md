@@ -29,13 +29,21 @@ Onboarding a new project is:
 
 Normal project deployment always uses the derived slug namespace. The internal Python deployment function accepts a test-only destination parameter; the ordinary source CLI does not expose it. The shared executable must already exist on `PATH` or be named by `SYMPHONY_BIN`; deployment never downloads, copies, preserves, or migrates it.
 
-Registry validation and port allocation may run under native Windows Python.
+Registry validation and port allocation may run under native Windows Python;
+the supported persisted dashboard allocation domain is TCP `1024–65535`.
 The read-only deployment dry-run may also run under native Windows Python.
 Actual deployment, secret provisioning, `project.py` lifecycle commands
 (`test`, `start`, `status`, `finish`, `stop`, and `stop-now`), internal runtime
 hooks, and physical workspace/state operations must run from the WSL/Linux
-operator environment. The Windows account name is not used to construct
+operator environment. If an unrelated host process occupies the persisted
+dashboard port, startup fails with a port-conflict diagnostic and does not
+renumber the project. The Windows account name is not used to construct
 `/home/...` paths.
+
+Canonical project authority requires the complete valid registry for new work,
+start, test, deploy, and secret provisioning. A registry defect cannot grant
+new authority, but it also does not strand an already-managed process: `status`
+and `stop-now` may use only that project's persisted recovery identity.
 
 `finish` drains active work before stopping. `stop` refuses active work and `stop-now` is the emergency path. PID, awake-guard, lock, recovery, and log state are project-derived. Tracker requests contain only the selected profile's repository and dispatch labels. A shared label string in another repository is not dispatchable by this instance.
 

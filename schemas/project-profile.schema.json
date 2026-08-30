@@ -11,7 +11,7 @@
     "secret_reference": {"type": "string"},
     "dispatch_labels": {"type": "array", "minItems": 1, "items": {"type": "string"}},
     "blocked_label": {"type": "string"},
-    "dashboard_port": {"type": "integer", "minimum": 4040, "maximum": 4999},
+    "dashboard_port": {"type": "integer", "minimum": 1024, "maximum": 65535},
     "max_concurrent_agents": {"const": 1},
     "max_turns": {"type": "integer", "minimum": 1},
     "poll_interval_ms": {"type": "integer", "minimum": 1000},

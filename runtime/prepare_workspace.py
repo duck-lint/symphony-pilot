@@ -89,8 +89,11 @@ def configured_path(value: str) -> pathlib.Path:
     return pathlib.Path(value).expanduser().resolve()
 
 
-DASHBOARD_PORT_MIN = 4040
-DASHBOARD_PORT_MAX = 4999
+# Linux/WSL allows an unprivileged process to bind TCP ports from 1024 upward.
+# The registry allocator owns uniqueness among Symphony projects; the runtime
+# bind check separately reports conflicts with unrelated host processes.
+DASHBOARD_PORT_MIN = 1024
+DASHBOARD_PORT_MAX = 65535
 
 
 def resolve_host_root() -> pathlib.Path:
@@ -123,6 +126,14 @@ def require_physical_namespace(path: pathlib.PurePath) -> pathlib.Path:
             "physical namespace operations must run under the WSL/Linux operator environment",
         )
     return pathlib.Path(path).resolve()
+
+
+def state_namespace_for_slug(slug: str) -> pathlib.Path:
+    """Resolve exactly one slug-owned state namespace for recovery control."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
+        raise PreparationError("project", "project slug is not a safe identifier")
+    root = host_namespace_root() / ".local" / "state" / "symphony-pilot" / slug
+    return require_physical_namespace(root)
 
 
 def project_namespaces(profile: Profile) -> dict[str, pathlib.PurePath]:

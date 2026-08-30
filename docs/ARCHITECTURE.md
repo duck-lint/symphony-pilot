@@ -17,9 +17,10 @@ secret reference, execution limits, Codex settings, and optional host
 integration preferences. Deployment, workspace, state, log, credential, lock,
 process, workflow, and service namespaces are derived from the slug. Dashboard
 ports are persisted finite host-resource allocations in the canonical profile;
-onboarding tooling chooses an unused value in the supported range and registry
-validation rejects duplicate assignments. Adding or removing a project never
-renumbers existing assignments.
+onboarding tooling chooses an unused value in the unprivileged TCP range
+`1024–65535` and registry validation rejects duplicate assignments. Runtime
+host occupancy is checked separately and never causes automatic renumbering.
+Adding or removing a project never renumbers existing assignments.
 There is no persisted `deployment_root`, `workspace_root`, `state_root`,
 `log_root`, or `service_identity` field.
 
@@ -69,6 +70,11 @@ before reading the project credential or querying the tracker. Process state
 also records the launched deployment identity, profile digest, and dashboard
 endpoint so later status/stop operations continue to address the process that
 actually started.
+
+These are separate authority boundaries: the complete canonical registry is
+required for new work, deployment, credentials, and `start`/`test`; recovery
+control accepts only a safe operator-supplied slug and that slug's validated
+persisted process identity for inspection or emergency shutdown.
 
 Physical namespace operations are WSL/Linux operations. Native Windows Python
 may perform host-neutral registry validation and port allocation, but it must
