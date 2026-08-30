@@ -4,6 +4,7 @@ git_remote = "git@github-symphony-canary:duck-lint/symphony-canary.git"
 secret_reference = "github.token"
 dispatch_labels = ["symphony:auto"]
 blocked_label = "symphony:human"
+dashboard_port = 4041
 max_concurrent_agents = 1
 max_turns = 8
 poll_interval_ms = 5000

@@ -16,16 +16,32 @@ Each profile supplies repository identity, its Git remote, tracker labels,
 secret reference, execution limits, Codex settings, and optional host
 integration preferences. Deployment, workspace, state, log, credential, lock,
 process, workflow, and service namespaces are derived from the slug. Dashboard
-ports are stable derived user-space ports and are rejected if they collide.
+ports are persisted finite host-resource allocations in the canonical profile;
+onboarding tooling chooses an unused value in the supported range and registry
+validation rejects duplicate assignments. Adding or removing a project never
+renumbers existing assignments.
 There is no persisted `deployment_root`, `workspace_root`, `state_root`,
-`log_root`, `service_identity`, or `dashboard_port` field.
+`log_root`, or `service_identity` field.
 
 The host topology is:
 
 ```text
-shared host
+SOURCE CHECKOUT
+  canonical registry
+  registry-wide validation
+  lifecycle/operator CLI
+  deployment command
+
+GENERATED PROJECT DEPLOYMENT
+  profile snapshot
+  WORKFLOW.md
+  runtime hooks/preparation
+  architect/role policies
+  DEPLOYMENT.json
+
+SHARED HOST
   official Symphony executable
-  symphony-pilot source checkout
+  canonical WSL/Linux operator root
 
 tracked registry
   projects/<slug>/profile.toml
@@ -45,6 +61,19 @@ contains the source operator CLI or the official Symphony executable. Atomic
 backup/replacement is bounded to that one derived deployment directory. Source
 checkout lifecycle commands operate on the selected slug's derived state and
 deployment only.
+
+`DEPLOYMENT.json` records the exact generated inventory, its hashes, the
+selected profile digest, and a bounded source lifecycle-contract digest.
+`project.py test` and `project.py start` use the same verifier; `start` runs it
+before reading the project credential or querying the tracker. Process state
+also records the launched deployment identity, profile digest, and dashboard
+endpoint so later status/stop operations continue to address the process that
+actually started.
+
+Physical namespace operations are WSL/Linux operations. Native Windows Python
+may perform host-neutral registry validation and port allocation, but it must
+not resolve or mutate a physical project namespace; Windows `USERNAME` is
+never treated as a WSL username.
 
 For distinct projects, registry validation rejects duplicate repository
 identity, service identity, dashboard port, or any equality/containment overlap

@@ -10,7 +10,14 @@ import pathlib
 import re
 from collections.abc import Iterable
 
-from prepare_workspace import Profile, PreparationError, load_profile, project_namespaces
+from prepare_workspace import (
+    DASHBOARD_PORT_MAX,
+    DASHBOARD_PORT_MIN,
+    Profile,
+    PreparationError,
+    load_profile,
+    project_namespaces,
+)
 
 
 def discover_profile_paths(registry_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
@@ -57,6 +64,11 @@ def validate_profiles(
         if previous:
             errors.append(f"duplicate dashboard port: {profile.dashboard_port}")
         seen_ports[profile.dashboard_port] = profile
+        if (not isinstance(profile.dashboard_port, int) or isinstance(profile.dashboard_port, bool) or
+                not DASHBOARD_PORT_MIN <= profile.dashboard_port <= DASHBOARD_PORT_MAX):
+            errors.append(
+                f"dashboard port outside supported finite range: {profile.dashboard_port}"
+            )
         if paths:
             expected = paths[index].parent.name
             if expected != profile.slug:
@@ -103,6 +115,16 @@ def resolve_project(slug: str, registry_root: pathlib.Path) -> Profile:
     if not matches:
         raise PreparationError("project", f"project is not registered: {slug}")
     return matches[0]
+
+
+def suggest_dashboard_port(registry_root: pathlib.Path) -> int:
+    """Choose the lowest unassigned port after validating the whole registry."""
+    profiles = validate_registry(registry_root)
+    assigned = {profile.dashboard_port for profile in profiles}
+    for port in range(DASHBOARD_PORT_MIN, DASHBOARD_PORT_MAX + 1):
+        if port not in assigned:
+            return port
+    raise PreparationError("dashboard_port", "the finite dashboard port range is exhausted")
 
 
 def _paths_overlap(left: pathlib.PurePath, right: pathlib.PurePath) -> bool:

@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from process_identity import capture, matches, read
-from prepare_workspace import Profile
+from prepare_workspace import Profile, require_physical_namespace
 
 
 AWAKE_STATE = "host-awake.json"
@@ -62,8 +62,9 @@ try {
 
 
 def _state_path(profile: Profile, name: str) -> pathlib.Path:
-    profile.state_root.mkdir(parents=True, exist_ok=True)
-    return profile.state_root / name
+    state_root = require_physical_namespace(profile.state_root)
+    state_root.mkdir(parents=True, exist_ok=True)
+    return state_root / name
 
 
 def _identity_alive(identity: object) -> bool:

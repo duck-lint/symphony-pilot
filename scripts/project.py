@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import shutil
 import subprocess
@@ -19,12 +20,25 @@ ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "a
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import establish_awake_guard, release_awake_guard
 from process_identity import capture, matches, read
-from prepare_workspace import PreparationError, deployment_path, github, read_secret
+from prepare_workspace import (
+    PreparationError,
+    deployment_path,
+    github,
+    load_profile,
+    read_secret,
+    require_physical_namespace,
+)
+from deployment_contract import contract_digest, deployment_identity
 from project_registry import resolve_project
 
+
+def file_digest(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
 def state_paths(profile):
-    profile.state_root.mkdir(parents=True, exist_ok=True)
-    return profile.state_root / "symphony.pid", profile.state_root / "symphony.log"
+    state_root = require_physical_namespace(profile.state_root)
+    state_root.mkdir(parents=True, exist_ok=True)
+    return state_root / "symphony.pid", state_root / "symphony.log"
 
 def install_root(profile):
     return deployment_path(profile)
@@ -111,9 +125,17 @@ def _stop_process(profile, identity):
     return 0
 
 
-def _write_process_state(profile, identity):
+def _write_process_state(profile, identity, verification):
+    dashboard_url = verification.get("dashboard_url", f"http://127.0.0.1:{profile.dashboard_port}")
     state_paths(profile)[0].write_text(
-        json.dumps({"schema": "symphony-pilot-process/v1", "identity": identity},
+        json.dumps({
+            "schema": "symphony-pilot-process/v2",
+            "identity": identity,
+            "deployment_root": str(verification["root"]),
+            "deployment_identity": verification["deployment_identity"],
+            "deployed_profile_sha256": verification["profile_sha256"],
+            "dashboard_url": dashboard_url,
+        },
                    sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -151,11 +173,26 @@ def _terminate_unverified_child(child, profile):
     release_awake_guard(profile)
     return True
 
-def dashboard(profile):
+def _dashboard_url(profile):
     if not profile.dashboard_port:
         return None
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{profile.dashboard_port}/", timeout=2) as response:
+        state = read(state_paths(profile)[0]) if state_paths(profile)[0].exists() else None
+    except (OSError, ValueError, TypeError):
+        state = None
+    endpoint = state.get("dashboard_url") if isinstance(state, dict) else None
+    if (not isinstance(endpoint, str) or
+            not re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", endpoint)):
+        endpoint = f"http://127.0.0.1:{profile.dashboard_port}"
+    return endpoint
+
+
+def dashboard(profile):
+    endpoint = _dashboard_url(profile)
+    if endpoint is None:
+        return None
+    try:
+        with urllib.request.urlopen(endpoint + "/", timeout=2) as response:
             payload = response.read()
             try:
                 return json.loads(payload)
@@ -165,11 +202,12 @@ def dashboard(profile):
         return None
 
 def runtime_state(profile):
-    if not profile.dashboard_port:
+    endpoint = _dashboard_url(profile)
+    if endpoint is None:
         return None
     try:
         with urllib.request.urlopen(
-            f"http://127.0.0.1:{profile.dashboard_port}/api/v1/state", timeout=2
+            endpoint + "/api/v1/state", timeout=2
         ) as response:
             return json.loads(response.read())
     except (urllib.error.URLError, TimeoutError, ValueError):
@@ -184,7 +222,6 @@ def project_name(profile):
     return profile.display_name or profile.slug
 
 def start(profile):
-    token = read_secret(profile)
     pid_path, log_path = state_paths(profile)
     if pid_path.exists():
         identity = read(pid_path)
@@ -199,17 +236,24 @@ def start(profile):
             return 0
         pid_path.unlink(missing_ok=True)
     try:
+        verification = verify_deployment(profile)
+    except (OSError, ValueError, TypeError, PreparationError) as exc:
+        print(f"Cannot start Symphony: deployment coherence verification failed: {exc}")
+        return 1
+    root = verification["root"]
+    workflow = root / "projects" / profile.slug / "WORKFLOW.md"
+    try:
+        token = read_secret(profile)
+    except PreparationError as exc:
+        print(f"Cannot start Symphony: {exc}")
+        return 1
+    try:
         issues = active_issues(profile, token)
     except Exception as exc:
         print(f"Cannot verify GitHub dispatch state: {type(exc).__name__}. No process was started.")
         return 1
     if len(issues) > profile.max_concurrent_agents:
         print(f"Refusing to start: {len(issues)} dispatchable issues exceed the one-issue pilot limit.")
-        return 1
-    root = install_root(profile)
-    workflow = root / "projects" / profile.slug / "WORKFLOW.md"
-    if not workflow.exists():
-        print(f"Deployment is missing its generated workflow: {workflow}")
         return 1
     try:
         establish_awake_guard(profile)
@@ -251,7 +295,7 @@ def start(profile):
             print("Cannot start Symphony: its process identity could not be verified; "
                   "the child exited and the awake guard was released.")
         return 1
-    _write_process_state(profile, identity)
+    _write_process_state(profile, identity, verification)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if dashboard(profile) is not None:
@@ -419,26 +463,85 @@ def verify_manifest(root, manifest_path, manifest):
         if expected != actual:
             raise ValueError(f"deployed file does not match its manifest: {relative}")
 
-def test(profile):
-    root = install_root(profile)
+
+REQUIRED_DEPLOYMENT_FILES = (
+    "profile.toml",
+    "runtime/prepare_workspace.py",
+    "runtime/after_run.py",
+    "runtime/before_remove.py",
+    "runtime/host_integration.py",
+    "runtime/process_identity.py",
+    "runtime/launch_codex.sh",
+    "runtime/deployment_contract.py",
+    "workflow/architect_policy.md",
+    "projects/{slug}/WORKFLOW.md",
+    "workflow/agents/project-manager.toml",
+    "workflow/agents/planner.toml",
+    "workflow/agents/implementer.toml",
+    "workflow/agents/reviewer.toml",
+    "workflow/agents/adversary.toml",
+    "workflow/agents/archivist.toml",
+)
+
+
+def verify_deployment(profile):
+    """Verify the selected source profile and generated deployment as one snapshot."""
+    root = require_physical_namespace(install_root(profile))
     manifest_path = root / "DEPLOYMENT.json"
-    required = [root / "profile.toml", manifest_path,
-                root / "runtime" / "prepare_workspace.py",
-                root / "runtime" / "host_integration.py", root / "runtime" / "process_identity.py",
-                root / "projects" / profile.slug / "WORKFLOW.md"]
-    required += [root / "workflow" / "agents" / f"{name}.toml"
-                 for name in ROLE_POLICY_NAMES]
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        print("Deployment validation failed; missing: " + ", ".join(missing))
-        return 1
+    if not manifest_path.is_file():
+        raise PreparationError("deployment", "DEPLOYMENT.json is missing; redeploy the selected project")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreparationError("deployment", "DEPLOYMENT.json cannot be read") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != "symphony-pilot-deployment/v2":
+        raise PreparationError("deployment", "DEPLOYMENT.json schema is not accepted")
+    if manifest.get("profile") != profile.slug:
+        raise PreparationError("deployment", "deployment belongs to a different project slug")
+    required = [root / relative.format(slug=profile.slug) for relative in REQUIRED_DEPLOYMENT_FILES]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise PreparationError("deployment", "required generated files are missing: " + ", ".join(missing))
+    try:
         verify_manifest(root, manifest_path, manifest)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        source_profile_path = profile.source_profile_path
+        if source_profile_path is None or not source_profile_path.is_file():
+            raise ValueError("selected canonical profile path is unavailable")
+        deployed_profile_path = root / "profile.toml"
+        source_bytes = source_profile_path.read_bytes()
+        deployed_bytes = deployed_profile_path.read_bytes()
+        if source_bytes != deployed_bytes:
+            raise ValueError("deployed profile snapshot differs from selected canonical profile")
+        deployed_profile = load_profile(deployed_profile_path)
+        if deployed_profile.slug != profile.slug:
+            raise ValueError("deployed profile slug does not match selected project")
+        profile_sha256 = file_digest(deployed_profile_path)
+        if manifest.get("profile_sha256") != profile_sha256:
+            raise ValueError("deployed profile digest does not match DEPLOYMENT.json")
+        operator_contract_sha256 = contract_digest(ROOT)
+        if manifest.get("operator_contract_sha256") != operator_contract_sha256:
+            raise ValueError("source operator/runtime contract differs; redeploy the selected project")
+        expected_identity = deployment_identity(
+            profile.slug, profile_sha256, operator_contract_sha256, manifest["files"]
+        )
+        if manifest.get("deployment_identity") != expected_identity:
+            raise ValueError("deployment identity does not match its accepted contents")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise PreparationError("deployment", str(exc)) from exc
+    return {
+        "root": root,
+        "deployment_identity": manifest["deployment_identity"],
+        "profile_sha256": manifest["profile_sha256"],
+        "dashboard_url": f"http://127.0.0.1:{profile.dashboard_port}",
+    }
+
+def test(profile):
+    try:
+        verification = verify_deployment(profile)
+    except PreparationError as exc:
         print(f"Deployment validation failed: {exc}")
         return 1
-    print(f"Deployment validation passed for {profile.slug} at {root}")
+    print(f"Deployment validation passed for {profile.slug} at {verification['root']}")
     return 0
 
 def main():
@@ -453,12 +556,16 @@ def main():
     except PreparationError as exc:
         print(f"symphony-pilot project resolution stopped: {exc.kind}: {exc}", file=sys.stderr)
         return 78
-    if args.action == "start": return start(profile)
-    if args.action == "stop": return stop(profile)
-    if args.action == "stop-now": return stop(profile, force=True)
-    if args.action == "finish": return finish(profile)
-    if args.action == "status": return status(profile)
-    return test(profile)
+    try:
+        if args.action == "start": return start(profile)
+        if args.action == "stop": return stop(profile)
+        if args.action == "stop-now": return stop(profile, force=True)
+        if args.action == "finish": return finish(profile)
+        if args.action == "status": return status(profile)
+        return test(profile)
+    except PreparationError as exc:
+        print(f"symphony-pilot operation stopped: {exc.kind}: {exc}", file=sys.stderr)
+        return 78
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -8,7 +8,7 @@ import pathlib
 import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
-from prepare_workspace import PreparationError, secret_path
+from prepare_workspace import PreparationError, require_physical_namespace, secret_path
 from project_registry import resolve_project
 
 parser = argparse.ArgumentParser()
@@ -16,9 +16,9 @@ parser.add_argument("--project", required=True, help="registered project slug")
 args = parser.parse_args()
 try:
     profile = resolve_project(args.project, ROOT / "projects")
+    path = require_physical_namespace(secret_path(profile))
 except PreparationError as exc:
     raise SystemExit(f"symphony-pilot project resolution stopped: {exc}") from exc
-path = secret_path(profile)
 path.parent.mkdir(parents=True, exist_ok=True)
 os.chmod(path.parent, 0o700)
 value = getpass.getpass(f"Enter tracker credential for {profile.slug} (hidden): ")

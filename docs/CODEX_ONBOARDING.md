@@ -248,7 +248,7 @@ Profiles contain non-secret configuration only. Register project-isolated values
 - dispatch and blocked labels;
 - derived service identity (not profile-configurable);
 - Codex model/reasoning settings;
-- optional dashboard/host integration;
+- allocated dashboard port and host integration preferences;
 - target toolchain hint.
 
 The current control plane requires:
@@ -342,7 +342,7 @@ Return the onboarding result under these headings.
 - toolchain hint and whether it has a real host preflight;
 - labels;
 - fixed concurrency (`1`);
-- dashboard port if enabled.
+- allocated dashboard port.
 
 ### Credential requirement
 

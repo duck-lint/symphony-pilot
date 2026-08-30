@@ -35,10 +35,13 @@ def make_profile(root: pathlib.Path) -> pw.Profile:
         codex_model="gpt-5.6-luna", codex_reasoning_effort="high", toolchain=None)
 
 
-def write_registry_profile(root: pathlib.Path, slug: str, repository: str | None = None) -> pathlib.Path:
+def write_registry_profile(root: pathlib.Path, slug: str, repository: str | None = None,
+                           dashboard_port: int | None = None) -> pathlib.Path:
     directory = root / slug
     directory.mkdir(parents=True)
     path = directory / "profile.toml"
+    if dashboard_port is None:
+        dashboard_port = 4040 + len(list(root.glob("*/profile.toml")))
     path.write_text(
         f'''slug = "{slug}"
 repository = "{repository or "example/" + slug}"
@@ -46,6 +49,7 @@ git_remote = "git@example:{slug}.git"
 secret_reference = "github.token"
 dispatch_labels = ["symphony:auto"]
 blocked_label = "symphony:human"
+dashboard_port = {dashboard_port}
 max_concurrent_agents = 1
 max_turns = 8
 poll_interval_ms = 5000
@@ -72,6 +76,24 @@ def git_repo(path: pathlib.Path) -> None:
 class InfrastructureTests(unittest.TestCase):
     def profile_with(self, profile, **changes):
         return profile.__class__(**{**profile.__dict__, **changes})
+
+    def deploy_fixture(self, root: pathlib.Path, slug: str = "alpha", port: int = 4040):
+        registry = root / "registry"
+        profile_path = write_registry_profile(registry, slug, dashboard_port=port)
+        target = root / "deployment" / slug
+        source_commit = "a" * 40
+        real_run = deploy.subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, source_commit + "\n", "")
+            if command[:3] == ["git", "status", "--porcelain=v1"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
+            deploy.deploy(profile_path, target, False)
+        return pw.load_profile(profile_path), target
 
     def test_idle_stop_is_allowed_after_runtime_state_is_verified(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -745,13 +767,97 @@ class InfrastructureTests(unittest.TestCase):
             text=True, capture_output=True, check=True)
         data = json.loads(result.stdout)
         self.assertEqual(set(data["role_policies"]), deploy.EXPECTED_ROLE_NAMES)
-        self.assertEqual(data["files"], 15)
+        self.assertEqual(data["files"], 16)
 
     def test_deployed_test_requires_and_verifies_role_policy_files(self):
         source = (ROOT / "scripts/project.py").read_text(encoding="utf-8")
         for name in ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"):
             self.assertIn(f'"{name}"', source)
         self.assertIn("deployed file does not match its manifest", source)
+
+    def test_generated_deployment_coherence_gate_accepts_valid_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile, target = self.deploy_fixture(pathlib.Path(directory))
+            with mock.patch.object(project_control, "install_root", return_value=target):
+                verification = project_control.verify_deployment(profile)
+            self.assertEqual(verification["root"], target.resolve())
+            manifest = json.loads((target / "DEPLOYMENT.json").read_text())
+            self.assertEqual(verification["deployment_identity"], manifest["deployment_identity"])
+
+    def test_start_can_proceed_only_after_real_deployment_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            selected, target = self.deploy_fixture(root)
+            profile = self.profile_with(selected, workspace_root=root / "work",
+                                        state_root=root / "state", log_root=root / "logs")
+            child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
+            identity = process_state()["identity"]
+            with mock.patch.object(project_control, "install_root", return_value=target), \
+                    mock.patch.object(project_control, "read_secret", return_value="test-token"), \
+                    mock.patch.object(project_control, "active_issues", return_value=[]), \
+                    mock.patch.object(project_control, "establish_awake_guard"), \
+                    mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
+                    mock.patch.object(project_control.subprocess, "Popen", return_value=child), \
+                    mock.patch.object(project_control, "capture", return_value=identity), \
+                    mock.patch.object(project_control, "dashboard", return_value={"state": "idle"}):
+                self.assertEqual(project_control.start(profile), 0)
+            state = json.loads((profile.state_root / "symphony.pid").read_text())
+            manifest = json.loads((target / "DEPLOYMENT.json").read_text())
+            self.assertEqual(state["deployment_identity"], manifest["deployment_identity"])
+            self.assertEqual(state["deployed_profile_sha256"], manifest["profile_sha256"])
+
+    def test_unrelated_registry_membership_does_not_invalidate_existing_deployment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile, target = self.deploy_fixture(root)
+            write_registry_profile(root / "registry", "beta", dashboard_port=4041)
+            with mock.patch.object(project_control, "install_root", return_value=target):
+                verification = project_control.verify_deployment(profile)
+            self.assertEqual(verification["root"], target.resolve())
+
+    def test_deployment_coherence_gate_rejects_missing_tampered_and_incompatible_snapshots(self):
+        for case in ("missing_manifest", "tampered_workflow", "profile_mismatch", "contract_mismatch"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                profile, target = self.deploy_fixture(root)
+                if case == "missing_manifest":
+                    (target / "DEPLOYMENT.json").unlink()
+                elif case == "tampered_workflow":
+                    workflow = target / "projects" / profile.slug / "WORKFLOW.md"
+                    workflow.write_text(workflow.read_text() + "tampered\n", encoding="utf-8")
+                elif case == "profile_mismatch":
+                    profile.source_profile_path.write_text(
+                        profile.source_profile_path.read_text() + "display_name = \"changed\"\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    with mock.patch.object(project_control, "install_root", return_value=target), \
+                            mock.patch.object(project_control, "contract_digest", return_value="different"):
+                        with self.assertRaisesRegex(pw.PreparationError, "contract differs"):
+                            project_control.verify_deployment(profile)
+                    continue
+                with mock.patch.object(project_control, "install_root", return_value=target):
+                    with self.assertRaises(pw.PreparationError):
+                        project_control.verify_deployment(profile)
+
+    def test_running_process_retains_deployment_endpoint_and_identity_across_source_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), dashboard_port=4041)
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text(json.dumps({
+                "schema": "symphony-pilot-process/v2",
+                "identity": process_state()["identity"],
+                "deployment_root": "/home/duck-lint/.local/share/symphony-pilot/deployments/demo",
+                "deployment_identity": "old-deployment",
+                "deployed_profile_sha256": "old-profile",
+                "dashboard_url": "http://127.0.0.1:4040",
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(project_control._dashboard_url(profile), "http://127.0.0.1:4040")
+            with mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.stop(profile, force=True), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
 
     def test_schema_has_no_credential_property(self):
         schema = json.loads((ROOT / "schemas/project-profile.schema.json").read_text())
@@ -975,6 +1081,7 @@ class InfrastructureTests(unittest.TestCase):
             (root / "deployment" / "projects" / profile.slug).mkdir(parents=True)
             (root / "deployment" / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
             with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
                     mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
                     mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
@@ -983,6 +1090,19 @@ class InfrastructureTests(unittest.TestCase):
                     mock.patch.object(project_control.subprocess, "Popen", side_effect=OSError("missing")):
                 self.assertEqual(project_control.start(profile), 1)
             release.assert_called_once_with(profile)
+
+    def test_start_verifies_deployment_before_secret_tracker_or_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            verification_error = pw.PreparationError("deployment", "tampered")
+            with mock.patch.object(project_control, "verify_deployment", side_effect=verification_error), \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "active_issues") as active_issues, \
+                    mock.patch.object(project_control.subprocess, "Popen") as popen:
+                self.assertEqual(project_control.start(profile), 1)
+            read_secret.assert_not_called()
+            active_issues.assert_not_called()
+            popen.assert_not_called()
 
     def test_start_identity_capture_failure_kills_unmanaged_child_and_retains_guard_if_needed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -994,6 +1114,7 @@ class InfrastructureTests(unittest.TestCase):
             child.wait.side_effect = [subprocess.TimeoutExpired("symphony", 5),
                                       subprocess.TimeoutExpired("symphony", 5)]
             with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
                     mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
                     mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
@@ -1019,6 +1140,7 @@ class InfrastructureTests(unittest.TestCase):
             child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
             identity = process_state()["identity"]
             with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
                     mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
                     mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
@@ -1044,6 +1166,7 @@ class InfrastructureTests(unittest.TestCase):
             child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
             identity = process_state()["identity"]
             with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
                     mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
                     mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
@@ -1262,6 +1385,34 @@ class InfrastructureTests(unittest.TestCase):
                 ["alpha", "delta", "gamma"],
             )
 
+    def test_dashboard_port_allocation_is_explicit_and_not_a_slug_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            write_registry_profile(root, "project-12", dashboard_port=4040)
+            write_registry_profile(root, "project-157", dashboard_port=4041)
+            profiles = project_registry.validate_registry(root)
+            self.assertEqual({p.slug: p.dashboard_port for p in profiles},
+                             {"project-12": 4040, "project-157": 4041})
+            self.assertEqual(project_registry.suggest_dashboard_port(root), 4042)
+            write_registry_profile(root, "duplicate", dashboard_port=4040)
+            with self.assertRaisesRegex(pw.PreparationError, "duplicate dashboard port"):
+                project_registry.validate_registry(root)
+
+    def test_dashboard_port_assignments_survive_registry_add_and_remove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for index, slug in enumerate(("alpha", "beta", "gamma")):
+                write_registry_profile(root, slug, dashboard_port=4040 + index)
+            before = {p.slug: p.dashboard_port for p in project_registry.validate_registry(root)}
+            write_registry_profile(root, "delta", dashboard_port=4043)
+            after_add = {p.slug: p.dashboard_port for p in project_registry.validate_registry(root)}
+            self.assertEqual({slug: after_add[slug] for slug in before}, before)
+            (root / "beta" / "profile.toml").unlink()
+            (root / "beta").rmdir()
+            after_remove = {p.slug: p.dashboard_port for p in project_registry.validate_registry(root)}
+            self.assertEqual({slug: after_remove[slug] for slug in ("alpha", "gamma", "delta")},
+                             {"alpha": 4040, "gamma": 4042, "delta": 4043})
+
     def test_registry_rejects_directory_slug_and_repository_collisions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -1307,6 +1458,24 @@ class InfrastructureTests(unittest.TestCase):
                 bad = alpha_path.with_name("bad.toml")
                 bad.write_text(raw + 'deployment_root = "/home/legacy"\n', encoding="utf-8")
                 pw.load_profile(bad)
+
+    def test_native_windows_never_guesses_wsl_home_from_windows_username(self):
+        with mock.patch.object(pw.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"USERNAME": "madis", "USER": "duck-lint",
+                                              "WSL_USER": "duck-lint"}, clear=True):
+            with self.assertRaisesRegex(pw.PreparationError, "WSL/Linux"):
+                pw.resolve_host_root()
+            symbolic = pw.host_namespace_root()
+            self.assertEqual(str(symbolic), "<wsl-home>")
+            self.assertNotIn("madis", str(symbolic))
+
+    def test_native_windows_cannot_read_or_mutate_physical_project_namespace(self):
+        profile = make_profile(pathlib.Path("C:/fixture"))
+        symbolic = pw.Profile(**{**profile.__dict__,
+                                 "state_root": pathlib.PurePosixPath("<wsl-home>/state")})
+        with mock.patch.object(pw.os, "name", "nt"):
+            with self.assertRaisesRegex(pw.PreparationError, "WSL/Linux"):
+                project_control.state_paths(symbolic)
 
     def test_deployment_isolation_for_alpha_beta_gamma_and_new_project(self):
         with tempfile.TemporaryDirectory() as directory:

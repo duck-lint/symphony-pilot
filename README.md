@@ -66,7 +66,12 @@ A deployment expects:
 - a Codex environment usable by Symphony;
 - any toolchain required by the target project's profile.
 
-The operational design is Linux-first. On Windows, workspaces and process state should remain on the WSL-native filesystem; Windows integration is limited to detected host tooling, notifications, and optional sleep inhibition.
+The operational design is Linux-first. Registry validation and port allocation
+may run under native Windows Python; the read-only deployment dry-run may too.
+Actual deployment, lifecycle, secret access, and physical workspace/state
+operations must run from the WSL/Linux operator environment. Windows integration is limited to detected host tooling,
+notifications, and optional sleep inhibition; Windows `USERNAME` is never used
+as a WSL username.
 
 ## Quick start
 
@@ -83,7 +88,7 @@ python3 scripts/provision_secret.py --project cleanroom
 python3 scripts/deploy.py --project cleanroom --dry-run
 python3 scripts/deploy.py --project cleanroom
 
-# Exercise the deployed control surface.
+# Exercise the source-checkout control surface against the generated deployment.
 python3 scripts/project.py --project cleanroom test
 python3 scripts/project.py --project cleanroom start
 python3 scripts/project.py --project cleanroom status

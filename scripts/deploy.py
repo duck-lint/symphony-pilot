@@ -14,6 +14,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 from prepare_workspace import Profile, PreparationError, deployment_path, load_profile
+from deployment_contract import contract_digest, deployment_identity
 from project_registry import resolve_project
 from render_workflow import render
 
@@ -35,6 +36,11 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
     raw_target = destination or selected_deployment(profile)
     target = (raw_target if isinstance(raw_target, pathlib.PurePosixPath) and os.name == "nt"
               else pathlib.Path(raw_target).expanduser().resolve())
+    if destination is None and os.name == "nt" and not dry_run:
+        raise PreparationError(
+            "host_platform",
+            "physical deployment must run under the WSL/Linux operator environment",
+        )
     if destination is None and os.name != "nt" and not str(target).startswith("/home/"):
         raise SystemExit("deployment root must remain on the WSL-native filesystem")
     source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
@@ -48,7 +54,7 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
                           "source_commit": source_commit,
                           "source_clean": not bool(source_status),
                           "role_policies": sorted(role_names),
-                          "files": 9 + len(ROLE_POLICY_FILES)}, sort_keys=True))
+                          "files": 10 + len(ROLE_POLICY_FILES)}, sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
@@ -60,7 +66,8 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         # The official executable is shared host infrastructure.  It is
         # intentionally absent from generated project deployments.
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
-                     "host_integration.py", "process_identity.py", "launch_codex.sh"):
+                     "host_integration.py", "process_identity.py", "launch_codex.sh",
+                     "deployment_contract.py"):
             shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
         shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
         for policy in ROLE_POLICY_FILES:
@@ -69,11 +76,21 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         (stage / "runtime/launch_codex.sh").chmod(0o755)
         workflow = stage / "projects" / profile.slug / "WORKFLOW.md"
         workflow.write_text(render(profile, target, stage / "workflow/architect_policy.md"), encoding="utf-8")
-        manifest = {"schema": "symphony-pilot-deployment/v1", "profile": profile.slug,
-                    "source_commit": source_commit,
-                    "deployed_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                    "files": {str(path.relative_to(stage)): file_digest(path)
-                              for path in stage.rglob("*") if path.is_file()}}
+        files = {path.relative_to(stage).as_posix(): file_digest(path)
+                 for path in stage.rglob("*") if path.is_file()}
+        profile_sha256 = file_digest(stage / "profile.toml")
+        operator_contract_sha256 = contract_digest(ROOT)
+        manifest = {
+            "schema": "symphony-pilot-deployment/v2",
+            "profile": profile.slug,
+            "profile_sha256": profile_sha256,
+            "operator_contract_sha256": operator_contract_sha256,
+            "deployment_identity": deployment_identity(
+                profile.slug, profile_sha256, operator_contract_sha256, files),
+            "source_commit": source_commit,
+            "deployed_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "files": files,
+        }
         (stage / "DEPLOYMENT.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                                                encoding="utf-8")
         if target.exists():

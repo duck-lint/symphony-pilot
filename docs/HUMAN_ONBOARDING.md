@@ -125,7 +125,7 @@ The onboarding agent should derive and register project-isolated values from the
 - state root and log root;
 - process/service identity;
 - secret reference;
-- optional dashboard port;
+- allocated dashboard port;
 - target-project toolchain hint.
 
 Do not ask the human to choose values that can be mechanically derived without changing authority.
