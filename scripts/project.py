@@ -19,7 +19,7 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
 sys.path.insert(0, str(ROOT / "runtime"))
-from host_integration import establish_awake_guard, release_awake_guard
+from host_integration import AWAKE_STATE, establish_awake_guard, release_awake_guard, release_awake_guard_at
 from process_identity import capture, matches, read
 from prepare_workspace import (
     DASHBOARD_PORT_MAX,
@@ -159,16 +159,28 @@ def _active_entries(view):
     return list(view.get("running") or []) + list(view.get("retrying") or [])
 
 
+def _complete_process_stop(state_path, release=None):
+    """Remove process bookkeeping only after stop, then reconcile host state."""
+    state_path.unlink(missing_ok=True)
+    try:
+        complete = release() if release else True
+    except (OSError, PreparationError) as exc:
+        print(f"Symphony stopped, but host-awake cleanup is incomplete: {exc}")
+        return 1
+    if complete is False:
+        print("Symphony stopped, but host-awake cleanup is incomplete; "
+              "SAFE TO SHUT DOWN cannot be reported.")
+        return 1
+    print("Symphony stopped - SAFE TO SHUT DOWN")
+    return 0
+
+
 def _stop_process_at(state_path, identity, release=None):
     pid = int(identity["pid"])
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        state_path.unlink(missing_ok=True)
-        if release:
-            release()
-        print("Symphony stopped - SAFE TO SHUT DOWN")
-        return 0
+        return _complete_process_stop(state_path, release)
     except (PermissionError, OSError) as exc:
         print(f"Cannot stop Symphony safely: {exc}")
         return 1
@@ -178,11 +190,7 @@ def _stop_process_at(state_path, identity, release=None):
     except KeyboardInterrupt:
         print("Stop cancelled; Symphony remains running.")
         return 130
-    state_path.unlink(missing_ok=True)
-    if release:
-        release()
-    print("Symphony stopped - SAFE TO SHUT DOWN")
-    return 0
+    return _complete_process_stop(state_path, release)
 
 
 def _stop_process(profile, identity):
@@ -536,14 +544,22 @@ def recovery_status(slug: str, state: dict) -> int:
 def recovery_stop_now(slug: str, state: dict) -> int:
     """Emergency-stop exactly the previously recorded process, without a profile."""
     identity = state["identity"]
+    process_state_path = recovery_state_path(slug)
+    awake_state_path = process_state_path.with_name(AWAKE_STATE)
+    release = lambda: release_awake_guard_at(awake_state_path)
     if not _identity_alive(identity):
         if pid_alive(identity["pid"]):
             print(f"RECOVERY {slug}: managed PID identity is stale or reused; no process was terminated.")
             return 1
-        recovery_state_path(slug).unlink(missing_ok=True)
-        print(f"RECOVERY {slug}: process is already stopped - SAFE TO SHUT DOWN")
-        return 0
-    return _stop_process_at(recovery_state_path(slug), identity)
+        result = _complete_process_stop(process_state_path, release)
+        if result == 0:
+            print(f"RECOVERY {slug}: process is already stopped - SAFE TO SHUT DOWN")
+        return result
+    return _stop_process_at(
+        process_state_path,
+        identity,
+        release=release,
+    )
 
 def verify_manifest(root, manifest_path, manifest):
     files = manifest.get("files")

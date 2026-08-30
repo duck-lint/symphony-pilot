@@ -74,7 +74,12 @@ actually started.
 These are separate authority boundaries: the complete canonical registry is
 required for new work, deployment, credentials, and `start`/`test`; recovery
 control accepts only a safe operator-supplied slug and that slug's validated
-persisted process identity for inspection or emergency shutdown.
+persisted process identity for inspection or emergency shutdown. Recovery
+`stop-now` also derives that slug's state namespace to validate and reconcile
+the exact persisted host-awake helper record. It never reads a current profile
+or grants new project authority. A malformed, reused, or otherwise unresolved
+helper identity makes shutdown incomplete; the operator is not told that the
+host is safe to shut down until both managed resources are reconciled.
 
 Physical namespace operations are WSL/Linux operations. Native Windows Python
 may perform host-neutral registry validation and port allocation, but it must

@@ -44,6 +44,12 @@ Canonical project authority requires the complete valid registry for new work,
 start, test, deploy, and secret provisioning. A registry defect cannot grant
 new authority, but it also does not strand an already-managed process: `status`
 and `stop-now` may use only that project's persisted recovery identity.
+Recovery `stop-now` validates the persisted process identity, stops only that
+exact process, then validates and reconciles the exact `host-awake.json` in the
+same slug-derived state directory. It does not read credentials, query the
+tracker, or reconstruct a profile. Missing or already-dead helper state is
+safe to reconcile; malformed or reused helper identity fails closed and is
+reported as incomplete rather than producing a clean shutdown result.
 
 `finish` drains active work before stopping. `stop` refuses active work and `stop-now` is the emergency path. PID, awake-guard, lock, recovery, and log state are project-derived. Tracker requests contain only the selected profile's repository and dispatch labels. A shared label string in another repository is not dispatchable by this instance.
 

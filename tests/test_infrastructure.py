@@ -109,6 +109,18 @@ class InfrastructureTests(unittest.TestCase):
         path.write_text(json.dumps(state) + "\n", encoding="utf-8")
         return state
 
+    def write_awake_state(self, path: pathlib.Path, pid: int = 456,
+                          identity_pid: int | None = None) -> dict:
+        state = {
+            "schema": host_integration.AWAKE_SCHEMA,
+            "pid": pid,
+            "identity": {"pid": identity_pid if identity_pid is not None else pid,
+                          "boot_id": "awake-boot", "start_time": "awake-start"},
+            "backend": host_integration.AWAKE_BACKEND,
+        }
+        path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+        return state
+
     def test_idle_stop_is_allowed_after_runtime_state_is_verified(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = make_profile(pathlib.Path(directory))
@@ -957,6 +969,100 @@ class InfrastructureTests(unittest.TestCase):
                     project_control.read_recovery_state("alpha")
             kill.assert_not_called()
 
+    def test_recovery_stop_now_reconciles_exact_awake_helper_with_invalid_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            state_path = root / "alpha-state" / "symphony.pid"
+            state_path.parent.mkdir()
+            self.write_recovery_state(state_path)
+            awake_path = state_path.with_name(host_integration.AWAKE_STATE)
+            self.write_awake_state(awake_path)
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(host_integration, "_identity_alive", side_effect=[True, False, False]), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "github") as github, \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "stop-now"]):
+                self.assertEqual(project_control.main(), 0)
+            self.assertEqual(kill.call_args_list, [
+                mock.call(123, project_control.signal.SIGTERM),
+                mock.call(456, project_control.signal.SIGTERM),
+            ])
+            self.assertFalse(state_path.exists())
+            self.assertFalse(awake_path.exists())
+            read_secret.assert_not_called()
+            github.assert_not_called()
+
+    def test_recovery_stop_now_succeeds_without_awake_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.recovery_stop_now("alpha", project_control.read_recovery_state("alpha")), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            self.assertFalse(state_path.exists())
+
+    def test_dead_awake_helper_bookkeeping_is_removed_without_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / host_integration.AWAKE_STATE
+            self.write_awake_state(path)
+            with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False), \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                self.assertTrue(host_integration.release_awake_guard_at(path))
+            kill.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_reused_awake_pid_fails_recovery_without_killing_reused_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path)
+            awake_path = state_path.with_name(host_integration.AWAKE_STATE)
+            self.write_awake_state(awake_path)
+            output = StringIO()
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    redirect_stdout(output):
+                result = project_control.recovery_stop_now("alpha", project_control.read_recovery_state("alpha"))
+            self.assertEqual(result, 1)
+            self.assertEqual(kill.call_args_list, [mock.call(123, project_control.signal.SIGTERM)])
+            self.assertTrue(awake_path.exists())
+            self.assertIn("cleanup is incomplete", output.getvalue())
+            self.assertNotIn("Symphony stopped - SAFE TO SHUT DOWN", output.getvalue())
+
+    def test_malformed_awake_state_fails_closed_without_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / host_integration.AWAKE_STATE
+            path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(host_integration, "_identity_alive") as identity_alive, \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                self.assertFalse(host_integration.release_awake_guard_at(path))
+            identity_alive.assert_not_called()
+            kill.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_awake_outer_pid_mismatch_fails_closed_without_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / host_integration.AWAKE_STATE
+            self.write_awake_state(path, pid=456, identity_pid=457)
+            with mock.patch.object(host_integration, "_identity_alive") as identity_alive, \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                self.assertFalse(host_integration.release_awake_guard_at(path))
+            identity_alive.assert_not_called()
+            kill.assert_not_called()
+            self.assertTrue(path.exists())
+
     def test_invalid_registry_has_no_recovery_fallback_for_authority_acquisition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -1352,7 +1458,7 @@ class InfrastructureTests(unittest.TestCase):
         with mock.patch.object(process_identity, "capture", return_value={**identity, "start_time": "other"}):
             self.assertFalse(process_identity.matches(altered))
 
-    def test_recycled_awake_pid_is_never_terminated(self):
+    def test_malformed_legacy_awake_record_is_not_terminated_or_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = self.profile_with(make_profile(pathlib.Path(directory)), prevent_host_sleep=True)
             path = profile.state_root / host_integration.AWAKE_STATE
@@ -1360,9 +1466,9 @@ class InfrastructureTests(unittest.TestCase):
             path.write_text(json.dumps({"pid": 456, "identity": process_state(456)["identity"]}) + "\n")
             with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
                     mock.patch.object(host_integration.os, "kill") as kill:
-                host_integration.release_awake_guard(profile)
+                self.assertFalse(host_integration.release_awake_guard(profile))
             kill.assert_not_called()
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
 
     def test_notification_redacts_credential_shapes_and_urls(self):
         with tempfile.TemporaryDirectory() as directory:
