@@ -27,15 +27,15 @@ def selected_deployment(profile: Profile):
     """Resolve the derived deployment namespace; profiles cannot override it."""
     return deployment_path(profile)
 
-def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_run: bool) -> pathlib.Path:
+def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run: bool) -> pathlib.Path:
     profile = load_profile(profile_path)
     role_names = {path.stem for path in ROLE_POLICY_FILES}
     if role_names != EXPECTED_ROLE_NAMES:
         raise SystemExit("role policy pack must contain exactly the six generic roles")
-    raw_target = install_root or selected_deployment(profile)
+    raw_target = destination or selected_deployment(profile)
     target = (raw_target if isinstance(raw_target, pathlib.PurePosixPath) and os.name == "nt"
               else pathlib.Path(raw_target).expanduser().resolve())
-    if install_root is None and os.name != "nt" and not str(target).startswith("/home/"):
+    if destination is None and os.name != "nt" and not str(target).startswith("/home/"):
         raise SystemExit("deployment root must remain on the WSL-native filesystem")
     source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
                                   capture_output=True, check=True).stdout.strip()
@@ -91,7 +91,6 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True, help="registered project slug")
-    parser.add_argument("--install-root", type=pathlib.Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
@@ -99,9 +98,7 @@ def main() -> int:
             raise PreparationError("project", "ordinary source deployment requires --project <registered-slug>")
         profile_path = ROOT / "projects" / args.project / "profile.toml"
         profile = resolve_project(args.project, ROOT / "projects")
-        deploy_path = deploy(profile_path, args.install_root, args.dry_run)
-        if deploy_path != selected_deployment(profile) and args.install_root is not None:
-            print("warning: --install-root is a non-persisted developer/test override", file=sys.stderr)
+        deploy_path = deploy(profile_path, None, args.dry_run)
     except PreparationError as exc:
         print(f"symphony-pilot deployment stopped: {exc.kind}: {exc}", file=sys.stderr)
         return 78

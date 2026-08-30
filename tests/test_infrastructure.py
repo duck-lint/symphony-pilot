@@ -1226,6 +1226,21 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('"source_commit"', result.stdout)
         self.assertNotIn("operator_cli", result.stdout)
 
+    def test_source_deploy_rejects_arbitrary_install_root_and_uses_derived_destination(self):
+        rejected = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/deploy.py"), "--project", "cleanroom",
+             "--install-root", "C:/arbitrary", "--dry-run"],
+            text=True, capture_output=True,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        selected = project_registry.resolve_project("cleanroom", ROOT / "projects")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/deploy.py"), "--project", "cleanroom", "--dry-run"],
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout)["install_root"],
+                         str(deploy.selected_deployment(selected)))
+
     def test_registry_accepts_empty_one_and_arbitrary_n_projects(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

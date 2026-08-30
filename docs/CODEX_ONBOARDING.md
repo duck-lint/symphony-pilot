@@ -262,7 +262,7 @@ This is not a project-specific tuning choice.
 Validate the profile with:
 
 ```bash
-python3 scripts/validate_profile.py projects/<project-slug>/profile.toml
+python3 scripts/validate_profile.py --project <project-slug>
 ```
 
 If changes are needed in both repositories, keep commits bounded and separated by repository responsibility.
@@ -274,7 +274,7 @@ If the required host secret does not yet exist, stop at the human credential bou
 The human should provision it from the `symphony-pilot` checkout with:
 
 ```bash
-python3 scripts/provision_secret.py projects/<project-slug>/profile.toml
+python3 scripts/provision_secret.py --project <project-slug>
 ```
 
 Do not replace this with repository `.env` files, shell startup variables, workflow secrets embedded in Git, or ad hoc secret-copying logic.

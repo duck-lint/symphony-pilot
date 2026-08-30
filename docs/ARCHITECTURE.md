@@ -37,11 +37,14 @@ per project pi
   ~/.config/symphony-pilot/secrets/<slug>/<reference>
 ```
 
-`deployment(pi)` contains the generated profile, workflow, runtime, generic
-role policies, operator CLI, and manifest. It never contains the official
-Symphony executable. Atomic backup/replacement is bounded to that one derived
-deployment directory. `start`, `stop`, `finish`, `status`, and `test` operate
-on the selected slug's derived state and deployment only.
+The source checkout contains registry discovery, project resolution, deploy,
+and lifecycle commands. A generated `deployment(pi)` contains only the
+generated profile snapshot, `WORKFLOW.md`, runtime hooks and preparation code
+required by Symphony, architect/role policies, and `DEPLOYMENT.json`. It never
+contains the source operator CLI or the official Symphony executable. Atomic
+backup/replacement is bounded to that one derived deployment directory. Source
+checkout lifecycle commands operate on the selected slug's derived state and
+deployment only.
 
 For distinct projects, registry validation rejects duplicate repository
 identity, service identity, dashboard port, or any equality/containment overlap

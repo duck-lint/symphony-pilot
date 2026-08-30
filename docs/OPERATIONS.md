@@ -26,7 +26,7 @@ Onboarding a new project is:
 4. Run the deployment dry-run, deploy, and `test` action.
 5. Enable dispatch only after a harmless end-to-end project canary proves the actual app-server role handoff and sandbox boundaries.
 
-`--install-root` is retained only as an explicit non-persisted developer/test override. Normal project deployment always uses the derived slug namespace. The shared executable must already exist on `PATH` or be named by `SYMPHONY_BIN`; deployment never downloads, copies, preserves, or migrates it.
+Normal project deployment always uses the derived slug namespace. The internal Python deployment function accepts a test-only destination parameter; the ordinary source CLI does not expose it. The shared executable must already exist on `PATH` or be named by `SYMPHONY_BIN`; deployment never downloads, copies, preserves, or migrates it.
 
 `finish` drains active work before stopping. `stop` refuses active work and `stop-now` is the emergency path. PID, awake-guard, lock, recovery, and log state are project-derived. Tracker requests contain only the selected profile's repository and dispatch labels. A shared label string in another repository is not dispatchable by this instance.
 

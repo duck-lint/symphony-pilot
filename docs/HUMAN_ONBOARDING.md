@@ -98,7 +98,7 @@ Prefer a finite expiration and document rotation expectations. Never ask the hum
 After the onboarding agent has created and validated the project profile, use the accepted helper from the `symphony-pilot` checkout:
 
 ```bash
-python3 scripts/provision_secret.py projects/<project-slug>/profile.toml
+python3 scripts/provision_secret.py --project <project-slug>
 ```
 
 The helper prompts with hidden input, creates the project secret directory with mode `0700`, writes the credential atomically with mode `0600`, and does not place the value in shell history.
