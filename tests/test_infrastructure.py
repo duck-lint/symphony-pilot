@@ -286,10 +286,13 @@ class InfrastructureTests(unittest.TestCase):
                            launcher.index("source .git/symphony-toolchain.env"))
         self.assertIn("app-server", launcher)
         self.assertIn(".codex/agents", launcher)
-        self.assertIn("target-owned role policy collision", launcher)
+        self.assertIn("reserved Codex agent name collision", launcher)
         self.assertIn("export CODEX_HOME", launcher)
         self.assertIn('mktemp -d "/tmp/symphony-pilot-codex-home.XXXXXX"', launcher)
-        self.assertIn("trap cleanup_role_home EXIT INT TERM", launcher)
+        self.assertIn('exec "${CODEX_BIN:-codex}"', launcher)
+        self.assertIn("trap - EXIT INT TERM", launcher)
+        self.assertIn("symphony-pilot-role-home/v1", launcher)
+        self.assertIn("tomllib", launcher)
         self.assertNotIn('ROLE_TARGET="$PWD/.codex/agents"', launcher)
 
     def test_launcher_role_setup_leaves_target_git_state_clean(self):
@@ -325,13 +328,35 @@ class InfrastructureTests(unittest.TestCase):
                 shutil.copy2(policy, role_source / policy.name)
             original_home = root / "operator-codex"
             original_home.mkdir()
+            operator_hook = original_home / "harmless-hook.sh"
+            operator_hook.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf executed > \"$HOOK_OBSERVATION\"\n", encoding="utf-8")
+            operator_hook.chmod(0o755)
+            (original_home / "hooks.json").write_text(
+                json.dumps({"harmless_hook": bash_path(operator_hook)}) + "\n", encoding="utf-8")
+            (original_home / "agents").mkdir()
+            (original_home / "agents" / "personal.toml").write_text(
+                'name = "personal"\ndescription = "operator policy"\n'
+                'developer_instructions = "operator policy"\n', encoding="utf-8")
             probe = root / "probe"
+            pid_probe = root / "pid"
             fake = root / "fake-codex"
             fake.write_text(
                 "#!/usr/bin/env bash\n"
                 "test -f \"$CODEX_HOME/agents/reviewer.toml\" || exit 41\n"
+                "test -f \"$CODEX_HOME/agents/personal.toml\" || exit 43\n"
+                "test -f \"$CODEX_HOME/hooks.json\" || exit 44\n"
+                "grep -q harmless_hook \"$CODEX_HOME/hooks.json\" || exit 45\n"
+                "hook_path=\"$(python - \"$CODEX_HOME/hooks.json\" <<'PY'\n"
+                "import json, sys\n"
+                "print(json.load(open(sys.argv[1]))[\"harmless_hook\"])\n"
+                "PY\n"
+                ")\"\n"
+                "\"$hook_path\" || exit 46\n"
                 "test -z \"${SYMPHONY_PILOT_GITHUB_TOKEN:-}\" || exit 42\n"
                 "printf '%s' \"$CODEX_HOME\" > \"$ROLE_PROBE\"\n"
+                "printf '%s' \"$$\" > \"$PID_PROBE\"\n"
                 "touch \"$ROLE_READY\"\n"
                 "while [[ ! -e \"$ROLE_RELEASE\" ]]; do sleep 0.01; done\n"
                 "exit 143\n", encoding="utf-8")
@@ -341,6 +366,8 @@ class InfrastructureTests(unittest.TestCase):
                         "SYMPHONY_PILOT_ROLE_POLICY_DIR": bash_path(role_source),
                         "SYMPHONY_PILOT_GITHUB_TOKEN": "must-not-reach-child",
                         "ROLE_PROBE": bash_path(probe),
+                        "PID_PROBE": bash_path(pid_probe),
+                        "HOOK_OBSERVATION": bash_path(root / "hook-observation"),
                         "ROLE_READY": bash_path(root / "ready"),
                         "ROLE_RELEASE": bash_path(root / "release")})
             child = subprocess.Popen([bash, bash_path(ROOT / "runtime/launch_codex.sh")],
@@ -352,24 +379,131 @@ class InfrastructureTests(unittest.TestCase):
                         break
                     time.sleep(0.01)
                 self.assertTrue((root / "ready").exists())
+                self.assertTrue((root / "hook-observation").exists())
                 status_while_running = subprocess.run(
                     ["git", "status", "--porcelain"], cwd=repo,
                     text=True, capture_output=True, check=True)
                 self.assertEqual(status_while_running.stdout, "")
                 self.assertFalse((repo / ".codex").exists())
-                (root / "release").touch()
+                lease = json.loads((repo / ".git" / "symphony-role-home.json").read_text())
+                role_home = pathlib.Path(lease["path"])
+                self.assertNotIn(str(repo), str(role_home))
+                if os.name == "nt":
+                    self.assertTrue(str(role_home).startswith("\\tmp\\") or
+                                    str(lease["path"]).startswith("/tmp/"))
+                else:
+                    self.assertTrue(role_home.is_dir())
+                if os.name == "nt":
+                    (root / "release").touch()
+                else:
+                    child.terminate()
                 result_code = child.wait(timeout=10)
             finally:
                 if child.poll() is None:
                     child.kill()
                     child.wait(timeout=10)
-            self.assertEqual(result_code, 143)
+            if os.name == "nt":
+                self.assertEqual(result_code, 143)
+            else:
+                self.assertLess(result_code, 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child.pid, 0)
             self.assertTrue(probe.exists())
             self.assertNotIn(str(repo), probe.read_text(encoding="utf-8"))
+            if os.name != "nt":
+                self.assertEqual(int(pid_probe.read_text()), child.pid)
             self.assertFalse((repo / ".codex").exists())
             status = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
                                     text=True, capture_output=True, check=True)
             self.assertEqual(status.stdout, "")
+            if os.name == "nt":
+                subprocess.run([bash, "-c", "rm -rf -- \"$1\"", "cleanup",
+                                lease["path"]], check=True)
+                (repo / ".git" / "symphony-role-home.json").unlink()
+            else:
+                self.assertTrue(pw.reconcile_role_home(repo))
+                self.assertFalse(role_home.exists())
+            self.assertFalse((repo / ".git" / "symphony-role-home.json").exists())
+
+    def test_launcher_rejects_logical_role_name_collision(self):
+        bash = None
+        if os.name == "nt":
+            for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                              r"C:\Program Files\Git\usr\bin\bash.exe"):
+                if pathlib.Path(candidate).exists():
+                    bash = candidate
+                    break
+        else:
+            bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("Bash is unavailable")
+
+        def bash_path(path):
+            value = str(path)
+            if os.name == "nt" and len(value) > 2 and value[1] == ":":
+                return "/" + value[0].lower() + value[2:].replace("\\", "/")
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            git_repo(repo)
+            collision = repo / ".codex" / "agents"
+            collision.mkdir(parents=True)
+            (collision / "not-reviewer.toml").write_text(
+                'name = "reviewer"\ndescription = "collision"\n'
+                'developer_instructions = "collision"\n', encoding="utf-8")
+            subprocess.run(["git", "add", ".codex"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "project agent"], cwd=repo, check=True)
+            role_source = root / "role-source"
+            role_source.mkdir()
+            for policy in (ROOT / "workflow/agents").glob("*.toml"):
+                shutil.copy2(policy, role_source / policy.name)
+            result = subprocess.run(
+                [bash, bash_path(ROOT / "runtime/launch_codex.sh")], cwd=repo,
+                env={**os.environ, "CODEX_HOME": bash_path(root / "operator-codex"),
+                     "SYMPHONY_PILOT_ROLE_POLICY_DIR": bash_path(role_source),
+                     "CODEX_BIN": "false"}, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("reserved Codex agent name collision", result.stderr)
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                                    text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+
+    def test_role_home_reconciliation_removes_exact_external_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home."))
+            (role_home / "agents").mkdir()
+            marker = repo / ".git" / "symphony-role-home.json"
+            marker.write_text(json.dumps({
+                "schema": "symphony-pilot-role-home/v1",
+                "pid": 999,
+                "path": str(role_home),
+            }), encoding="utf-8")
+            self.assertTrue(pw.reconcile_role_home(repo))
+            self.assertFalse(role_home.exists())
+            self.assertFalse(marker.exists())
+
+    def test_after_run_reconciles_role_home_before_tracker_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "workspace"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home."))
+            marker = repo / ".git" / "symphony-role-home.json"
+            marker.write_text(json.dumps({
+                "schema": "symphony-pilot-role-home/v1", "pid": 999,
+                "path": str(role_home)}), encoding="utf-8")
+            with mock.patch.object(after_run, "load_profile", return_value=make_profile(root)), \
+                    mock.patch.object(after_run, "read_secret", return_value="redacted"), \
+                    mock.patch.object(sys, "argv", ["after_run", "--profile", "x",
+                                                      "--workspace", str(repo)]):
+                self.assertEqual(after_run.main(), 0)
+            self.assertFalse(role_home.exists())
+            self.assertFalse(marker.exists())
 
     def test_generic_role_policies_have_distinct_contracts(self):
         import tomllib
@@ -422,6 +556,12 @@ class InfrastructureTests(unittest.TestCase):
             self.assertIn(phrase, policy)
         self.assertNotIn("built-in worker subagent", policy)
 
+    def test_canary_requires_mechanical_isolation_evidence(self):
+        operations = (ROOT / "docs/OPERATIONS.md").read_text(encoding="utf-8")
+        self.assertIn("sentinel mutation", operations)
+        self.assertIn("runtime denial/error", operations)
+        self.assertIn("voluntary non-editing is not sandbox evidence", operations)
+
     def test_deployment_inventory_includes_all_generic_role_policies(self):
         self.assertEqual({path.stem for path in deploy.ROLE_POLICY_FILES},
                          deploy.EXPECTED_ROLE_NAMES)
@@ -459,7 +599,7 @@ class InfrastructureTests(unittest.TestCase):
             self.assertIn("RECOVERY-MANIFEST.json", names)
             self.assertFalse(any(name.startswith(".git") for name in names))
 
-    def test_recovery_archive_excludes_secret_named_paths(self):
+    def test_recovery_archive_excludes_secret_named_paths_recursively(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             repo = root / "work" / "GH-10"

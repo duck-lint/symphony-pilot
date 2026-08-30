@@ -7,7 +7,8 @@ import json
 import pathlib
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from prepare_workspace import archive_recovery, git, issue_facts, load_profile, read_secret
+from prepare_workspace import (archive_recovery, git, issue_facts, load_profile,
+                                read_secret, reconcile_role_home)
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -16,6 +17,7 @@ def main() -> int:
     args = parser.parse_args()
     profile = load_profile(args.profile)
     workspace = args.workspace.resolve()
+    reconcile_role_home(workspace)
     status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False)
     if not status:
         return 0

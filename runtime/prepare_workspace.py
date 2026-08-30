@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -321,8 +322,56 @@ def process_owns_workspace(workspace: pathlib.Path) -> bool:
     return False
 
 
+ROLE_HOME_SCHEMA = "symphony-pilot-role-home/v1"
+ROLE_HOME_MARKER = pathlib.PurePosixPath(".git/symphony-role-home.json")
+ROLE_HOME_PREFIX = "symphony-pilot-codex-home."
+
+
+def _role_home_path(value: object) -> pathlib.Path:
+    if not isinstance(value, str):
+        raise PreparationError("role_home_recovery", "role-home marker path is invalid")
+    path = pathlib.Path(value).resolve()
+    if path.parent != pathlib.Path(tempfile.gettempdir()).resolve() or not path.name.startswith(ROLE_HOME_PREFIX):
+        raise PreparationError("role_home_recovery", "role-home marker escapes the pilot staging directory")
+    return path
+
+
+def reconcile_role_home(workspace: pathlib.Path) -> bool:
+    """Remove the exact external role home left by a completed or crashed run.
+
+    The marker is host-owned state under .git, not a target-project file. Its
+    path is accepted only when it is the launcher-created /tmp prefix, so a
+    malformed marker fails closed instead of becoming a deletion primitive.
+    """
+    marker = workspace / pathlib.Path(ROLE_HOME_MARKER)
+    if not marker.exists():
+        return False
+    if process_owns_workspace(workspace):
+        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its workspace is active")
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreparationError("role_home_recovery", "role-home marker cannot be read") from exc
+    if (not isinstance(data, dict) or data.get("schema") != ROLE_HOME_SCHEMA or
+            not isinstance(data.get("pid"), int) or isinstance(data.get("pid"), bool) or
+            data.get("pid") < 1):
+        raise PreparationError("role_home_recovery", "role-home marker schema is invalid")
+    role_home = _role_home_path(data.get("path"))
+    try:
+        if role_home.is_symlink():
+            role_home.unlink()
+        elif role_home.is_dir():
+            shutil.rmtree(role_home)
+        elif role_home.exists():
+            role_home.unlink()
+        marker.unlink()
+    except OSError as exc:
+        raise PreparationError("role_home_recovery", "stale role home could not be removed") from exc
+    return True
+
+
 def recovery_path_is_safe(path: pathlib.Path) -> bool:
-    """Exclude common secret containers without exposing their contents."""
+    """Apply the pre-existing host rule that secrets never enter archives."""
     sensitive_names = {".env", "credentials", "credential", "secret", "secrets",
                        "token", "tokens", "private-key", "private_keys"}
     sensitive_suffixes = {".key", ".pem", ".p12", ".pfx", ".kdbx", ".token", ".secret"}
@@ -335,7 +384,7 @@ def recovery_path_is_safe(path: pathlib.Path) -> bool:
 
 
 def recovery_entries(workspace: pathlib.Path) -> tuple[list[tuple[pathlib.Path, str]], list[str]]:
-    """Walk recovery input without recursively crossing excluded paths or symlinks."""
+    """Walk recovery input recursively without crossing excluded paths."""
     entries: list[tuple[pathlib.Path, str]] = []
     excluded: list[str] = []
 
@@ -528,6 +577,7 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
         try:
             if process_owns_workspace(workspace):
                 raise PreparationError("workspace_in_use", "another process currently owns the issue workspace")
+            reconcile_role_home(workspace)
             facts = issue_facts(profile, workspace, token)
             fetch = subprocess.run(["git", "fetch", "origin", "refs/heads/" + facts.branch + ":refs/remotes/origin/" + facts.branch],
                                    cwd=workspace, text=True, capture_output=True)

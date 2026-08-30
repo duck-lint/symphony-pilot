@@ -37,14 +37,13 @@ publication, and final acceptance. The target repository owns semantic
 decisions.
 
 The generic role policies are deployed under `workflow/agents/`. The Codex
-launcher copies them into a temporary per-process `CODEX_HOME/agents/`
-directory outside the target checkout for the app-server lifetime, preserves
-operator authentication/configuration through symlinks, and removes the
-temporary home on exit. It refuses collisions with target-owned same-name role
-files without creating `.codex` in the target. This keeps generated role files
-out of Git and avoids making target projects accommodate pilot artifacts. The
-host's supported Codex discovery mechanism is personal-agent discovery scoped
-to this process; project-owned `.codex/agents` remains untouched.
+launcher creates a temporary per-process `CODEX_HOME` outside the target
+checkout, symlinks the complete operator home surface into it, preserves
+personal agents, and overlays the six pilot policies. It refuses collisions by
+logical TOML `name` across personal, project, and pilot layers without creating
+`.codex` in the target. A host-owned lease under `.git` lets `after_run`, next
+preparation, or recovery remove the exact external home after normal or
+abnormal termination. Project-owned `.codex/agents` remains untouched.
 
 The role pack and launcher preflight are deployment wiring. A complete
 named-role lifecycle remains unproven until a harmless target issue is run and

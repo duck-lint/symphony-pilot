@@ -94,7 +94,7 @@ python3 scripts/project.py --profile projects/cleanroom/profile.toml finish
 
 `stop` refuses to terminate active work. `stop-now` is the emergency path.
 
-Before authorizing real work for a new project, run a harmless issue through the complete dispatch/workspace/multi-role/workpad/completion/cleanup lifecycle. The canary must verify that the deployed app-server actually loads and uses the named role policies; files and prompts alone are not proof of role execution.
+Before authorizing real work for a new project, run a harmless issue through the complete dispatch/workspace/multi-role/workpad/completion/cleanup lifecycle. The canary must verify that the deployed app-server actually loads and uses the named role policies; files and prompts alone are not proof of role execution. Reviewer and adversary isolation additionally require a harmless attempted sentinel mutation to be denied by the runtime; a voluntary no-edit is not sandbox evidence.
 
 ## Repository layout
 

@@ -33,8 +33,11 @@ responsibility of the pilot checkout.
 
 During an app-server run, the launcher exposes those role policies through a
 temporary external `CODEX_HOME`; it does not create pilot role files in the
-target checkout. The archivist returns a closeout packet, while the architect
-persists only accepted archival facts to the single workpad.
+target checkout. The temporary home overlays the complete operator Codex home
+surface, including user hooks and personal agents, and records a host-owned
+lease under `.git` for normal and stale cleanup. The archivist returns a
+closeout packet, while the architect persists only accepted archival facts to
+the single workpad.
 
 Start performs a GitHub dispatch-label count before launching and enforces the
 profile's one-issue limit. Deployment and preparation fail closed when a
@@ -56,6 +59,9 @@ deployment, and perform a harmless canary before enabling its dispatch label.
 The canary must prove a real app-server role handoff, not just deployment
 presence: observe project-manager and planner packets, an implementer change,
 a fresh reviewer verdict, a fresh adversarial verdict, and the same final HEAD
-in both acceptance records and mechanical validation. If role selection is not
-available in the installed Codex path, record that capability boundary and do
-not silently run the old architect-worker lifecycle.
+in both acceptance records and mechanical validation. For reviewer and
+adversary isolation, the canary must also request an explicitly harmless
+sentinel mutation and observe a runtime denial/error while confirming the
+worktree is unchanged; voluntary non-editing is not sandbox evidence. If role
+selection is not available in the installed Codex path, record that capability
+boundary and do not silently run the old architect-worker lifecycle.

@@ -11,10 +11,13 @@ repository identity and remote connectivity, then chooses state as follows:
 - Dirty tree with a unique delta: archive it outside the workspace, record one
   stable blocker fingerprint in the workpad, disable dispatch, and stop. It is
   never silently discarded.
-- Recovery archives exclude Git metadata and common secret containers such as
-  `.env`, credential/token/secret paths, private-key files, and private-key
-  extensions. Exclusions are recorded by path name in the non-secret recovery
-  manifest; contents are never copied into the archive.
+- Recovery archives exclude Git metadata, the target build directory, and
+  secret-shaped paths recursively. Excluded paths are recorded by name in the
+  non-secret recovery manifest; contents are never copied. This is the
+  pre-existing host rule in `AGENTS.md`, not a role-lifecycle policy. If the
+  only unique unpublished state is excluded private material, this issue does
+  not provide a quarantine or preservation mechanism; that preservation-versus
+  privacy decision remains a separate host/security authority question.
 - Broken/stale metadata or unsafe workspace: preserve the old path and clone a
   fresh WSL-native workspace.
 - Every successful preparation writes .git/symphony-preparation.json only after

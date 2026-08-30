@@ -8,7 +8,8 @@ import pathlib
 import re
 
 from host_integration import clear_notification, notify, _safe_summary
-from prepare_workspace import comments, compact_workpad, github, load_profile, read_secret, workpad
+from prepare_workspace import (comments, compact_workpad, github, load_profile,
+                                read_secret, reconcile_role_home, workpad)
 
 
 def current_blocker_body(workpad_body: str) -> str:
@@ -36,6 +37,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         profile = load_profile(args.profile)
+        reconcile_role_home(args.workspace.resolve())
         token = read_secret(profile)
         match = re.fullmatch(r"GH-(\d+)", args.workspace.name)
         if not match:
