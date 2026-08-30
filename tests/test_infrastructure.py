@@ -1,6 +1,7 @@
 """Focused infrastructure regression tests for the reusable pilot runtime."""
 from __future__ import annotations
 import json
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -16,6 +17,7 @@ import prepare_workspace as pw
 import after_run
 sys.path.insert(0, str(ROOT / "scripts"))
 import project as project_control
+import deploy
 import host_integration
 import process_identity
 
@@ -149,6 +151,12 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(compact.count("same"), 1)
         self.assertLessEqual(len(bounded), 1000)
 
+    def test_duplicate_workpads_are_not_selected(self):
+        comments = [{"id": 1, "body": "<!-- symphony-workpad:v1 --> one"},
+                    {"id": 2, "body": "<!-- symphony-workpad:v1 --> two"}]
+        self.assertEqual(pw.workpad_candidates(comments), comments)
+        self.assertIsNone(pw.workpad(comments))
+
     def test_blocker_fingerprint_is_stable(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -181,10 +189,128 @@ class InfrastructureTests(unittest.TestCase):
             finally:
                 pw.github, pw.git = old_github, old_git
 
+    def test_multiple_matching_issue_prs_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-11"
+            repo.mkdir(parents=True)
+            p = make_profile(root)
+            old_github, old_git = pw.github, pw.git
+            try:
+                def fake_github(_p, _t, _m, path, _body=None):
+                    if path == "/issues/11":
+                        return {"body": "required starting commit: " + "e"*40}
+                    if path.endswith("/comments?per_page=100"):
+                        return []
+                    if path.startswith("/pulls"):
+                        return [
+                            {"number": 1, "head": {"repo": {"full_name": p.repository},
+                                                     "ref": "codex/gh-11-one"}},
+                            {"number": 2, "head": {"repo": {"full_name": p.repository},
+                                                     "ref": "codex/gh-11-two"}},
+                        ]
+                    return []
+                pw.github = fake_github
+                pw.git = lambda *_args, **_kwargs: ""
+                with self.assertRaisesRegex(pw.PreparationError, "more than one matching"):
+                    pw.issue_facts(p, repo, "secret")
+            finally:
+                pw.github, pw.git = old_github, old_git
+
+    def test_non_draft_issue_pr_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-12"
+            repo.mkdir(parents=True)
+            p = make_profile(root)
+            old_github, old_git = pw.github, pw.git
+            try:
+                def fake_github(_p, _t, _m, path, _body=None):
+                    if path == "/issues/12":
+                        return {"body": "required starting commit: " + "f"*40}
+                    if path.endswith("/comments?per_page=100"):
+                        return []
+                    if path.startswith("/pulls"):
+                        return [{"number": 3, "draft": False,
+                                 "head": {"repo": {"full_name": p.repository},
+                                          "ref": "codex/gh-12-work"}}]
+                    return []
+                pw.github = fake_github
+                pw.git = lambda *_args, **_kwargs: ""
+                with self.assertRaisesRegex(pw.PreparationError, "not a draft"):
+                    pw.issue_facts(p, repo, "secret")
+            finally:
+                pw.github, pw.git = old_github, old_git
+
     def test_launcher_unsets_tracker_variables(self):
         launcher = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")
         self.assertIn("unset SYMPHONY_PILOT_GITHUB_TOKEN", launcher)
+        self.assertLess(launcher.index("unset SYMPHONY_PILOT_GITHUB_TOKEN"),
+                        launcher.index("source .git/symphony-toolchain.env"))
         self.assertIn("app-server", launcher)
+        self.assertIn(".codex/agents", launcher)
+        self.assertIn("target-owned role policy collision", launcher)
+        self.assertIn("trap cleanup_role_policies EXIT", launcher)
+
+    def test_generic_role_policies_have_distinct_contracts(self):
+        import tomllib
+
+        expected = {
+            "project-manager": "read-only",
+            "planner": "read-only",
+            "implementer": "workspace-write",
+            "reviewer": "read-only",
+            "adversary": "read-only",
+            "archivist": "read-only",
+        }
+        policies = sorted((ROOT / "workflow/agents").glob("*.toml"))
+        self.assertEqual({path.stem for path in policies}, set(expected))
+        descriptions = set()
+        for path in policies:
+            with path.open("rb") as stream:
+                data = tomllib.load(stream)
+            self.assertEqual(data["name"], path.stem)
+            self.assertEqual(data["sandbox_mode"], expected[path.stem])
+            self.assertTrue(data["description"])
+            self.assertTrue(data["developer_instructions"])
+            descriptions.add(data["developer_instructions"])
+        self.assertEqual(len(descriptions), len(expected))
+
+    def test_architect_policy_defines_independent_gates_and_adjudication(self):
+        policy = (ROOT / "workflow/architect_policy.md").read_text(encoding="utf-8")
+        for phrase in (
+            "ARCHITECT / ORCHESTRATOR",
+            "PROJECT-MANAGER",
+            "PLANNER",
+            "IMPLEMENTER",
+            "REVIEWER",
+            "ADVERSARY",
+            "ARCHIVIST",
+            "licensed correction | unresolved project decision | infrastructure condition",
+            "A correction invalidates every prior acceptance of the older HEAD",
+            "Reviewer and adversary findings are internal orchestration state",
+            "<!-- symphony-workpad:v1 -->",
+            "final fresh REVIEWER",
+            "final fresh ADVERSARY",
+        ):
+            self.assertIn(phrase, policy)
+        self.assertNotIn("built-in worker subagent", policy)
+
+    def test_deployment_inventory_includes_all_generic_role_policies(self):
+        self.assertEqual({path.stem for path in deploy.ROLE_POLICY_FILES},
+                         deploy.EXPECTED_ROLE_NAMES)
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
+            "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
+            text=True, capture_output=True, check=True)
+        data = json.loads(result.stdout)
+        self.assertEqual(set(data["role_policies"]), deploy.EXPECTED_ROLE_NAMES)
+        self.assertEqual(data["files"], 17)
+
+    def test_deployed_test_requires_and_verifies_role_policy_files(self):
+        source = (ROOT / "scripts/project.py").read_text(encoding="utf-8")
+        for name in ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"):
+            self.assertIn(f'"{name}"', source)
+        self.assertIn("deployed file does not match its manifest", source)
 
     def test_schema_has_no_credential_property(self):
         schema = json.loads((ROOT / "schemas/project-profile.schema.json").read_text())
@@ -206,6 +332,41 @@ class InfrastructureTests(unittest.TestCase):
                 names = tar.getnames()
             self.assertIn("RECOVERY-MANIFEST.json", names)
             self.assertFalse(any(name.startswith(".git") for name in names))
+
+    def test_recovery_archive_excludes_secret_named_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-10"
+            repo.mkdir(parents=True)
+            git_repo(repo)
+            (repo / ".env").write_text("PRIVATE=do-not-archive\n", encoding="utf-8")
+            (repo / "private.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
+            (repo / "dirty.txt").write_text("recover\n", encoding="utf-8")
+            p = make_profile(root)
+            facts = pw.IssueFacts(10, "branch", "c"*40, None, None, None, None, "initial", None, None, [])
+            archive = pw.archive_recovery(p, repo, facts, "?? dirty.txt")
+            import tarfile
+            with tarfile.open(archive) as tar:
+                names = tar.getnames()
+                manifest = json.loads(tar.extractfile("RECOVERY-MANIFEST.json").read())
+            self.assertIn("dirty.txt", names)
+            self.assertNotIn(".env", names)
+            self.assertNotIn("private.pem", names)
+            self.assertEqual(set(manifest["excluded_paths"]), {".env", "private.pem"})
+
+    def test_manifest_verification_rejects_tampered_or_uninventoried_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "runtime").mkdir()
+            (root / "runtime" / "launch_codex.sh").write_text("original\n", encoding="utf-8")
+            manifest_path = root / "DEPLOYMENT.json"
+            digest = hashlib.sha256(
+                (root / "runtime" / "launch_codex.sh").read_bytes()).hexdigest()
+            manifest = {"files": {"runtime/launch_codex.sh": digest}}
+            project_control.verify_manifest(root, manifest_path, manifest)
+            (root / "runtime" / "launch_codex.sh").write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                project_control.verify_manifest(root, manifest_path, manifest)
 
     def test_initial_facts_use_licensed_sha_when_remote_branch_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:

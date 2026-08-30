@@ -66,13 +66,47 @@ If a genuinely missing project decision prevents safe automation, stop and repor
 
 Use these roles.
 
-### ARCHITECT
+### ARCHITECT / ORCHESTRATOR
 
-The parent Codex session owns issue interpretation, authority reading, decomposition, bounded worker delegation, review, publication, workpad state, and issue lifecycle.
+The parent Codex session owns issue interpretation, authority integration,
+decomposition, role routing, adjudication, review sequencing, publication,
+workpad state, and final acceptance. Its inspection of worker output is
+triage, not independent acceptance of its own plan.
 
-### WORKER
+### PROJECT-MANAGER and PLANNER
 
-The delegated Codex worker performs bounded implementation/research/testing, returns evidence, and does not independently expand scope.
+Project-manager is read-only/advisory and establishes admissibility, authority
+boundaries, affected and non-affected surfaces, unresolved decisions, and stop
+conditions. Planner is read-only with respect to project source and turns the
+admissible objective into bounded seams, acceptance criteria, and a
+verification contract. Neither role defines missing project semantics.
+
+### IMPLEMENTER
+
+The mutating role performs only an architect-authorized implementation seam,
+returns evidence, and does not independently expand scope. Corrections use a
+fresh implementer instance and invalidate prior acceptance of the old HEAD.
+
+### REVIEWER and ADVERSARY
+
+Both roles are read-only with respect to project source. Reviewer checks
+conformance with the issue, authority, plan, verification contract, and tests.
+Adversary independently tries to falsify the completeness claim using the
+cheapest grounded checks. Findings return to architect adjudication and do not
+become new GitHub work orders automatically.
+
+These contracts define the reusable policy boundary. They do not by themselves
+prove that the installed Symphony/Codex app-server can select and isolate
+named roles. The deployed launcher preflights and supplies the role pack; a
+harmless live canary must establish actual role handoffs before that capability
+is described as operational.
+
+### ARCHIVIST
+
+The continuity role records accepted lifecycle conclusions, review history,
+decisions, validation evidence, limitations, publication state, and final
+status in the existing workpad or explicitly authorized project surface. It
+does not invent decisions or create a `harness/` directory.
 
 ### HUMAN OPERATOR
 

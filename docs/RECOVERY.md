@@ -11,6 +11,10 @@ repository identity and remote connectivity, then chooses state as follows:
 - Dirty tree with a unique delta: archive it outside the workspace, record one
   stable blocker fingerprint in the workpad, disable dispatch, and stop. It is
   never silently discarded.
+- Recovery archives exclude Git metadata and common secret containers such as
+  `.env`, credential/token/secret paths, private-key files, and private-key
+  extensions. Exclusions are recorded by path name in the non-secret recovery
+  manifest; contents are never copied into the archive.
 - Broken/stale metadata or unsafe workspace: preserve the old path and clone a
   fresh WSL-native workspace.
 - Every successful preparation writes .git/symphony-preparation.json only after

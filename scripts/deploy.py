@@ -16,6 +16,9 @@ sys.path.insert(0, str(ROOT / "runtime"))
 from prepare_workspace import load_profile
 from render_workflow import render
 
+ROLE_POLICY_FILES = tuple(sorted((ROOT / "workflow" / "agents").glob("*.toml")))
+EXPECTED_ROLE_NAMES = {"project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"}
+
 def file_digest(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -24,6 +27,9 @@ def deployment_root(profile):
 
 def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_run: bool) -> pathlib.Path:
     profile = load_profile(profile_path)
+    role_names = {path.stem for path in ROLE_POLICY_FILES}
+    if role_names != EXPECTED_ROLE_NAMES:
+        raise SystemExit("role policy pack must contain exactly the six generic roles")
     raw_target = install_root or deployment_root(profile)
     target = (raw_target if isinstance(raw_target, pathlib.PurePosixPath) and os.name == "nt"
               else pathlib.Path(raw_target).expanduser().resolve())
@@ -31,15 +37,23 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
         raise SystemExit("deployment root must remain on the WSL-native filesystem")
     source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
                                   capture_output=True, check=True).stdout.strip()
+    source_status = subprocess.run(["git", "status", "--porcelain=v1"], cwd=ROOT,
+                                   text=True, capture_output=True, check=True).stdout
+    if source_status and not dry_run:
+        raise SystemExit("deployment requires a clean source checkout; commit the reviewed changes first")
     if dry_run:
         print(json.dumps({"profile": profile.slug, "install_root": str(target),
-                          "source_commit": source_commit, "files": 11}, sort_keys=True))
+                          "source_commit": source_commit,
+                          "source_clean": not bool(source_status),
+                          "role_policies": sorted(role_names),
+                          "files": 11 + len(ROLE_POLICY_FILES)}, sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
     try:
         (stage / "runtime").mkdir()
         (stage / "workflow").mkdir()
+        (stage / "workflow" / "agents").mkdir()
         (stage / "projects" / profile.slug).mkdir(parents=True)
         # Keep the separately installed official Symphony executable when the
         # profile intentionally deploys into its existing runtime directory.
@@ -54,6 +68,8 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
         (stage / "scripts").mkdir()
         shutil.copy2(ROOT / "scripts" / "project.py", stage / "scripts" / "project.py")
         shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
+        for policy in ROLE_POLICY_FILES:
+            shutil.copy2(policy, stage / "workflow" / "agents" / policy.name)
         shutil.copy2(profile_path, stage / "profile.toml")
         (stage / "runtime/launch_codex.sh").chmod(0o755)
         workflow = stage / "projects" / profile.slug / "WORKFLOW.md"

@@ -27,9 +27,9 @@ on the next start. Windows adapters invoke the deployed command
 `<deployment>/scripts/project.py`, never a source checkout.
 
 The deployed `test` action is deployment-safe: it checks that the deployed
-profile, manifest, workflow, operator command, and required runtime modules
-exist. Source-only validation remains the responsibility of the pilot
-checkout.
+profile, manifest, workflow, operator command, required runtime modules, and
+the six generic role-policy files exist. Source-only validation remains the
+responsibility of the pilot checkout.
 
 Start performs a GitHub dispatch-label count before launching and enforces the
 profile's one-issue limit. Deployment and preparation fail closed when a
@@ -46,5 +46,11 @@ and completed states, with fingerprints under the profile state root. They are
 convenience only; GitHub labels and the workpad remain authoritative.
 
 To add a project: commit a non-secret profile under projects/<slug>/, review
-the generated workflow, provision its host secret, run deployment, and perform
-a harmless canary before enabling its dispatch label.
+the generated workflow and role pack, provision its host secret, run
+deployment, and perform a harmless canary before enabling its dispatch label.
+The canary must prove a real app-server role handoff, not just deployment
+presence: observe project-manager and planner packets, an implementer change,
+a fresh reviewer verdict, a fresh adversarial verdict, and the same final HEAD
+in both acceptance records and mechanical validation. If role selection is not
+available in the installed Codex path, record that capability boundary and do
+not silently run the old architect-worker lifecycle.

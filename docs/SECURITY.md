@@ -12,7 +12,8 @@ hidden prompt and writes the directory/file permissions without shell history.
 
 Symphony receives the tracker token because it must read and update GitHub
 issues. The generated Codex launcher explicitly removes the tracker variables
-before starting App Server. SSH is the preferred source credential for
+before sourcing the workspace toolchain fragment or starting App Server. SSH is
+the preferred source credential for
 repository clone/fetch/push. A tracker PAT is not used as ordinary Git
 authentication.
 

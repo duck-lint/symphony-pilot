@@ -23,13 +23,17 @@ GitHub issue / labels / comments
    official OpenAI Symphony
             |
             v
-       Codex architect
+       Codex architect / orchestrator
             |
             v
-     bounded worker work
+ project-manager -> planner -> implementer
+             |
+      reviewer -> adversary
+             |
+ licensed correction loops / archivist
             |
             v
- branch + draft PR + workpad
+ branch + draft PR + workpad -> human merge
 ```
 
 The durable continuation boundary is GitHub state plus the remote issue branch and draft pull request. Local mutable workspaces are disposable execution state.
@@ -39,6 +43,7 @@ The durable continuation boundary is GitHub state plus the remote issue branch a
 - **Project profiles** — non-secret TOML configuration for repository identity, labels, workspace/state roots, limits, Codex settings, and host integration.
 - **Issue-scoped workspaces** — clean preparation for initial work and continuation from the authorized remote issue branch.
 - **Reviewed deployments** — atomic deployment directories with a `DEPLOYMENT.json` manifest recording the source artifacts that were deployed.
+- **Bounded role lifecycle** — generic project-manager, planner, implementer, reviewer, adversary, and archivist policies under one issue branch, draft PR, and workpad.
 - **Credential isolation** — project credentials live in host-side secret files and are not copied into Git, generated workflows, or Codex child environments.
 - **Operator lifecycle controls** — validate, deploy, test, start, inspect status, finish gracefully, stop when idle, or emergency-stop.
 - **Host integration** — WSL/Linux-native process state with optional Windows sleep inhibition and notifications.
@@ -89,7 +94,7 @@ python3 scripts/project.py --profile projects/cleanroom/profile.toml finish
 
 `stop` refuses to terminate active work. `stop-now` is the emergency path.
 
-Before authorizing real work for a new project, run a harmless issue through the complete dispatch/workspace/architect-worker/workpad/completion/cleanup lifecycle.
+Before authorizing real work for a new project, run a harmless issue through the complete dispatch/workspace/multi-role/workpad/completion/cleanup lifecycle. The canary must verify that the deployed app-server actually loads and uses the named role policies; files and prompts alone are not proof of role execution.
 
 ## Repository layout
 
@@ -100,7 +105,8 @@ runtime/    host-side preparation, workflow rendering, lifecycle hooks
 schemas/    machine-readable profile contracts
 scripts/    deployment and operator commands
 tests/      infrastructure regression tests
-workflow/   generic architect policy rendered into deployments
+workflow/   generic architect policy and role policies rendered into deployments
+workflow/agents/  project-scoped Codex custom-agent policies
 ```
 
 ## Tests
