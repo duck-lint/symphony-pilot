@@ -1,70 +1,111 @@
 # Architecture
 
-symphony-pilot is a reusable host-side control plane around the official
-OpenAI Symphony runtime. It does not contain target-project semantics.
+`symphony-pilot` is a generic control plane for an arbitrary finite registry
+of projects. The official OpenAI Symphony executable is shared host
+infrastructure; it is installed independently of this repository and is
+resolved at runtime only through `SYMPHONY_BIN` or `PATH`.
 
-The durable state boundary is:
+The pilot source checkout contains generic runtime, policy, deployment, and
+operator code. It contains no project architecture or closed list of project
+identities. The canonical registry is the tracked set of
+`projects/<slug>/profile.toml` files. The directory name must equal `slug`.
+An empty registry is valid; every discovered profile is loaded and the full
+collection is validated before a slug is resolved.
 
-    GitHub issue/comments/labels + remote issue branch + draft PR
-      -> host preparation
-      -> clean WSL-native issue workspace
-      -> official Symphony
-      -> Codex architect / orchestrator
-      -> project-manager -> planner -> implementer
-      -> independent reviewer -> adversary
-      -> archivist and human merge handoff
+Each profile supplies repository identity, its Git remote, tracker labels,
+secret reference, execution limits, Codex settings, and optional host
+integration preferences. Deployment, workspace, state, log, credential, lock,
+process, workflow, and service namespaces are derived from the slug. Dashboard
+ports are persisted finite host-resource allocations in the canonical profile;
+onboarding tooling chooses an unused value in the unprivileged TCP range
+`1024–65535` and registry validation rejects duplicate assignments. Runtime
+host occupancy is checked separately and never causes automatic renumbering.
+Adding or removing a project never renumbers existing assignments.
+There is no persisted `deployment_root`, `workspace_root`, `state_root`,
+`log_root`, or `service_identity` field.
 
-A project profile supplies repository identity, non-secret paths, labels, limits,
-and Codex settings. runtime/prepare_workspace.py resolves issue-specific
-initial or continuation state. The first run uses the issue-authorized starting
-SHA; a continuation uses the existing remote issue branch and checks ancestry
-against the required base. Local mutable workspaces are execution state, never
-the continuation checkpoint.
+The host topology is:
 
-runtime/render_workflow.py emits the official Symphony WORKFLOW.md for a
-profile. scripts/deploy.py copies reviewed runtime, policy, and the operator
-command into an atomic deployment directory and records source hashes in
-DEPLOYMENT.json. Windows-facing controls invoke
-<deployment>/scripts/project.py, so a source checkout cannot silently change a
-live deployment. The architect policy is generic; the issue body and target
-repository remain the authority for project work.
+```text
+SOURCE CHECKOUT
+  canonical registry
+  registry-wide validation
+  lifecycle/operator CLI
+  deployment command
 
-The host owns Git, recovery archives, toolchain discovery, publication
-preflight, credential isolation, host-awake inhibition, and best-effort generic
-notifications. The architect/orchestrator owns one issue lifecycle, authority
-integration, role routing, adjudication, evidence-specific workpad state,
-publication, and final acceptance. The target repository owns semantic
-decisions.
+GENERATED PROJECT DEPLOYMENT
+  profile snapshot
+  WORKFLOW.md
+  runtime hooks/preparation
+  architect/role policies
+  DEPLOYMENT.json
 
-The generic role policies are deployed under `workflow/agents/`. The Codex
-launcher creates a temporary per-process `CODEX_HOME` outside the target
-checkout, symlinks the complete operator home surface into it, preserves
-personal agents, and overlays the six pilot policies. It refuses collisions by
-logical TOML `name` across personal, project, and pilot layers without creating
-`.codex` in the target. A host-owned lease under `.git` lets `after_run`, next
-preparation, or recovery remove the exact external home after normal or
-abnormal termination. Pilot files use generated non-hidden filenames, so an
-operator file such as `reviewer.toml` is never overwritten even when its
-logical name is unrelated. Cleanup also requires the matching external lease,
-workspace binding, and boot/start process identity to be stale. Both launcher
-and reconciler use the fixed host `/tmp` staging root; ambient `TMPDIR` cannot
-redirect it. If `/tmp` is cleared after a reboot, a stale durable marker is
-removed without authorizing deletion of any replacement path. Project-owned
-`.codex/agents` remains untouched.
+SHARED HOST
+  official Symphony executable
+  canonical WSL/Linux operator root
 
-The role pack and launcher preflight are deployment wiring. A complete
-named-role lifecycle remains unproven until a harmless target issue is run and
-the workpad, app-server events, and exact HEADs confirm each role handoff. The
-repository therefore makes no unconditional claim that every deployed
-Codex/App Server version can execute named roles; a failed capability follows
-the existing infrastructure blocker path.
+tracked registry
+  projects/<slug>/profile.toml
 
-Upstream runtime: OpenAI openai/symphony Elixir reference implementation.
-Upstream lifecycle authority: OpenAI SPEC.md.
-Local policy layer: symphony-pilot.
-No maintained fork of Symphony unless a documented upstream incompatibility forces one.
+per project pi
+  ~/.local/share/symphony-pilot/deployments/<slug>
+  ~/symphony-workspaces/<slug>
+  ~/.local/state/symphony-pilot/<slug>
+  ~/.config/symphony-pilot/secrets/<slug>/<reference>
+```
 
-When prevent_host_sleep is enabled, the pilot owns a small Windows
-SetThreadExecutionState helper and records only its PID/backend under the
-profile state root. Notification fingerprints are also stored there;
-notification failure never changes issue state.
+The source checkout contains registry discovery, project resolution, deploy,
+and lifecycle commands. A generated `deployment(pi)` contains only the
+generated profile snapshot, `WORKFLOW.md`, runtime hooks and preparation code
+required by Symphony, architect/role policies, and `DEPLOYMENT.json`. It never
+contains the source operator CLI or the official Symphony executable. Atomic
+backup/replacement is bounded to that one derived deployment directory. Source
+checkout lifecycle commands operate on the selected slug's derived state and
+deployment only.
+
+`DEPLOYMENT.json` records the exact generated inventory, its hashes, the
+selected profile digest, and a bounded source lifecycle-contract digest.
+`project.py test` and `project.py start` use the same verifier; `start` runs it
+before reading the project credential or querying the tracker. Process state
+also records the launched deployment identity, profile digest, and dashboard
+endpoint so later status/stop operations continue to address the process that
+actually started.
+
+These are separate authority boundaries: the complete canonical registry is
+required for new work, deployment, credentials, and `start`/`test`; recovery
+control accepts only a safe operator-supplied slug and that slug's validated
+persisted process identity for inspection or emergency shutdown. Recovery
+`stop-now` also derives that slug's state namespace to validate and reconcile
+the exact persisted host-awake helper record. It never reads a current profile
+or grants new project authority. A malformed, reused, or otherwise unresolved
+helper identity makes shutdown incomplete; the operator is not told that the
+host is safe to shut down until both managed resources are reconciled. Awake
+startup uses the same strict parser: malformed or unresolved state is retained
+and blocks replacement, while only a valid dead helper with an unused PID may
+be removed before establishing a new guard.
+
+Physical namespace operations are WSL/Linux operations. Native Windows Python
+may perform host-neutral registry validation and port allocation, but it must
+not resolve or mutate a physical project namespace; Windows `USERNAME` is
+never treated as a WSL username.
+
+For distinct projects, registry validation rejects duplicate repository
+identity, service identity, dashboard port, or any equality/containment overlap
+among project-owned namespaces. Repository identity is globally unique because
+the same label text in the same repository would otherwise create tracker
+dispatch authority across profiles. Tracker labels remain repository-scoped;
+the same label may be used in different repositories.
+
+Adding `p(n+1)` means adding only `projects/<slug>/profile.toml` and satisfying
+real host prerequisites. No generic source, schema, runtime dispatch, or
+operator code changes are needed. The remaining limits are actual host
+resources: available ports, disk, process/memory capacity, GitHub/API access,
+the installed shared executable, and the target repository's credentials and
+toolchain.
+
+The role scaffold remains generic: ARCHITECT/orchestrator ownership,
+PROJECT-MANAGER, PLANNER, IMPLEMENTER, REVIEWER, ADVERSARY, ARCHIVIST,
+conformance review, falsification, fresh correction review, exact-HEAD
+agreement, one issue/branch/draft PR/workpad, pagination, role-home leases,
+process identity, recovery boundaries, and no auto-merge. Named-role App
+Server execution remains a future live-canary capability boundary.

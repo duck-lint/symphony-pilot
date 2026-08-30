@@ -5,6 +5,7 @@ import hashlib
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,12 +23,43 @@ import project as project_control
 import deploy
 import host_integration
 import process_identity
+import project_registry
+import provision_secret
 
 def make_profile(root: pathlib.Path) -> pw.Profile:
-    return pw.Profile("demo", "example/project", "git@example:project.git",
-        root / "work", root / "state", root / "logs", "github.token",
-        ("symphony:auto",), "symphony:human", "demo", 4040, 1, 8, 5000,
-        300000, "gpt-5.6-luna", "high", None, root / "deployment")
+    return pw.Profile(
+        slug="demo", repository="example/project", git_remote="git@example:project.git",
+        workspace_root=root / "work", state_root=root / "state", log_root=root / "logs",
+        secret_reference="github.token", dispatch_labels=("symphony:auto",),
+        blocked_label="symphony:human", service_identity="symphony-pilot-demo",
+        dashboard_port=4040, max_concurrent_agents=1, max_turns=8,
+        poll_interval_ms=5000, max_retry_backoff_ms=300000,
+        codex_model="gpt-5.6-luna", codex_reasoning_effort="high", toolchain=None)
+
+
+def write_registry_profile(root: pathlib.Path, slug: str, repository: str | None = None,
+                           dashboard_port: int | None = None) -> pathlib.Path:
+    directory = root / slug
+    directory.mkdir(parents=True)
+    path = directory / "profile.toml"
+    if dashboard_port is None:
+        dashboard_port = 4040 + len(list(root.glob("*/profile.toml")))
+    path.write_text(
+        f'''slug = "{slug}"
+repository = "{repository or "example/" + slug}"
+git_remote = "git@example:{slug}.git"
+secret_reference = "github.token"
+dispatch_labels = ["symphony:auto"]
+blocked_label = "symphony:human"
+dashboard_port = {dashboard_port}
+max_concurrent_agents = 1
+max_turns = 8
+poll_interval_ms = 5000
+max_retry_backoff_ms = 300000
+codex_model = "gpt-5.6-luna"
+codex_reasoning_effort = "high"
+''', encoding="utf-8")
+    return path
 
 
 def process_state(pid: int = 123) -> dict:
@@ -46,6 +78,48 @@ def git_repo(path: pathlib.Path) -> None:
 class InfrastructureTests(unittest.TestCase):
     def profile_with(self, profile, **changes):
         return profile.__class__(**{**profile.__dict__, **changes})
+
+    def deploy_fixture(self, root: pathlib.Path, slug: str = "alpha", port: int = 4040):
+        registry = root / "registry"
+        profile_path = write_registry_profile(registry, slug, dashboard_port=port)
+        target = root / "deployment" / slug
+        source_commit = "a" * 40
+        real_run = deploy.subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, source_commit + "\n", "")
+            if command[:3] == ["git", "status", "--porcelain=v1"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
+            deploy.deploy(profile_path, target, False)
+        return pw.load_profile(profile_path), target
+
+    def write_recovery_state(self, path: pathlib.Path, dashboard_port: int = 4040) -> dict:
+        state = {
+            "schema": "symphony-pilot-process/v2",
+            "identity": {"pid": 123, "boot_id": "boot", "start_time": "start"},
+            "deployment_root": "/home/duck-lint/.local/share/symphony-pilot/deployments/alpha",
+            "deployment_identity": "a" * 64,
+            "deployed_profile_sha256": "b" * 64,
+            "dashboard_url": f"http://127.0.0.1:{dashboard_port}",
+        }
+        path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+        return state
+
+    def write_awake_state(self, path: pathlib.Path, pid: int = 456,
+                          identity_pid: int | None = None) -> dict:
+        state = {
+            "schema": host_integration.AWAKE_SCHEMA,
+            "pid": pid,
+            "identity": {"pid": identity_pid if identity_pid is not None else pid,
+                          "boot_id": "awake-boot", "start_time": "awake-start"},
+            "backend": host_integration.AWAKE_BACKEND,
+        }
+        path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+        return state
 
     def test_idle_stop_is_allowed_after_runtime_state_is_verified(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -715,17 +789,314 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual({path.stem for path in deploy.ROLE_POLICY_FILES},
                          deploy.EXPECTED_ROLE_NAMES)
         result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
-            "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
+            "--project", "cleanroom", "--dry-run"],
             text=True, capture_output=True, check=True)
         data = json.loads(result.stdout)
         self.assertEqual(set(data["role_policies"]), deploy.EXPECTED_ROLE_NAMES)
-        self.assertEqual(data["files"], 17)
+        self.assertEqual(data["files"], 16)
 
     def test_deployed_test_requires_and_verifies_role_policy_files(self):
         source = (ROOT / "scripts/project.py").read_text(encoding="utf-8")
         for name in ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"):
             self.assertIn(f'"{name}"', source)
         self.assertIn("deployed file does not match its manifest", source)
+
+    def test_generated_deployment_coherence_gate_accepts_valid_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile, target = self.deploy_fixture(pathlib.Path(directory))
+            with mock.patch.object(project_control, "install_root", return_value=target):
+                verification = project_control.verify_deployment(profile)
+            self.assertEqual(verification["root"], target.resolve())
+            manifest = json.loads((target / "DEPLOYMENT.json").read_text())
+            self.assertEqual(verification["deployment_identity"], manifest["deployment_identity"])
+
+    def test_start_can_proceed_only_after_real_deployment_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            selected, target = self.deploy_fixture(root)
+            profile = self.profile_with(selected, workspace_root=root / "work",
+                                        state_root=root / "state", log_root=root / "logs")
+            child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
+            identity = process_state()["identity"]
+            with mock.patch.object(project_control, "install_root", return_value=target), \
+                    mock.patch.object(project_control, "read_secret", return_value="test-token"), \
+                    mock.patch.object(project_control, "active_issues", return_value=[]), \
+                    mock.patch.object(project_control, "establish_awake_guard"), \
+                    mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
+                    mock.patch.object(project_control.subprocess, "Popen", return_value=child), \
+                    mock.patch.object(project_control, "capture", return_value=identity), \
+                    mock.patch.object(project_control, "dashboard", return_value={"state": "idle"}):
+                self.assertEqual(project_control.start(profile), 0)
+            state = json.loads((profile.state_root / "symphony.pid").read_text())
+            manifest = json.loads((target / "DEPLOYMENT.json").read_text())
+            self.assertEqual(state["deployment_identity"], manifest["deployment_identity"])
+            self.assertEqual(state["deployed_profile_sha256"], manifest["profile_sha256"])
+
+    def test_unrelated_registry_membership_does_not_invalidate_existing_deployment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile, target = self.deploy_fixture(root)
+            write_registry_profile(root / "registry", "beta", dashboard_port=4041)
+            with mock.patch.object(project_control, "install_root", return_value=target):
+                verification = project_control.verify_deployment(profile)
+            self.assertEqual(verification["root"], target.resolve())
+
+    def test_deployment_coherence_gate_rejects_missing_tampered_and_incompatible_snapshots(self):
+        for case in ("missing_manifest", "tampered_workflow", "profile_mismatch", "contract_mismatch"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                profile, target = self.deploy_fixture(root)
+                if case == "missing_manifest":
+                    (target / "DEPLOYMENT.json").unlink()
+                elif case == "tampered_workflow":
+                    workflow = target / "projects" / profile.slug / "WORKFLOW.md"
+                    workflow.write_text(workflow.read_text() + "tampered\n", encoding="utf-8")
+                elif case == "profile_mismatch":
+                    profile.source_profile_path.write_text(
+                        profile.source_profile_path.read_text() + "display_name = \"changed\"\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    with mock.patch.object(project_control, "install_root", return_value=target), \
+                            mock.patch.object(project_control, "contract_digest", return_value="different"):
+                        with self.assertRaisesRegex(pw.PreparationError, "contract differs"):
+                            project_control.verify_deployment(profile)
+                    continue
+                with mock.patch.object(project_control, "install_root", return_value=target):
+                    with self.assertRaises(pw.PreparationError):
+                        project_control.verify_deployment(profile)
+
+    def test_running_process_retains_deployment_endpoint_and_identity_across_source_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), dashboard_port=4041)
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text(json.dumps({
+                "schema": "symphony-pilot-process/v2",
+                "identity": process_state()["identity"],
+                "deployment_root": "/home/duck-lint/.local/share/symphony-pilot/deployments/demo",
+                "deployment_identity": "old-deployment",
+                "deployed_profile_sha256": "old-profile",
+                "dashboard_url": "http://127.0.0.1:4040",
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(project_control._dashboard_url(profile), "http://127.0.0.1:4040")
+            with mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state_at", return_value={
+                        "running": [], "retrying": []}) as runtime_state_at:
+                self.assertEqual(project_control.status(profile), 0)
+            runtime_state_at.assert_called_once_with("http://127.0.0.1:4040")
+            with mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.stop(profile, force=True), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+
+    def test_invalid_registry_still_allows_recovery_status_and_stop_now(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            state_path = root / "alpha-state" / "symphony.pid"
+            state_path.parent.mkdir()
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state_at", return_value={"running": [], "retrying": []}), \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "github") as github, \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "status"]):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.main(), 0)
+            self.assertIn("RECOVERY alpha", output.getvalue())
+            read_secret.assert_not_called()
+            github.assert_not_called()
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "github") as github, \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "stop-now"]):
+                self.assertEqual(project_control.main(), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            read_secret.assert_not_called()
+            github.assert_not_called()
+
+    def test_removed_profile_still_allows_exact_recovery_stop_now(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "beta", dashboard_port=4041)
+            state_path = root / "alpha-state" / "symphony.pid"
+            state_path.parent.mkdir()
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                with mock.patch.object(sys, "argv", ["project", "--project", "alpha", "stop-now"]):
+                    self.assertEqual(project_control.main(), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+
+    def test_recovery_uses_persisted_dashboard_after_current_profile_port_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path, dashboard_port=4040)
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=True), \
+                    mock.patch.object(project_control, "runtime_state_at", return_value=None):
+                state = project_control.read_recovery_state("alpha")
+                self.assertEqual(project_control.recovery_status("alpha", state), 0)
+            self.assertEqual(state["dashboard_url"], "http://127.0.0.1:4040")
+
+    def test_recovery_rejects_reused_pid_and_malformed_state_without_killing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", return_value=False), \
+                    mock.patch.object(project_control, "pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                state = project_control.read_recovery_state("alpha")
+                self.assertEqual(project_control.recovery_stop_now("alpha", state), 1)
+            kill.assert_not_called()
+            state_path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                with self.assertRaises(pw.PreparationError):
+                    project_control.read_recovery_state("alpha")
+            kill.assert_not_called()
+
+    def test_recovery_stop_now_reconciles_exact_awake_helper_with_invalid_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            state_path = root / "alpha-state" / "symphony.pid"
+            state_path.parent.mkdir()
+            self.write_recovery_state(state_path)
+            awake_path = state_path.with_name(host_integration.AWAKE_STATE)
+            self.write_awake_state(awake_path)
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(host_integration, "_identity_alive", side_effect=[True, False, False]), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "github") as github, \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "stop-now"]):
+                self.assertEqual(project_control.main(), 0)
+            self.assertEqual(kill.call_args_list, [
+                mock.call(123, project_control.signal.SIGTERM),
+                mock.call(456, project_control.signal.SIGTERM),
+            ])
+            self.assertFalse(state_path.exists())
+            self.assertFalse(awake_path.exists())
+            read_secret.assert_not_called()
+            github.assert_not_called()
+
+    def test_recovery_stop_now_succeeds_without_awake_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path)
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                self.assertEqual(project_control.recovery_stop_now("alpha", project_control.read_recovery_state("alpha")), 0)
+            kill.assert_called_once_with(123, project_control.signal.SIGTERM)
+            self.assertFalse(state_path.exists())
+
+    def test_dead_awake_helper_bookkeeping_is_removed_without_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / host_integration.AWAKE_STATE
+            self.write_awake_state(path)
+            with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False), \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                self.assertTrue(host_integration.release_awake_guard_at(path))
+            kill.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_reused_awake_pid_fails_recovery_without_killing_reused_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "symphony.pid"
+            self.write_recovery_state(state_path)
+            awake_path = state_path.with_name(host_integration.AWAKE_STATE)
+            self.write_awake_state(awake_path)
+            output = StringIO()
+            with mock.patch.object(project_control, "recovery_state_path", return_value=state_path), \
+                    mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    redirect_stdout(output):
+                result = project_control.recovery_stop_now("alpha", project_control.read_recovery_state("alpha"))
+            self.assertEqual(result, 1)
+            self.assertEqual(kill.call_args_list, [mock.call(123, project_control.signal.SIGTERM)])
+            self.assertTrue(awake_path.exists())
+            self.assertIn("cleanup is incomplete", output.getvalue())
+            self.assertNotIn("Symphony stopped - SAFE TO SHUT DOWN", output.getvalue())
+
+    def test_malformed_awake_state_fails_closed_without_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / host_integration.AWAKE_STATE
+            path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(host_integration, "_identity_alive") as identity_alive, \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                self.assertFalse(host_integration.release_awake_guard_at(path))
+            identity_alive.assert_not_called()
+            kill.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_awake_outer_pid_mismatch_fails_closed_without_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / host_integration.AWAKE_STATE
+            self.write_awake_state(path, pid=456, identity_pid=457)
+            with mock.patch.object(host_integration, "_identity_alive") as identity_alive, \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                self.assertFalse(host_integration.release_awake_guard_at(path))
+            identity_alive.assert_not_called()
+            kill.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_invalid_registry_has_no_recovery_fallback_for_authority_acquisition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            for action in ("start", "test"):
+                with mock.patch.object(project_control, "ROOT", root), \
+                        mock.patch.object(sys, "argv", ["project", "--project", "alpha", action]):
+                    self.assertEqual(project_control.main(), 78)
+            with mock.patch.object(deploy, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["deploy", "--project", "alpha", "--dry-run"]):
+                self.assertEqual(deploy.main(), 78)
+            with mock.patch.object(provision_secret, "ROOT", root), \
+                    mock.patch.object(provision_secret.getpass, "getpass") as getpass:
+                self.assertEqual(provision_secret.main(["--project", "alpha"]), 78)
+            getpass.assert_not_called()
+
+    def test_invalid_registry_without_process_state_fails_closed_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared", dashboard_port=4040)
+            write_registry_profile(registry, "beta", "example/shared", dashboard_port=4041)
+            missing_state = root / "missing" / "symphony.pid"
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(project_control, "recovery_state_path", return_value=missing_state), \
+                    mock.patch.object(project_control, "_identity_alive") as identity_alive, \
+                    mock.patch.object(project_control.os, "kill") as kill:
+                for action in ("status", "stop-now"):
+                    with mock.patch.object(sys, "argv", ["project", "--project", "alpha", action]):
+                        self.assertEqual(project_control.main(), 78)
+            identity_alive.assert_not_called()
+            kill.assert_not_called()
 
     def test_schema_has_no_credential_property(self):
         schema = json.loads((ROOT / "schemas/project-profile.schema.json").read_text())
@@ -853,7 +1224,7 @@ class InfrastructureTests(unittest.TestCase):
 
     def test_deployment_dry_run_is_available_without_secret(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
-            "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
+            "--project", "cleanroom", "--dry-run"],
             text=True, capture_output=True, check=True)
         self.assertIn('"profile": "cleanroom"', result.stdout)
 
@@ -931,24 +1302,76 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(data["pid"], 456)
             self.assertNotIn("github", json.dumps(popen.call_args).lower())
 
-    def test_awake_guard_releases_on_stale_or_normal_cleanup(self):
+    def test_awake_guard_recovery_rejects_malformed_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
             path = profile.state_root / host_integration.AWAKE_STATE
             profile.state_root.mkdir(parents=True)
             path.write_text(json.dumps({"pid": 456, "identity": {"pid": 456}}) + "\n", encoding="utf-8")
-            with mock.patch.object(host_integration, "_identity_alive", return_value=False):
-                host_integration.recover_awake_guard(profile)
-            self.assertFalse(path.exists())
+            with self.assertRaises(pw.PreparationError), \
+                    mock.patch.object(host_integration.subprocess, "Popen") as popen:
+                host_integration.establish_awake_guard(profile)
+            popen.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_awake_guard_recovery_rejects_reused_helper_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            self.write_awake_state(path)
+            with self.assertRaises(pw.PreparationError), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=True), \
+                    mock.patch.object(host_integration.subprocess, "Popen") as popen, \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                host_integration.establish_awake_guard(profile)
+            popen.assert_not_called()
+            kill.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_awake_guard_recovery_retains_exact_live_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            before = self.write_awake_state(path)
+            with mock.patch.object(host_integration, "_identity_alive", return_value=True), \
+                    mock.patch.object(host_integration.subprocess, "Popen") as popen:
+                host_integration.establish_awake_guard(profile)
+            popen.assert_not_called()
+            self.assertEqual(json.loads(path.read_text()), before)
+
+    def test_awake_guard_recovery_replaces_only_dead_unused_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            self.write_awake_state(path)
+            helper = mock.Mock(pid=789)
+            identity = {"pid": 789, "boot_id": "new-boot", "start_time": "new-start"}
+            with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False), \
+                    mock.patch.object(host_integration.subprocess, "Popen", return_value=helper) as popen, \
+                    mock.patch.object(host_integration, "capture", return_value=identity):
+                host_integration.establish_awake_guard(profile)
+            popen.assert_called_once()
+            self.assertEqual(json.loads(path.read_text())["pid"], 789)
 
     def test_start_failure_releases_awake_guard(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
-            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
-            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
-            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+            (root / "deployment" / "projects" / profile.slug).mkdir(parents=True)
+            (root / "deployment" / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
+                    mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
+                    mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
                     mock.patch.object(project_control, "establish_awake_guard"), \
                     mock.patch.object(project_control, "release_awake_guard") as release, \
@@ -956,16 +1379,103 @@ class InfrastructureTests(unittest.TestCase):
                 self.assertEqual(project_control.start(profile), 1)
             release.assert_called_once_with(profile)
 
+    def test_stop_without_process_does_not_claim_clean_with_malformed_awake_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                result = project_control.stop(profile)
+            self.assertEqual(result, 1)
+            self.assertIn("Symphony is stopped", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("Symphony is stopped - SAFE TO SHUT DOWN", output.getvalue())
+            self.assertTrue(path.exists())
+
+    def test_stop_after_process_exit_does_not_claim_clean_with_reused_awake_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            awake_path = profile.state_root / host_integration.AWAKE_STATE
+            self.write_awake_state(awake_path)
+            output = StringIO()
+            with mock.patch.object(project_control, "_identity_alive", return_value=False), \
+                    mock.patch.object(project_control, "pid_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    redirect_stdout(output):
+                result = project_control.stop(profile, force=True)
+            self.assertEqual(result, 1)
+            kill.assert_not_called()
+            self.assertIn("Symphony is stopped", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("Symphony is stopped - SAFE TO SHUT DOWN", output.getvalue())
+            self.assertTrue(awake_path.exists())
+
+    def test_finish_without_process_does_not_claim_clean_with_unresolved_awake_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            awake_path = profile.state_root / host_integration.AWAKE_STATE
+            awake_path.parent.mkdir(parents=True)
+            awake_path.write_text("{}\n", encoding="utf-8")
+            output = StringIO()
+            with mock.patch.object(project_control, "_safe_pid", return_value=None), \
+                    redirect_stdout(output):
+                result = project_control.finish(profile)
+            self.assertEqual(result, 1)
+            self.assertIn("STOPPED", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("STOPPED - SAFE TO SHUT DOWN", output.getvalue())
+
+    def test_status_without_process_reports_stopped_but_incomplete_awake_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            awake_path = profile.state_root / host_integration.AWAKE_STATE
+            awake_path.parent.mkdir(parents=True)
+            awake_path.write_text("{}\n", encoding="utf-8")
+            output = StringIO()
+            with mock.patch.object(project_control, "_managed_identity", return_value=None), \
+                    redirect_stdout(output):
+                result = project_control.status(profile)
+            self.assertEqual(result, 1)
+            self.assertIn("STOPPED", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("STOPPED - SAFE TO SHUT DOWN", output.getvalue())
+
+    def test_start_verifies_deployment_before_secret_tracker_or_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(pathlib.Path(directory))
+            verification_error = pw.PreparationError("deployment", "tampered")
+            with mock.patch.object(project_control, "verify_deployment", side_effect=verification_error), \
+                    mock.patch.object(project_control, "read_secret") as read_secret, \
+                    mock.patch.object(project_control, "active_issues") as active_issues, \
+                    mock.patch.object(project_control.subprocess, "Popen") as popen:
+                self.assertEqual(project_control.start(profile), 1)
+            read_secret.assert_not_called()
+            active_issues.assert_not_called()
+            popen.assert_not_called()
+
     def test_start_identity_capture_failure_kills_unmanaged_child_and_retains_guard_if_needed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
-            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
-            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            (root / "deployment" / "projects" / profile.slug).mkdir(parents=True)
+            (root / "deployment" / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
             child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
             child.wait.side_effect = [subprocess.TimeoutExpired("symphony", 5),
                                       subprocess.TimeoutExpired("symphony", 5)]
-            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+            with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
+                    mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
+                    mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
                     mock.patch.object(project_control, "establish_awake_guard"), \
                     mock.patch.object(project_control, "release_awake_guard") as release, \
@@ -984,11 +1494,14 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
-            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
-            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            (root / "deployment" / "projects" / profile.slug).mkdir(parents=True)
+            (root / "deployment" / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
             child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
             identity = process_state()["identity"]
-            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+            with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
+                    mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
+                    mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
                     mock.patch.object(project_control, "establish_awake_guard"), \
                     mock.patch.object(project_control, "release_awake_guard") as release, \
@@ -998,20 +1511,28 @@ class InfrastructureTests(unittest.TestCase):
                     mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
                     mock.patch.object(project_control.time, "monotonic", side_effect=[0, 31, 0, 31]), \
                     mock.patch.object(project_control.os, "kill") as kill:
-                self.assertEqual(project_control.start(profile), 1)
+                release.return_value = False
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.start(profile), 1)
             kill.assert_called_once_with(123, project_control.signal.SIGTERM)
             release.assert_called_once_with(profile)
             self.assertFalse(project_control.state_paths(profile)[0].exists())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("awake guard released.", output.getvalue())
 
     def test_start_timeout_retains_pid_and_awake_guard_if_child_survives(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
-            (profile.deployment_root / "projects" / profile.slug).mkdir(parents=True)
-            (profile.deployment_root / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
+            (root / "deployment" / "projects" / profile.slug).mkdir(parents=True)
+            (root / "deployment" / "projects" / profile.slug / "WORKFLOW.md").write_text("workflow\n")
             child = mock.Mock(pid=123, poll=mock.Mock(return_value=None))
             identity = process_state()["identity"]
-            with mock.patch.object(project_control, "read_secret", return_value="secret"), \
+            with mock.patch.object(project_control, "install_root", return_value=root / "deployment"), \
+                    mock.patch.object(project_control, "verify_deployment", return_value={"root": root / "deployment", "deployment_identity": "test", "profile_sha256": "test"}), \
+                    mock.patch.object(project_control, "resolve_symphony_binary", return_value="symphony"), \
+                    mock.patch.object(project_control, "read_secret", return_value="secret"), \
                     mock.patch.object(project_control, "active_issues", return_value=[]), \
                     mock.patch.object(project_control, "establish_awake_guard"), \
                     mock.patch.object(project_control, "release_awake_guard") as release, \
@@ -1062,7 +1583,7 @@ class InfrastructureTests(unittest.TestCase):
         with mock.patch.object(process_identity, "capture", return_value={**identity, "start_time": "other"}):
             self.assertFalse(process_identity.matches(altered))
 
-    def test_recycled_awake_pid_is_never_terminated(self):
+    def test_malformed_legacy_awake_record_is_not_terminated_or_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = self.profile_with(make_profile(pathlib.Path(directory)), prevent_host_sleep=True)
             path = profile.state_root / host_integration.AWAKE_STATE
@@ -1070,9 +1591,9 @@ class InfrastructureTests(unittest.TestCase):
             path.write_text(json.dumps({"pid": 456, "identity": process_state(456)["identity"]}) + "\n")
             with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
                     mock.patch.object(host_integration.os, "kill") as kill:
-                host_integration.release_awake_guard(profile)
+                self.assertFalse(host_integration.release_awake_guard(profile))
             kill.assert_not_called()
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
 
     def test_notification_redacts_credential_shapes_and_urls(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1185,11 +1706,298 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(run.call_count, 3)
             self.assertNotIn("secret", (profile.state_root / host_integration.NOTIFICATION_STATE).read_text())
 
-    def test_deployment_contains_operator_cli_and_host_backend(self):
+    def test_deployment_manifest_has_no_source_operator_claim(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
-            "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
+            "--project", "cleanroom", "--dry-run"],
             text=True, capture_output=True, check=True)
         self.assertIn('"source_commit"', result.stdout)
+        self.assertNotIn("operator_cli", result.stdout)
+
+    def test_source_deploy_rejects_arbitrary_install_root_and_uses_derived_destination(self):
+        rejected = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/deploy.py"), "--project", "cleanroom",
+             "--install-root", "C:/arbitrary", "--dry-run"],
+            text=True, capture_output=True,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        selected = project_registry.resolve_project("cleanroom", ROOT / "projects")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/deploy.py"), "--project", "cleanroom", "--dry-run"],
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout)["install_root"],
+                         str(deploy.selected_deployment(selected)))
+
+    def test_registry_accepts_empty_one_and_arbitrary_n_projects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            self.assertEqual(project_registry.validate_registry(root), ())
+            write_registry_profile(root, "alpha")
+            self.assertEqual([p.slug for p in project_registry.validate_registry(root)], ["alpha"])
+            write_registry_profile(root, "beta")
+            write_registry_profile(root, "gamma")
+            self.assertEqual(
+                [p.slug for p in project_registry.validate_registry(root)],
+                ["alpha", "beta", "gamma"],
+            )
+            write_registry_profile(root, "delta")
+            self.assertEqual(len(project_registry.validate_registry(root)), 4)
+            (root / "beta" / "profile.toml").unlink()
+            (root / "beta").rmdir()
+            self.assertEqual(
+                [p.slug for p in project_registry.validate_registry(root)],
+                ["alpha", "delta", "gamma"],
+            )
+
+    def test_dashboard_port_allocation_is_explicit_and_not_a_slug_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            write_registry_profile(root, "project-12", dashboard_port=4040)
+            write_registry_profile(root, "project-157", dashboard_port=4041)
+            profiles = project_registry.validate_registry(root)
+            self.assertEqual({p.slug: p.dashboard_port for p in profiles},
+                             {"project-12": 4040, "project-157": 4041})
+            self.assertEqual(project_registry.suggest_dashboard_port(root), 1024)
+            write_registry_profile(root, "duplicate", dashboard_port=4040)
+            with self.assertRaisesRegex(pw.PreparationError, "duplicate dashboard port"):
+                project_registry.validate_registry(root)
+
+    def test_dashboard_port_above_historical_range_is_valid_and_occupancy_is_not_renumbered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            write_registry_profile(root, "alpha", dashboard_port=5000)
+            profile = project_registry.resolve_project("alpha", root)
+            self.assertEqual(profile.dashboard_port, 5000)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+                occupied.bind(("127.0.0.1", 0))
+                port = occupied.getsockname()[1]
+                with self.assertRaisesRegex(pw.PreparationError, "occupied or unavailable"):
+                    project_control.ensure_dashboard_port_available(port)
+
+    def test_dashboard_allocator_fails_only_when_supported_domain_is_exhausted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for index, slug in enumerate(("alpha", "beta", "gamma")):
+                write_registry_profile(root, slug, dashboard_port=6000 + index)
+            with mock.patch.object(project_registry, "DASHBOARD_PORT_MIN", 6000), \
+                    mock.patch.object(project_registry, "DASHBOARD_PORT_MAX", 6002):
+                with self.assertRaisesRegex(pw.PreparationError, "range is exhausted"):
+                    project_registry.suggest_dashboard_port(root)
+
+    def test_dashboard_port_assignments_survive_registry_add_and_remove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for index, slug in enumerate(("alpha", "beta", "gamma")):
+                write_registry_profile(root, slug, dashboard_port=4040 + index)
+            before = {p.slug: p.dashboard_port for p in project_registry.validate_registry(root)}
+            write_registry_profile(root, "delta", dashboard_port=4043)
+            after_add = {p.slug: p.dashboard_port for p in project_registry.validate_registry(root)}
+            self.assertEqual({slug: after_add[slug] for slug in before}, before)
+            (root / "beta" / "profile.toml").unlink()
+            (root / "beta").rmdir()
+            after_remove = {p.slug: p.dashboard_port for p in project_registry.validate_registry(root)}
+            self.assertEqual({slug: after_remove[slug] for slug in ("alpha", "gamma", "delta")},
+                             {"alpha": 4040, "gamma": 4042, "delta": 4043})
+
+    def test_registry_rejects_directory_slug_and_repository_collisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            path = write_registry_profile(root, "alpha")
+            path.write_text(path.read_text().replace('slug = "alpha"', 'slug = "beta"'), encoding="utf-8")
+            with self.assertRaisesRegex(pw.PreparationError, "directory/slug mismatch"):
+                project_registry.validate_registry(root)
+            path.write_text(path.read_text().replace('slug = "beta"', 'slug = "alpha"'), encoding="utf-8")
+            write_registry_profile(root, "beta", "example/alpha")
+            with self.assertRaisesRegex(pw.PreparationError, "duplicate repository identity"):
+                project_registry.validate_registry(root)
+
+    def test_registry_rejects_service_port_and_namespace_collisions(self):
+        alpha = make_profile(pathlib.Path("/tmp/alpha"))
+        beta = self.profile_with(alpha, slug="beta", dashboard_port=alpha.dashboard_port)
+        with self.assertRaisesRegex(pw.PreparationError, "duplicate dashboard port"):
+            project_registry.validate_profiles((alpha, beta))
+        beta = self.profile_with(beta, dashboard_port=4041,
+                                 service_identity=alpha.service_identity)
+        with self.assertRaisesRegex(pw.PreparationError, "duplicate service identity"):
+            project_registry.validate_profiles((alpha, beta))
+        beta = self.profile_with(beta, service_identity="symphony-pilot-beta")
+        with mock.patch.object(project_registry, "project_namespaces", side_effect=[
+                {"state": pathlib.Path("/tmp/project")},
+                {"state": pathlib.Path("/tmp/project/subproject")},
+        ]):
+            with self.assertRaisesRegex(pw.PreparationError, "namespace overlap"):
+                project_registry.validate_profiles((alpha, beta))
+
+    def test_derived_namespaces_are_slug_scoped_and_profile_has_no_root_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            alpha_path = write_registry_profile(root, "alpha")
+            alpha = pw.load_profile(alpha_path)
+            beta_path = write_registry_profile(root, "beta")
+            beta = pw.load_profile(beta_path)
+            self.assertNotEqual(pw.deployment_path(alpha), pw.deployment_path(beta))
+            self.assertNotEqual(alpha.workspace_root, beta.workspace_root)
+            self.assertNotEqual(alpha.state_root, beta.state_root)
+            self.assertNotEqual(alpha.service_identity, beta.service_identity)
+            raw = alpha_path.read_text(encoding="utf-8")
+            with self.assertRaisesRegex(pw.PreparationError, "unsupported profile fields"):
+                bad = alpha_path.with_name("bad.toml")
+                bad.write_text(raw + 'deployment_root = "/home/legacy"\n', encoding="utf-8")
+                pw.load_profile(bad)
+
+    def test_native_windows_never_guesses_wsl_home_from_windows_username(self):
+        with mock.patch.object(pw.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"USERNAME": "madis", "USER": "duck-lint",
+                                              "WSL_USER": "duck-lint"}, clear=True):
+            with self.assertRaisesRegex(pw.PreparationError, "WSL/Linux"):
+                pw.resolve_host_root()
+            symbolic = pw.host_namespace_root()
+            self.assertEqual(str(symbolic), "<wsl-home>")
+            self.assertNotIn("madis", str(symbolic))
+
+    def test_native_windows_cannot_read_or_mutate_physical_project_namespace(self):
+        profile = make_profile(pathlib.Path("C:/fixture"))
+        symbolic = pw.Profile(**{**profile.__dict__,
+                                 "state_root": pathlib.PurePosixPath("<wsl-home>/state")})
+        with mock.patch.object(pw.os, "name", "nt"):
+            with self.assertRaisesRegex(pw.PreparationError, "WSL/Linux"):
+                project_control.state_paths(symbolic)
+
+    def test_deployment_isolation_for_alpha_beta_gamma_and_new_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profiles = {slug: write_registry_profile(root, slug)
+                        for slug in ("alpha", "beta", "gamma")}
+            source_commit = "a" * 40
+            real_run = deploy.subprocess.run
+            def fake_run(command, *args, **kwargs):
+                if command[:3] == ["git", "rev-parse", "HEAD"]:
+                    return subprocess.CompletedProcess(command, 0, source_commit + "\n", "")
+                if command[:3] == ["git", "status", "--porcelain=v1"]:
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return real_run(command, *args, **kwargs)
+            targets = {slug: root / "deployments" / slug for slug in profiles}
+            with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
+                for slug, path in profiles.items():
+                    deploy.deploy(path, targets[slug], False)
+            generated_modules = sorted(path.stem for path in targets["alpha"].rglob("*.py"))
+            module_env = os.environ.copy()
+            module_env["PYTHONPATH"] = os.pathsep.join(
+                [str(targets["alpha"] / "runtime"), str(targets["alpha"] / "scripts")]
+            )
+            subprocess.run(
+                [sys.executable, "-c", "import " + ", ".join(generated_modules)],
+                cwd=targets["alpha"], env=module_env, check=True,
+                capture_output=True, text=True,
+            )
+            self.assertFalse((targets["alpha"] / "scripts" / "project.py").exists())
+            manifest = json.loads((targets["alpha"] / "DEPLOYMENT.json").read_text(encoding="utf-8"))
+            self.assertNotIn("operator_cli", manifest)
+            self.assertEqual(len({str(path) for path in targets.values()}), 3)
+            before = {slug: {str(p.relative_to(targets[slug])): hashlib.sha256(p.read_bytes()).hexdigest()
+                             for p in targets[slug].rglob("*") if p.is_file()}
+                      for slug in targets}
+            (targets["beta"] / "bin").mkdir()
+            (targets["beta"] / "bin" / "symphony-old").write_text("must not be inherited")
+            with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
+                deploy.deploy(profiles["beta"], targets["beta"], False)
+            after = {slug: {str(p.relative_to(targets[slug])): hashlib.sha256(p.read_bytes()).hexdigest()
+                            for p in targets[slug].rglob("*") if p.is_file()}
+                     for slug in ("alpha", "gamma")}
+            self.assertEqual(before["alpha"], after["alpha"])
+            self.assertEqual(before["gamma"], after["gamma"])
+            self.assertFalse((targets["beta"] / "bin").exists())
+            write_registry_profile(root, "delta")
+            with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
+                deploy.deploy(root / "delta" / "profile.toml", root / "deployments" / "delta", False)
+            self.assertTrue((root / "deployments" / "delta" / "DEPLOYMENT.json").exists())
+
+    def test_tracker_rendering_is_repository_scoped_for_arbitrary_projects(self):
+        from render_workflow import render
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            policy = root / "policy.md"
+            policy.write_text("policy\n", encoding="utf-8")
+            one = make_profile(root)
+            two = self.profile_with(one, slug="other", repository="another/project")
+            first = render(one, root / "one", policy)
+            second = render(two, root / "two", policy)
+            self.assertIn("repo: example/project", first)
+            self.assertNotIn("another/project", first)
+            self.assertIn("repo: another/project", second)
+            self.assertEqual(first.count("symphony:auto"), 1)
+            self.assertEqual(second.count("symphony:auto"), 1)
+
+    def test_operator_resolution_has_no_implicit_cleanroom(self):
+        missing = subprocess.run([sys.executable, str(ROOT / "scripts/project.py"), "status"],
+                                 text=True, capture_output=True)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertNotIn("cleanroom", (missing.stdout + missing.stderr).lower())
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            standalone = root / "standalone.toml"
+            standalone.write_text("slug = \"standalone\"\n", encoding="utf-8")
+            for script, arguments in (
+                    (ROOT / "scripts/project.py", ["--profile", str(standalone), "status"]),
+                    (ROOT / "scripts/deploy.py", ["--profile", str(standalone), "--dry-run"]),
+                    (ROOT / "scripts/validate_profile.py", ["--profile", str(standalone)]),
+                    (ROOT / "scripts/provision_secret.py", ["--profile", str(standalone)])):
+                rejected = subprocess.run([sys.executable, str(script), *arguments],
+                                          text=True, capture_output=True)
+                self.assertNotEqual(rejected.returncode, 0)
+            registered = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/validate_profile.py"), "--project", "cleanroom"],
+                text=True, capture_output=True, check=True,
+            )
+            self.assertIn("valid profile: cleanroom", registered.stdout)
+            write_registry_profile(root, "alpha")
+            write_registry_profile(root, "beta")
+            alpha = project_registry.resolve_project("alpha", root)
+            beta = project_registry.resolve_project("beta", root)
+            self.assertNotEqual(project_control.install_root(alpha), project_control.install_root(beta))
+            self.assertNotEqual(str(alpha.state_root), str(beta.state_root))
+
+    def test_selected_project_fails_when_another_registry_member_collides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared")
+            write_registry_profile(registry, "beta", "example/shared")
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "status"]):
+                self.assertEqual(project_control.main(), 78)
+            with mock.patch.object(deploy, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["deploy", "--project", "alpha", "--dry-run"]):
+                self.assertEqual(deploy.main(), 78)
+
+    def test_selected_operator_lifecycle_does_not_touch_unselected_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            alpha = make_profile(root / "alpha")
+            beta = self.profile_with(make_profile(root / "beta"), slug="other",
+                                     service_identity="symphony-pilot-other", dashboard_port=4041)
+            beta_marker = beta.state_root / "unrelated.json"
+            beta_marker.parent.mkdir(parents=True)
+            beta_marker.write_text("beta-state\n", encoding="utf-8")
+            with mock.patch.object(project_control, "_managed_identity", return_value=None), \
+                    mock.patch.object(project_control, "release_awake_guard"):
+                self.assertEqual(project_control.status(alpha), 0)
+            self.assertEqual(beta_marker.read_text(encoding="utf-8"), "beta-state\n")
+            with mock.patch.object(project_control, "_safe_pid", return_value=None), \
+                    mock.patch.object(project_control, "release_awake_guard"):
+                self.assertEqual(project_control.finish(alpha), 0)
+            self.assertEqual(beta_marker.read_text(encoding="utf-8"), "beta-state\n")
+            self.assertEqual(project_control.install_root(alpha).name, "demo")
+            self.assertEqual(project_control.install_root(beta).name, "other")
+            self.assertEqual(project_control.install_root(alpha).parent,
+                             project_control.install_root(beta).parent)
+
+    def test_official_binary_resolution_does_not_use_deployment_contents(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(project_control.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(FileNotFoundError, "official Symphony"):
+                project_control.resolve_symphony_binary()
+        self.assertNotIn("glob(\"symphony-*\")", (ROOT / "scripts/project.py").read_text())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

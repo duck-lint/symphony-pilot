@@ -1,70 +1,62 @@
 # Operations
 
-Run these commands from a checkout of this repository:
+Run from the pilot source checkout. Every ordinary source operation names a registered project slug; no command defaults to CLEANROOM.
 
-    python3 scripts/validate_profile.py projects/cleanroom/profile.toml
-    python3 scripts/provision_secret.py projects/cleanroom/profile.toml
-    python3 scripts/deploy.py --profile projects/cleanroom/profile.toml
-    python3 scripts/project.py --profile projects/cleanroom/profile.toml test
-    python3 scripts/project.py --profile projects/cleanroom/profile.toml start
-    python3 scripts/project.py --profile projects/cleanroom/profile.toml status
-    python3 scripts/project.py --profile projects/cleanroom/profile.toml finish
-    python3 scripts/project.py --profile projects/cleanroom/profile.toml stop
-    python3 scripts/project.py --profile projects/cleanroom/profile.toml stop-now
+```bash
+python3 scripts/validate_profile.py
+python3 scripts/list_projects.py
+python3 scripts/list_projects.py --suggest-dashboard-port
+python3 scripts/provision_secret.py --project example-four
+python3 scripts/deploy.py --project example-four --dry-run
+python3 scripts/deploy.py --project example-four
+python3 scripts/project.py --project example-four test
+python3 scripts/project.py --project example-four start
+python3 scripts/project.py --project example-four status
+python3 scripts/project.py --project example-four finish
+python3 scripts/project.py --project example-four stop
+python3 scripts/project.py --project example-four stop-now
+```
 
-finish is the normal end-of-session path: it waits for the one authorized
-running/retrying issue to drain, then stops Symphony. It also stops an idle or
-durably human-blocked service. stop refuses to terminate active work;
-stop-now is the emergency path. A cancelled finish leaves Symphony and active
-work running.
-The PID and log are under the profile state root. A detached process does not
-depend on the terminal that launched it.
+`validate_profile.py` without a path validates the complete registry. The registry is presence in `projects/<slug>/profile.toml`, not a second database or a registration command. `register_project.py` was removed because it had no truthful durable registration role.
 
-For a profile with prevent_host_sleep=true, start establishes the pilot-owned
-Windows execution-state guard before launching Symphony. Successful finish,
-stop, and stop-now release it; stale bookkeeping for a dead helper is removed
-on the next start. Windows adapters invoke the deployed command
-`<deployment>/scripts/project.py`, never a source checkout.
+Onboarding a new project is:
 
-The deployed `test` action is deployment-safe: it checks that the deployed
-profile, manifest, workflow, operator command, required runtime modules, and
-the six generic role-policy files exist. Source-only validation remains the
-responsibility of the pilot checkout.
+1. From the source checkout, run `python3 scripts/list_projects.py --suggest-dashboard-port` and persist the returned unused `dashboard_port` in `projects/example-four/profile.toml`.
+2. Run `python3 scripts/validate_profile.py` and review the whole registry.
+3. Have the operator provision `~/.config/symphony-pilot/secrets/example-four/github.token` with `python3 scripts/provision_secret.py --project example-four`.
+4. Run the deployment dry-run, deploy, and `test` action.
+5. Enable dispatch only after a harmless end-to-end project canary proves the actual app-server role handoff and sandbox boundaries.
 
-During an app-server run, the launcher exposes those role policies through a
-temporary external `CODEX_HOME`; it does not create pilot role files in the
-target checkout. The temporary home overlays the complete operator Codex home
-surface, including user hooks and personal agents, and records a host-owned
-lease under `.git` for normal and stale cleanup. The launcher and reconciler
-use the fixed host `/tmp` staging root, not ambient `TMPDIR`. If a reboot has
-already removed the external home, reconciliation clears only the stale
-durable marker after verifying that its recorded owner is dead. The archivist
-returns a closeout packet, while the architect persists only accepted archival
-facts to the single workpad.
+Normal project deployment always uses the derived slug namespace. The internal Python deployment function accepts a test-only destination parameter; the ordinary source CLI does not expose it. The shared executable must already exist on `PATH` or be named by `SYMPHONY_BIN`; deployment never downloads, copies, preserves, or migrates it.
 
-Start performs a GitHub dispatch-label count before launching and enforces the
-profile's one-issue limit. Deployment and preparation fail closed when a
-profile secret, Git repository, upstream, toolchain, clean worktree, or
-publication preflight is unavailable.
+Registry validation and port allocation may run under native Windows Python;
+the supported persisted dashboard allocation domain is TCP `1024–65535`.
+The read-only deployment dry-run may also run under native Windows Python.
+Actual deployment, secret provisioning, `project.py` lifecycle commands
+(`test`, `start`, `status`, `finish`, `stop`, and `stop-now`), internal runtime
+hooks, and physical workspace/state operations must run from the WSL/Linux
+operator environment. If an unrelated host process occupies the persisted
+dashboard port, startup fails with a port-conflict diagnostic and does not
+renumber the project. The Windows account name is not used to construct
+`/home/...` paths.
 
-For Windows-facing wrappers, invoke these WSL commands through a detached
-PowerShell launcher and display the resulting status. The launcher should keep
-all process state in WSL and should not embed a token or a machine-specific
-secret. Dashboard discovery belongs to the official Symphony dashboard; a
-closed browser is not a process control. Generic Windows notifications are
-emitted by existing host lifecycle hooks for durable human, infrastructure,
-and completed states, with fingerprints under the profile state root. They are
-convenience only; GitHub labels and the workpad remain authoritative.
+Canonical project authority requires the complete valid registry for new work,
+start, test, deploy, and secret provisioning. A registry defect cannot grant
+new authority, but it also does not strand an already-managed process: `status`
+and `stop-now` may use only that project's persisted recovery identity.
+Recovery `stop-now` validates the persisted process identity, stops only that
+exact process, then validates and reconciles the exact `host-awake.json` in the
+same slug-derived state directory. It does not read credentials, query the
+tracker, or reconstruct a profile. Missing or already-dead helper state is
+safe to reconcile; malformed or reused helper identity fails closed and is
+reported as incomplete rather than producing a clean shutdown result. Startup
+uses the same strict host-awake parser: malformed or unresolved state remains
+in place and prevents a replacement helper; only a valid dead helper whose PID
+is unused may be replaced. Normal `stop`, `finish`, and not-running `status`
+apply the same result rule: a stopped Symphony process is reported separately
+from complete host cleanup, and no clean-shutdown claim is printed when awake
+reconciliation fails.
 
-To add a project: commit a non-secret profile under projects/<slug>/, review
-the generated workflow and role pack, provision its host secret, run
-deployment, and perform a harmless canary before enabling its dispatch label.
-The canary must prove a real app-server role handoff, not just deployment
-presence: observe project-manager and planner packets, an implementer change,
-a fresh reviewer verdict, a fresh adversarial verdict, and the same final HEAD
-in both acceptance records and mechanical validation. For reviewer and
-adversary isolation, the canary must also request an explicitly harmless
-sentinel mutation and observe a runtime denial/error while confirming the
-worktree is unchanged; voluntary non-editing is not sandbox evidence. If role
-selection is not available in the installed Codex path, record that capability
-boundary and do not silently run the old architect-worker lifecycle.
+`finish` drains active work before stopping. `stop` refuses active work and `stop-now` is the emergency path. PID, awake-guard, lock, recovery, and log state are project-derived. Tracker requests contain only the selected profile's repository and dispatch labels. A shared label string in another repository is not dispatchable by this instance.
+
+Before real unattended work, a harmless canary must prove the actual app-server role handoff, including a requested sentinel mutation that is mechanically denied with a runtime denial/error for reviewer/adversary sandbox testing; voluntary non-editing is not sandbox evidence. After this change is merged, CLEANROOM's one-time manual cutover is described in `docs/RECOVERY.md`. Do not delete or move existing host state during source validation, and do not start `symphony-canary` as part of this architecture work.

@@ -1,27 +1,21 @@
 # Project onboarding
 
-Use this checklist for the mechanical control-plane side of onboarding.
+The canonical registry is the tracked `projects/` directory. A registered project is exactly one `projects/<slug>/profile.toml` whose `slug` matches its directory name and whose non-secret fields pass profile validation.
 
-For the reusable role and authority contracts, see:
+Create a profile with repository, Git remote, secret reference, dispatch and blocked labels, an allocated dashboard port, execution limits, Codex settings, toolchain hint, and optional notification/sleep preferences. Do not add host paths or service names: deployment, workspace, state, logs, credentials, process state, locks, workflow location, and service identity are derived from the slug.
 
-- [Human onboarding](HUMAN_ONBOARDING.md) — determines only human-authority inputs and credential actions.
-- [Codex onboarding](CODEX_ONBOARDING.md) — inspects target-project authority and registers the project without duplicating pilot infrastructure.
+```bash
+mkdir -p projects/example-four
+python3 scripts/list_projects.py --suggest-dashboard-port
+$EDITOR projects/example-four/profile.toml
+python3 scripts/validate_profile.py
+python3 scripts/list_projects.py
+python3 scripts/provision_secret.py --project example-four
+python3 scripts/deploy.py --project example-four --dry-run
+python3 scripts/deploy.py --project example-four
+python3 scripts/project.py --project example-four test
+```
 
-## Mechanical onboarding sequence
+The profile's repository is globally unique in the registry. This is a deliberate tracker-isolation rule: identical label text is safe across different repositories, but not across two profiles targeting one repository. Registry validation also rejects duplicate dashboard allocations, derived resource equality, and path containment. Adding or removing a profile changes only registry membership; generic implementation remains unchanged.
 
-1. Establish the target project's authority, validation, private-data, and human-stop contracts from target-repository evidence.
-2. Copy the profile shape from `projects/cleanroom/profile.toml` and create `projects/<slug>/profile.toml`.
-3. Set the single target repository, SSH Git remote, WSL-native workspace/state/log roots, labels, service identity, supported toolchain hint, and optional host-integration settings. Current profiles require `max_concurrent_agents = 1`.
-4. Validate the TOML profile with `python3 scripts/validate_profile.py projects/<slug>/profile.toml` and review `schemas/project-profile.schema.json`.
-5. Commit the non-secret profile and any bounded policy/documentation changes. No secret belongs in Git.
-6. Have the human provision the tracker credential with `python3 scripts/provision_secret.py projects/<slug>/profile.toml`. The helper writes the resolved host secret under `~/.config/symphony-pilot/secrets/<slug>/<reference>` with the required permissions.
-7. Run `scripts/deploy.py --profile ... --dry-run`, then deploy and inspect `DEPLOYMENT.json`.
-8. Run the deployed `test` action.
-9. Create one harmless target-project issue with an explicit authorized starting ref/SHA and the profile dispatch label. Verify the project-specific integration: correct repository/profile, issue workspace, preparation marker, single workpad, project-manager/planner/implementer/reviewer/adversary/archivist handoff, supported toolchain preflight, publication preflight, completion/handoff behavior, and cleanup. Treat the named-role handoff as unproven until the app-server events and workpad show it; deployment presence alone is insufficient.
-10. Only then authorize real unattended work.
-
-Do not make the canary re-prove generic stale-workspace recovery, unique-state archiving, retry/circuit-breaker, locking, or credential-isolation mechanics already owned by `symphony-pilot` regression tests. If onboarding exposes a real generic defect, fix that boundary in `symphony-pilot` separately.
-
-The issue body remains the work order. The profile does not encode project architecture, phase authority, semantic boundaries, or acceptance criteria. Those remain in the target repository and issue.
-
-A current profile represents exactly one `repository` and one `git_remote`. Multi-repository orchestration requires an explicit boundary decision rather than an invented profile extension.
+The project repository and issue remain authoritative for architecture, acceptance criteria, private inputs, and human stop conditions. The pilot owns only reusable host mechanics. A harmless live canary is required before real dispatch, and `symphony-canary` is just another profile when it is onboarded.

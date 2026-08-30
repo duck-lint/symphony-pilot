@@ -6,7 +6,10 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -16,16 +19,101 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
 sys.path.insert(0, str(ROOT / "runtime"))
-from host_integration import establish_awake_guard, release_awake_guard
+from host_integration import AWAKE_STATE, establish_awake_guard, release_awake_guard, release_awake_guard_at
 from process_identity import capture, matches, read
-from prepare_workspace import github, load_profile, read_secret
+from prepare_workspace import (
+    DASHBOARD_PORT_MAX,
+    DASHBOARD_PORT_MIN,
+    PreparationError,
+    deployment_path,
+    github,
+    load_profile,
+    read_secret,
+    require_physical_namespace,
+    state_namespace_for_slug,
+)
+from deployment_contract import contract_digest, deployment_identity
+from project_registry import resolve_project
+
+
+def file_digest(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 def state_paths(profile):
-    profile.state_root.mkdir(parents=True, exist_ok=True)
-    return profile.state_root / "symphony.pid", profile.state_root / "symphony.log"
+    state_root = require_physical_namespace(profile.state_root)
+    state_root.mkdir(parents=True, exist_ok=True)
+    return state_root / "symphony.pid", state_root / "symphony.log"
+
+
+def recovery_state_path(slug: str) -> pathlib.Path:
+    """Derive only the supplied slug's process-state path; do not create it."""
+    return state_namespace_for_slug(slug) / "symphony.pid"
+
+
+def read_recovery_state(slug: str):
+    """Load and strictly validate one existing managed-process record."""
+    path = recovery_state_path(slug)
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise PreparationError("recovery_state", "managed process state is malformed") from exc
+    expected_fields = {
+        "schema", "identity", "deployment_root", "deployment_identity",
+        "deployed_profile_sha256", "dashboard_url",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise PreparationError("recovery_state", "managed process state fields are invalid")
+    if value["schema"] != "symphony-pilot-process/v2":
+        raise PreparationError("recovery_state", "managed process state schema is not accepted")
+    identity = value["identity"]
+    if (not isinstance(identity, dict) or set(identity) != {"pid", "boot_id", "start_time"} or
+            not isinstance(identity["pid"], int) or isinstance(identity["pid"], bool) or
+            identity["pid"] < 1 or not isinstance(identity["boot_id"], str) or
+            not identity["boot_id"] or not isinstance(identity["start_time"], str) or
+            not identity["start_time"]):
+        raise PreparationError("recovery_state", "managed process identity is invalid")
+    if (not isinstance(value["deployment_root"], str) or
+            not pathlib.PurePosixPath(value["deployment_root"]).is_absolute()):
+        raise PreparationError("recovery_state", "managed deployment root is invalid")
+    for field in ("deployment_identity", "deployed_profile_sha256"):
+        if not isinstance(value[field], str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
+            raise PreparationError("recovery_state", f"managed {field} is invalid")
+    endpoint = value["dashboard_url"]
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]+)", endpoint) if isinstance(endpoint, str) else None
+    if not match or not DASHBOARD_PORT_MIN <= int(match.group(1)) <= DASHBOARD_PORT_MAX:
+        raise PreparationError("recovery_state", "managed dashboard endpoint is invalid")
+    return value
+
+
+def ensure_dashboard_port_available(port: int) -> None:
+    """Report unrelated host occupancy without changing the persisted port."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise PreparationError(
+            "dashboard_port",
+            f"dashboard port {port} is occupied or unavailable; persisted allocation was not changed",
+        ) from exc
 
 def install_root(profile):
-    return profile.deployment_root or pathlib.Path.home() / ".local/share/symphony-pilot/deployments" / profile.slug
+    return deployment_path(profile)
+
+
+def resolve_symphony_binary() -> str:
+    """Resolve the shared host executable without consulting any deployment."""
+    configured = os.environ.get("SYMPHONY_BIN")
+    candidate = pathlib.Path(configured).expanduser() if configured else None
+    if candidate:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise FileNotFoundError("SYMPHONY_BIN does not name an executable file")
+    found = shutil.which("symphony")
+    if found:
+        return found
+    raise FileNotFoundError("official Symphony executable was not found on PATH")
 
 def pid_alive(pid):
     try:
@@ -71,15 +159,28 @@ def _active_entries(view):
     return list(view.get("running") or []) + list(view.get("retrying") or [])
 
 
-def _stop_process(profile, identity):
+def _complete_process_stop(state_path, release=None):
+    """Remove process bookkeeping only after stop, then reconcile host state."""
+    state_path.unlink(missing_ok=True)
+    try:
+        complete = release() if release else True
+    except (OSError, PreparationError) as exc:
+        print(f"Symphony stopped, but host-awake cleanup is incomplete: {exc}")
+        return 1
+    if complete is False:
+        print("Symphony stopped, but host-awake cleanup is incomplete; "
+              "SAFE TO SHUT DOWN cannot be reported.")
+        return 1
+    print("Symphony stopped - SAFE TO SHUT DOWN")
+    return 0
+
+
+def _stop_process_at(state_path, identity, release=None):
     pid = int(identity["pid"])
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        state_paths(profile)[0].unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("Symphony stopped - SAFE TO SHUT DOWN")
-        return 0
+        return _complete_process_stop(state_path, release)
     except (PermissionError, OSError) as exc:
         print(f"Cannot stop Symphony safely: {exc}")
         return 1
@@ -89,15 +190,27 @@ def _stop_process(profile, identity):
     except KeyboardInterrupt:
         print("Stop cancelled; Symphony remains running.")
         return 130
-    state_paths(profile)[0].unlink(missing_ok=True)
-    release_awake_guard(profile)
-    print("Symphony stopped - SAFE TO SHUT DOWN")
-    return 0
+    return _complete_process_stop(state_path, release)
 
 
-def _write_process_state(profile, identity):
+def _stop_process(profile, identity):
+    return _stop_process_at(
+        state_paths(profile)[0], identity,
+        release=lambda: release_awake_guard(profile),
+    )
+
+
+def _write_process_state(profile, identity, verification):
+    dashboard_url = verification.get("dashboard_url", f"http://127.0.0.1:{profile.dashboard_port}")
     state_paths(profile)[0].write_text(
-        json.dumps({"schema": "symphony-pilot-process/v1", "identity": identity},
+        json.dumps({
+            "schema": "symphony-pilot-process/v2",
+            "identity": identity,
+            "deployment_root": str(verification["root"]),
+            "deployment_identity": verification["deployment_identity"],
+            "deployed_profile_sha256": verification["profile_sha256"],
+            "dashboard_url": dashboard_url,
+        },
                    sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -132,14 +245,31 @@ def _terminate_unverified_child(child, profile):
               "and child exit could not be confirmed; the awake guard was retained "
               "for operator attention.")
         return False
-    release_awake_guard(profile)
-    return True
+    if release_awake_guard(profile):
+        return True
+    print("Cannot start Symphony: its process exited, but host-awake cleanup is incomplete.")
+    return False
 
-def dashboard(profile):
+def _dashboard_url(profile):
     if not profile.dashboard_port:
         return None
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{profile.dashboard_port}/", timeout=2) as response:
+        state = read(state_paths(profile)[0]) if state_paths(profile)[0].exists() else None
+    except (OSError, ValueError, TypeError):
+        state = None
+    endpoint = state.get("dashboard_url") if isinstance(state, dict) else None
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]+)", endpoint) if isinstance(endpoint, str) else None
+    if not match or not DASHBOARD_PORT_MIN <= int(match.group(1)) <= DASHBOARD_PORT_MAX:
+        endpoint = f"http://127.0.0.1:{profile.dashboard_port}"
+    return endpoint
+
+
+def dashboard(profile):
+    endpoint = _dashboard_url(profile)
+    if endpoint is None:
+        return None
+    try:
+        with urllib.request.urlopen(endpoint + "/", timeout=2) as response:
             payload = response.read()
             try:
                 return json.loads(payload)
@@ -148,16 +278,19 @@ def dashboard(profile):
     except (urllib.error.URLError, TimeoutError, ValueError):
         return None
 
-def runtime_state(profile):
-    if not profile.dashboard_port:
-        return None
+def runtime_state_at(endpoint):
     try:
         with urllib.request.urlopen(
-            f"http://127.0.0.1:{profile.dashboard_port}/api/v1/state", timeout=2
+            endpoint + "/api/v1/state", timeout=2
         ) as response:
             return json.loads(response.read())
     except (urllib.error.URLError, TimeoutError, ValueError):
         return None
+
+
+def runtime_state(profile):
+    endpoint = _dashboard_url(profile)
+    return runtime_state_at(endpoint) if endpoint is not None else None
 
 def active_issues(profile, token):
     issues = github(profile, token, "GET", "/issues?state=open&labels=" +
@@ -168,7 +301,6 @@ def project_name(profile):
     return profile.display_name or profile.slug
 
 def start(profile):
-    token = read_secret(profile)
     pid_path, log_path = state_paths(profile)
     if pid_path.exists():
         identity = read(pid_path)
@@ -176,12 +308,29 @@ def start(profile):
         if identity and _identity_alive(identity):
             try:
                 establish_awake_guard(profile)
-            except RuntimeError as exc:
+            except (RuntimeError, PreparationError) as exc:
                 print(f"Cannot keep {project_name(profile)} awake: {exc}")
                 return 1
             print("Symphony is already running.")
             return 0
         pid_path.unlink(missing_ok=True)
+    try:
+        verification = verify_deployment(profile)
+    except (OSError, ValueError, TypeError, PreparationError) as exc:
+        print(f"Cannot start Symphony: deployment coherence verification failed: {exc}")
+        return 1
+    root = verification["root"]
+    workflow = root / "projects" / profile.slug / "WORKFLOW.md"
+    try:
+        ensure_dashboard_port_available(profile.dashboard_port)
+    except PreparationError as exc:
+        print(f"Cannot start Symphony: {exc}")
+        return 1
+    try:
+        token = read_secret(profile)
+    except PreparationError as exc:
+        print(f"Cannot start Symphony: {exc}")
+        return 1
     try:
         issues = active_issues(profile, token)
     except Exception as exc:
@@ -190,14 +339,9 @@ def start(profile):
     if len(issues) > profile.max_concurrent_agents:
         print(f"Refusing to start: {len(issues)} dispatchable issues exceed the one-issue pilot limit.")
         return 1
-    root = install_root(profile)
-    workflow = root / "projects" / profile.slug / "WORKFLOW.md"
-    if not workflow.exists():
-        print(f"Deployment is missing its generated workflow: {workflow}")
-        return 1
     try:
         establish_awake_guard(profile)
-    except RuntimeError as exc:
+    except (RuntimeError, PreparationError) as exc:
         print(f"Cannot start {project_name(profile)}: {exc}")
         return 1
     env = os.environ.copy()
@@ -206,10 +350,12 @@ def start(profile):
     env["SYMPHONY_WORKFLOW"] = str(workflow)
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
-    binary = os.environ.get("SYMPHONY_BIN")
-    if not binary:
-        candidates = sorted((root / "bin").glob("symphony-*"))
-        binary = str(candidates[0]) if candidates else "symphony"
+    try:
+        binary = resolve_symphony_binary()
+    except FileNotFoundError as exc:
+        release_awake_guard(profile)
+        print(f"Cannot start Symphony: {exc}. Install the shared host executable or set SYMPHONY_BIN.")
+        return 1
     log = log_path.open("ab")
     command = [binary, "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
                "--logs-root", str(profile.log_root)]
@@ -233,7 +379,7 @@ def start(profile):
             print("Cannot start Symphony: its process identity could not be verified; "
                   "the child exited and the awake guard was released.")
         return 1
-    _write_process_state(profile, identity)
+    _write_process_state(profile, identity, verification)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if dashboard(profile) is not None:
@@ -242,7 +388,7 @@ def start(profile):
         if child.poll() is not None:
             print("Symphony exited during startup. Review the project log.")
             pid_path.unlink(missing_ok=True)
-            release_awake_guard(profile)
+            _report_startup_cleanup(profile, "Symphony exited during startup")
             return 1
         time.sleep(0.5)
     print("Symphony dashboard did not become reachable within 30 seconds; requesting normal shutdown.")
@@ -251,8 +397,7 @@ def start(profile):
             print("Startup identity could not be confirmed; PID and awake guard were retained for operator attention.")
             return 1
         pid_path.unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("Symphony exited during startup; awake guard released.")
+        _report_startup_cleanup(profile, "Symphony exited during startup")
         return 1
     try:
         os.kill(int(identity["pid"]), signal.SIGTERM)
@@ -271,16 +416,38 @@ def start(profile):
         print("Startup failed; Symphony may still be running. PID and awake guard were retained for operator attention.")
         return 1
     pid_path.unlink(missing_ok=True)
-    release_awake_guard(profile)
-    print("Symphony exited after startup timeout; awake guard released.")
+    _report_startup_cleanup(profile, "Symphony exited after startup timeout")
     return 1
+
+
+def _release_awake_for_shutdown(profile) -> bool:
+    try:
+        return release_awake_guard(profile)
+    except (OSError, PreparationError):
+        return False
+
+
+def _report_stopped(profile, prefix: str) -> int:
+    """Report process state separately from complete pilot-owned cleanup."""
+    if _release_awake_for_shutdown(profile):
+        print(f"{prefix} - SAFE TO SHUT DOWN")
+        return 0
+    print(f"{prefix}, but host-awake cleanup is incomplete.")
+    print("SAFE TO SHUT DOWN cannot be reported.")
+    return 1
+
+
+def _report_startup_cleanup(profile, prefix: str) -> bool:
+    if _release_awake_for_shutdown(profile):
+        print(f"{prefix}; awake guard released.")
+        return True
+    print(f"{prefix}; host-awake cleanup is incomplete.")
+    return False
 
 def stop(profile, force=False):
     pid_path, _ = state_paths(profile)
     if not pid_path.exists():
-        release_awake_guard(profile)
-        print("Symphony is stopped - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "Symphony is stopped")
     state = read(pid_path)
     identity = state.get("identity") if state else None
     if not identity:
@@ -291,9 +458,7 @@ def stop(profile, force=False):
             print("Cannot stop safely: managed Symphony PID identity is stale or reused; no process was terminated.")
             return 1
         pid_path.unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("Symphony is stopped - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "Symphony is stopped")
     if not force:
         view = runtime_state(profile)
         if view is None:
@@ -309,9 +474,7 @@ def finish(profile):
     """Drain one pilot issue, then perform the normal stop operation."""
     pid = _safe_pid(profile)
     if pid is None:
-        release_awake_guard(profile)
-        print("STOPPED - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "STOPPED")
     view = runtime_state(profile)
     if view is None:
         print("Cannot finish safely: authoritative Symphony runtime state is unavailable.")
@@ -347,9 +510,7 @@ def status(profile):
     running = identity is not None
     if not running:
         pid_path.unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("STOPPED - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "STOPPED")
     view = runtime_state(profile) or dashboard(profile)
     if isinstance(view, dict):
         blocked = view.get("blocked") or []
@@ -374,6 +535,48 @@ def status(profile):
     else:
         print("WORKING - DO NOT SHUT DOWN")
     return 0
+
+
+def recovery_status(slug: str, state: dict) -> int:
+    """Inspect only the process identity persisted for the supplied slug."""
+    identity = state["identity"]
+    if not _identity_alive(identity):
+        if pid_alive(identity["pid"]):
+            print(f"RECOVERY {slug}: managed PID identity is stale or reused; no process was touched.")
+            return 1
+        print(f"RECOVERY {slug}: managed process is no longer running.")
+        return 0
+    view = runtime_state_at(state["dashboard_url"])
+    if isinstance(view, dict):
+        current = view.get("running") or view.get("retrying") or []
+        activity = "active" if current else "idle"
+        print(f"RECOVERY {slug}: managed PID {identity['pid']} is {activity}; "
+              f"deployment {state['deployment_identity']} at {state['dashboard_url']}.")
+    else:
+        print(f"RECOVERY {slug}: managed PID {identity['pid']} is running; "
+              f"runtime state unavailable at {state['dashboard_url']}.")
+    return 0
+
+
+def recovery_stop_now(slug: str, state: dict) -> int:
+    """Emergency-stop exactly the previously recorded process, without a profile."""
+    identity = state["identity"]
+    process_state_path = recovery_state_path(slug)
+    awake_state_path = process_state_path.with_name(AWAKE_STATE)
+    release = lambda: release_awake_guard_at(awake_state_path)
+    if not _identity_alive(identity):
+        if pid_alive(identity["pid"]):
+            print(f"RECOVERY {slug}: managed PID identity is stale or reused; no process was terminated.")
+            return 1
+        result = _complete_process_stop(process_state_path, release)
+        if result == 0:
+            print(f"RECOVERY {slug}: process is already stopped - SAFE TO SHUT DOWN")
+        return result
+    return _stop_process_at(
+        process_state_path,
+        identity,
+        release=release,
+    )
 
 def verify_manifest(root, manifest_path, manifest):
     files = manifest.get("files")
@@ -401,43 +604,128 @@ def verify_manifest(root, manifest_path, manifest):
         if expected != actual:
             raise ValueError(f"deployed file does not match its manifest: {relative}")
 
-def test(profile):
-    root = install_root(profile)
+
+REQUIRED_DEPLOYMENT_FILES = (
+    "profile.toml",
+    "runtime/prepare_workspace.py",
+    "runtime/after_run.py",
+    "runtime/before_remove.py",
+    "runtime/host_integration.py",
+    "runtime/process_identity.py",
+    "runtime/launch_codex.sh",
+    "runtime/deployment_contract.py",
+    "workflow/architect_policy.md",
+    "projects/{slug}/WORKFLOW.md",
+    "workflow/agents/project-manager.toml",
+    "workflow/agents/planner.toml",
+    "workflow/agents/implementer.toml",
+    "workflow/agents/reviewer.toml",
+    "workflow/agents/adversary.toml",
+    "workflow/agents/archivist.toml",
+)
+
+
+def verify_deployment(profile):
+    """Verify the selected source profile and generated deployment as one snapshot."""
+    root = require_physical_namespace(install_root(profile))
     manifest_path = root / "DEPLOYMENT.json"
-    required = [root / "profile.toml", manifest_path,
-                root / "scripts" / "project.py", root / "runtime" / "prepare_workspace.py",
-                root / "runtime" / "host_integration.py", root / "runtime" / "process_identity.py",
-                root / "projects" / profile.slug / "WORKFLOW.md"]
-    required += [root / "workflow" / "agents" / f"{name}.toml"
-                 for name in ROLE_POLICY_NAMES]
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        print("Deployment validation failed; missing: " + ", ".join(missing))
-        return 1
+    if not manifest_path.is_file():
+        raise PreparationError("deployment", "DEPLOYMENT.json is missing; redeploy the selected project")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        cli_name = manifest.get("operator_cli")
-        if cli_name != "scripts/project.py":
-            raise ValueError("manifest operator_cli is not scripts/project.py")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreparationError("deployment", "DEPLOYMENT.json cannot be read") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != "symphony-pilot-deployment/v2":
+        raise PreparationError("deployment", "DEPLOYMENT.json schema is not accepted")
+    if manifest.get("profile") != profile.slug:
+        raise PreparationError("deployment", "deployment belongs to a different project slug")
+    required = [root / relative.format(slug=profile.slug) for relative in REQUIRED_DEPLOYMENT_FILES]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise PreparationError("deployment", "required generated files are missing: " + ", ".join(missing))
+    try:
         verify_manifest(root, manifest_path, manifest)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        source_profile_path = profile.source_profile_path
+        if source_profile_path is None or not source_profile_path.is_file():
+            raise ValueError("selected canonical profile path is unavailable")
+        deployed_profile_path = root / "profile.toml"
+        source_bytes = source_profile_path.read_bytes()
+        deployed_bytes = deployed_profile_path.read_bytes()
+        if source_bytes != deployed_bytes:
+            raise ValueError("deployed profile snapshot differs from selected canonical profile")
+        deployed_profile = load_profile(deployed_profile_path)
+        if deployed_profile.slug != profile.slug:
+            raise ValueError("deployed profile slug does not match selected project")
+        profile_sha256 = file_digest(deployed_profile_path)
+        if manifest.get("profile_sha256") != profile_sha256:
+            raise ValueError("deployed profile digest does not match DEPLOYMENT.json")
+        operator_contract_sha256 = contract_digest(ROOT)
+        if manifest.get("operator_contract_sha256") != operator_contract_sha256:
+            raise ValueError("source operator/runtime contract differs; redeploy the selected project")
+        expected_identity = deployment_identity(
+            profile.slug, profile_sha256, operator_contract_sha256, manifest["files"]
+        )
+        if manifest.get("deployment_identity") != expected_identity:
+            raise ValueError("deployment identity does not match its accepted contents")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise PreparationError("deployment", str(exc)) from exc
+    return {
+        "root": root,
+        "deployment_identity": manifest["deployment_identity"],
+        "profile_sha256": manifest["profile_sha256"],
+        "dashboard_url": f"http://127.0.0.1:{profile.dashboard_port}",
+    }
+
+def test(profile):
+    try:
+        verification = verify_deployment(profile)
+    except PreparationError as exc:
         print(f"Deployment validation failed: {exc}")
         return 1
-    print(f"Deployment validation passed for {profile.slug} at {root}")
+    print(f"Deployment validation passed for {profile.slug} at {verification['root']}")
     return 0
 
 def main():
     parser = argparse.ArgumentParser(description="symphony-pilot project lifecycle")
-    parser.add_argument("--profile", default=str(ROOT / "projects/cleanroom/profile.toml"))
+    parser.add_argument("--project", required=True, help="registered project slug")
     parser.add_argument("action", choices=("start", "status", "stop", "stop-now", "finish", "test"))
     args = parser.parse_args()
-    profile = load_profile(pathlib.Path(args.profile))
-    if args.action == "start": return start(profile)
-    if args.action == "stop": return stop(profile)
-    if args.action == "stop-now": return stop(profile, force=True)
-    if args.action == "finish": return finish(profile)
-    if args.action == "status": return status(profile)
-    return test(profile)
+    try:
+        if not args.project:
+            raise PreparationError("project", "ordinary source operation requires --project <registered-slug>")
+        profile = resolve_project(args.project, ROOT / "projects")
+    except PreparationError as exc:
+        if args.action in ("status", "stop-now"):
+            try:
+                recovery = read_recovery_state(args.project)
+            except PreparationError as recovery_error:
+                print(f"symphony-pilot recovery stopped: {recovery_error.kind}: {recovery_error}",
+                      file=sys.stderr)
+                return 78
+            if recovery is not None:
+                if args.action == "status":
+                    return recovery_status(args.project, recovery)
+                return recovery_stop_now(args.project, recovery)
+            print(f"symphony-pilot project resolution stopped: {exc.kind}: {exc}; "
+                  "no valid managed process state exists for recovery", file=sys.stderr)
+            return 78
+        if args.action in ("stop", "finish"):
+            print(f"symphony-pilot project resolution stopped: {exc.kind}: {exc}; "
+                  "normal control is unavailable, use --project <slug> stop-now only "
+                  "after reviewing the managed process state", file=sys.stderr)
+            return 78
+        print(f"symphony-pilot project resolution stopped: {exc.kind}: {exc}", file=sys.stderr)
+        return 78
+    try:
+        if args.action == "start": return start(profile)
+        if args.action == "stop": return stop(profile)
+        if args.action == "stop-now": return stop(profile, force=True)
+        if args.action == "finish": return finish(profile)
+        if args.action == "status": return status(profile)
+        return test(profile)
+    except PreparationError as exc:
+        print(f"symphony-pilot operation stopped: {exc.kind}: {exc}", file=sys.stderr)
+        return 78
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -45,9 +45,9 @@ class Profile:
     slug: str
     repository: str
     git_remote: str
-    workspace_root: pathlib.Path
-    state_root: pathlib.Path
-    log_root: pathlib.Path
+    workspace_root: pathlib.PurePath
+    state_root: pathlib.PurePath
+    log_root: pathlib.PurePath
     secret_reference: str
     dispatch_labels: tuple[str, ...]
     blocked_label: str
@@ -60,11 +60,11 @@ class Profile:
     codex_model: str
     codex_reasoning_effort: str
     toolchain: str | None
-    deployment_root: pathlib.Path | None
     prevent_host_sleep: bool = False
     notifications_enabled: bool = False
     display_name: str = ""
     notification_backend: str = "windows-toast"
+    source_profile_path: pathlib.Path | None = None
 
 
 @dataclasses.dataclass
@@ -89,14 +89,91 @@ def configured_path(value: str) -> pathlib.Path:
     return pathlib.Path(value).expanduser().resolve()
 
 
+# Linux/WSL allows an unprivileged process to bind TCP ports from 1024 upward.
+# The registry allocator owns uniqueness among Symphony projects; the runtime
+# bind check separately reports conflicts with unrelated host processes.
+DASHBOARD_PORT_MIN = 1024
+DASHBOARD_PORT_MAX = 65535
+
+
+def resolve_host_root() -> pathlib.Path:
+    """Return the one physical namespace root for the installed control plane.
+
+    Native Windows Python has no authority to resolve the WSL operator home.
+    Refusing here is safer than turning the Windows account name into a
+    fabricated ``/home/<name>`` path.
+    """
+    if os.name == "nt":
+        raise PreparationError(
+            "host_platform",
+            "physical namespace operations must run under the WSL/Linux operator environment",
+        )
+    return pathlib.Path.home().resolve()
+
+
+def host_namespace_root() -> pathlib.Path | pathlib.PurePosixPath:
+    """Return a physical root on Linux or a non-physical marker on Windows."""
+    if os.name == "nt":
+        return pathlib.PurePosixPath("<wsl-home>")
+    return resolve_host_root()
+
+
+def require_physical_namespace(path: pathlib.PurePath) -> pathlib.Path:
+    """Reject symbolic Windows paths before any host mutation or credential read."""
+    if os.name == "nt" and isinstance(path, pathlib.PurePosixPath):
+        raise PreparationError(
+            "host_platform",
+            "physical namespace operations must run under the WSL/Linux operator environment",
+        )
+    return pathlib.Path(path).resolve()
+
+
+def state_namespace_for_slug(slug: str) -> pathlib.Path:
+    """Resolve exactly one slug-owned state namespace for recovery control."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
+        raise PreparationError("project", "project slug is not a safe identifier")
+    root = host_namespace_root() / ".local" / "state" / "symphony-pilot" / slug
+    return require_physical_namespace(root)
+
+
+def project_namespaces(profile: Profile) -> dict[str, pathlib.PurePath]:
+    """Return every project-owned host namespace used by the control plane."""
+    home = host_namespace_root()
+    data = home / ".local" / "share" / "symphony-pilot" / "deployments" / profile.slug
+    state = home / ".local" / "state" / "symphony-pilot" / profile.slug
+    workspace = home / "symphony-workspaces" / profile.slug
+    return {
+        "deployment": data,
+        "workspace": workspace,
+        "state": state,
+        "logs": state / "logs",
+        "process_state": state / "symphony.pid",
+        "lock": state / "locks",
+        "awake_guard": state / "symphony-awake.json",
+        "workflow": data / "projects" / profile.slug / "WORKFLOW.md",
+        "credentials": home / ".config" / "symphony-pilot" / "secrets" / profile.slug,
+    }
+
+
+def deployment_path(profile: Profile) -> pathlib.Path | pathlib.PurePosixPath:
+    return project_namespaces(profile)["deployment"]
+
+
 def load_profile(path: pathlib.Path) -> Profile:
     import tomllib
 
     with path.open("rb") as stream:
         raw = tomllib.load(stream)
-    required = ["slug", "repository", "git_remote", "workspace_root", "state_root",
-                "log_root", "secret_reference", "dispatch_labels", "blocked_label",
-                "service_identity", "max_concurrent_agents", "max_turns",
+    allowed = {"slug", "repository", "git_remote", "secret_reference", "dispatch_labels",
+               "blocked_label", "max_concurrent_agents", "max_turns", "poll_interval_ms",
+               "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
+               "prevent_host_sleep", "notifications_enabled", "display_name",
+               "notification_backend", "dashboard_port"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise PreparationError("profile", "unsupported profile fields: " + ",".join(unknown))
+    required = ["slug", "repository", "git_remote", "secret_reference", "dispatch_labels", "blocked_label",
+                "max_concurrent_agents", "max_turns", "dashboard_port",
                 "poll_interval_ms", "max_retry_backoff_ms", "codex_model",
                 "codex_reasoning_effort"]
     missing = [key for key in required if key not in raw]
@@ -105,43 +182,42 @@ def load_profile(path: pathlib.Path) -> Profile:
     slug = str(raw["slug"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
         raise PreparationError("profile", "profile slug is not a safe identifier")
-    for key in ("repository", "git_remote", "workspace_root", "state_root", "log_root",
-                "secret_reference", "blocked_label", "display_name", "notification_backend"):
+    for key in ("repository", "git_remote", "secret_reference", "blocked_label",
+                "display_name", "notification_backend"):
         if any(character in str(raw.get(key, "")) for character in ("\n", "\r", "\0")):
             raise PreparationError("profile", f"profile field {key} contains control characters")
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", str(raw["repository"])):
         raise PreparationError("profile", "repository must be an owner/name pair")
-    workspace_text = str(raw["workspace_root"])
-    if not workspace_text.startswith("/home/") or ".." in pathlib.PurePosixPath(workspace_text).parts:
-        raise PreparationError("profile", "workspace_root must remain on the WSL-native filesystem")
-    workspace_root = configured_path(workspace_text)
     forbidden_keys = {"token", "password", "credential", "secret", "pat", "api_key"}
     suspicious = [key for key in raw if key.lower() in forbidden_keys]
     if suspicious:
         raise PreparationError("profile", "profiles may contain only secret_reference, not credential values")
-    dashboard = raw.get("dashboard_port")
-    if dashboard is not None and not 1 <= int(dashboard) <= 65535:
-        raise PreparationError("profile", "dashboard_port is invalid")
     if int(raw["max_concurrent_agents"]) != 1:
         raise PreparationError("profile", "the pilot permits exactly one concurrent agent")
     if not raw["dispatch_labels"]:
         raise PreparationError("profile", "at least one dispatch label is required")
+    dashboard_port = int(raw["dashboard_port"])
+    if not DASHBOARD_PORT_MIN <= dashboard_port <= DASHBOARD_PORT_MAX:
+        raise PreparationError(
+            "profile",
+            f"dashboard_port must be between {DASHBOARD_PORT_MIN} and {DASHBOARD_PORT_MAX}",
+        )
     if not isinstance(raw.get("prevent_host_sleep", False), bool):
         raise PreparationError("profile", "prevent_host_sleep must be boolean")
     if not isinstance(raw.get("notifications_enabled", False), bool):
         raise PreparationError("profile", "notifications_enabled must be boolean")
-    return Profile(
+    profile = Profile(
         slug=slug,
         repository=str(raw["repository"]),
         git_remote=str(raw["git_remote"]),
-        workspace_root=workspace_root,
-        state_root=configured_path(str(raw["state_root"])),
-        log_root=configured_path(str(raw["log_root"])),
+        workspace_root=pathlib.PurePosixPath(),
+        state_root=pathlib.PurePosixPath(),
+        log_root=pathlib.PurePosixPath(),
         secret_reference=str(raw["secret_reference"]),
         dispatch_labels=tuple(str(label) for label in raw["dispatch_labels"]),
         blocked_label=str(raw["blocked_label"]),
-        service_identity=str(raw["service_identity"]),
-        dashboard_port=int(dashboard) if dashboard is not None else None,
+        service_identity=f"symphony-pilot-{slug}",
+        dashboard_port=dashboard_port,
         max_concurrent_agents=int(raw["max_concurrent_agents"]),
         max_turns=int(raw["max_turns"]),
         poll_interval_ms=int(raw["poll_interval_ms"]),
@@ -149,24 +225,33 @@ def load_profile(path: pathlib.Path) -> Profile:
         codex_model=str(raw["codex_model"]),
         codex_reasoning_effort=str(raw["codex_reasoning_effort"]),
         toolchain=str(raw["toolchain"]) if raw.get("toolchain") else None,
-        deployment_root=(configured_path(str(raw["deployment_root"]))
-                         if raw.get("deployment_root") else None),
         prevent_host_sleep=bool(raw.get("prevent_host_sleep", False)),
         notifications_enabled=bool(raw.get("notifications_enabled", False)),
         display_name=str(raw.get("display_name", slug)),
         notification_backend=str(raw.get("notification_backend", "windows-toast")),
+        source_profile_path=path.resolve(),
+    )
+    namespaces = project_namespaces(profile)
+    return dataclasses.replace(
+        profile,
+        workspace_root=(namespaces["workspace"] if os.name == "nt"
+                        else pathlib.Path(namespaces["workspace"]).resolve()),
+        state_root=(namespaces["state"] if os.name == "nt"
+                    else pathlib.Path(namespaces["state"]).resolve()),
+        log_root=(namespaces["logs"] if os.name == "nt"
+                  else pathlib.Path(namespaces["logs"]).resolve()),
     )
 
 
-def secret_path(profile: Profile) -> pathlib.Path:
+def secret_path(profile: Profile) -> pathlib.PurePath:
     reference = pathlib.Path(profile.secret_reference)
     if reference.is_absolute() or ".." in reference.parts:
         raise PreparationError("secret_reference", "secret reference escapes its project boundary")
-    return pathlib.Path.home() / ".config/symphony-pilot/secrets" / profile.slug / reference
+    return host_namespace_root() / ".config/symphony-pilot/secrets" / profile.slug / reference
 
 
 def read_secret(profile: Profile) -> str:
-    path = secret_path(profile)
+    path = require_physical_namespace(secret_path(profile))
     try:
         mode = path.stat().st_mode & 0o777
         if mode != 0o600:

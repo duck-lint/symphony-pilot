@@ -40,7 +40,7 @@ The durable continuation boundary is GitHub state plus the remote issue branch a
 
 ## What it provides
 
-- **Project profiles** — non-secret TOML configuration for repository identity, labels, workspace/state roots, limits, Codex settings, and host integration.
+- **Project profiles** — non-secret TOML configuration for repository identity, labels, limits, Codex settings, and host integration; host namespaces derive from the project slug.
 - **Issue-scoped workspaces** — clean preparation for initial work and continuation from the authorized remote issue branch.
 - **Reviewed deployments** — atomic deployment directories with a `DEPLOYMENT.json` manifest recording the source artifacts that were deployed.
 - **Bounded role lifecycle** — generic project-manager, planner, implementer, reviewer, adversary, and archivist policies under one issue branch, draft PR, and workpad.
@@ -66,30 +66,35 @@ A deployment expects:
 - a Codex environment usable by Symphony;
 - any toolchain required by the target project's profile.
 
-The operational design is Linux-first. On Windows, workspaces and process state should remain on the WSL-native filesystem; Windows integration is limited to detected host tooling, notifications, and optional sleep inhibition.
+The operational design is Linux-first. Registry validation and port allocation
+may run under native Windows Python; the read-only deployment dry-run may too.
+Actual deployment, lifecycle, secret access, and physical workspace/state
+operations must run from the WSL/Linux operator environment. Windows integration is limited to detected host tooling,
+notifications, and optional sleep inhibition; Windows `USERNAME` is never used
+as a WSL username.
 
 ## Quick start
 
-The included CLEANROOM profile is a concrete example. For another project, copy its shape and replace the project-specific values rather than editing generic runtime policy.
+The tracked `projects/<slug>/profile.toml` files are the canonical registry. CLEANROOM and `symphony-canary` are concrete witnesses, not built-in architecture. For another project, add its profile directory without changing generic runtime policy.
 
 ```bash
-# Validate the non-secret profile.
-python3 scripts/validate_profile.py projects/cleanroom/profile.toml
+# Validate the complete non-secret registry.
+python3 scripts/validate_profile.py
 
 # Provision the host-side credential referenced by the profile.
-python3 scripts/provision_secret.py projects/cleanroom/profile.toml
+python3 scripts/provision_secret.py --project cleanroom
 
 # Inspect, then perform, an atomic deployment.
-python3 scripts/deploy.py --profile projects/cleanroom/profile.toml --dry-run
-python3 scripts/deploy.py --profile projects/cleanroom/profile.toml
+python3 scripts/deploy.py --project cleanroom --dry-run
+python3 scripts/deploy.py --project cleanroom
 
-# Exercise the deployed control surface.
-python3 scripts/project.py --profile projects/cleanroom/profile.toml test
-python3 scripts/project.py --profile projects/cleanroom/profile.toml start
-python3 scripts/project.py --profile projects/cleanroom/profile.toml status
+# Exercise the source-checkout control surface against the generated deployment.
+python3 scripts/project.py --project cleanroom test
+python3 scripts/project.py --project cleanroom start
+python3 scripts/project.py --project cleanroom status
 
 # Normal end-of-session path: drain authorized work, then stop Symphony.
-python3 scripts/project.py --profile projects/cleanroom/profile.toml finish
+python3 scripts/project.py --project cleanroom finish
 ```
 
 `stop` refuses to terminate active work. `stop-now` is the emergency path.
