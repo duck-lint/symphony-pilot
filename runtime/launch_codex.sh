@@ -118,18 +118,63 @@ if [[ -d "$ORIGINAL_CODEX_HOME/agents" ]]; then
     ln -s -- "$entry" "$ROLE_CODEX_HOME/agents/$(basename "$entry")"
   done
 fi
+ROLE_LEASE_ID="$(basename "$ROLE_CODEX_HOME")"
 for source in "${ROLE_FILES[@]}"; do
-  cp -- "$source" "$ROLE_CODEX_HOME/agents/$(basename "$source")"
+  role_name="$(basename "$source" .toml)"
+  destination="$ROLE_CODEX_HOME/agents/symphony-pilot-${role_name}-${ROLE_LEASE_ID}.toml"
+  # The generated name avoids operator filename conventions. Keep the check
+  # explicit: never let cp follow an operator-owned symlink or replace a file.
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    echo "symphony-pilot: generated role destination already exists" >&2
+    exit 78
+  fi
+  cp -- "$source" "$destination"
 done
 shopt -u dotglob nullglob
 export CODEX_HOME="$ROLE_CODEX_HOME"
 
-# This host-owned lease is intentionally inside .git, so it is invisible to
-# target Git status. after_run removes it on normal completion; preparation
-# and before_remove reconcile the exact /tmp path after a crash or kill.
+# Capture the process identity before exec. Linux/WSL provides boot ID and
+# start time, which distinguish a reused PID from the owning App Server.
+OWNER_ID="$("$PYTHON_BIN" - "$$" <<'PY'
+import pathlib
+import sys
+
+pid = int(sys.argv[1])
+try:
+    boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    fields = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    start = fields[fields.rfind(")") + 2:].split()[19]
+except (OSError, UnicodeError, ValueError, IndexError):
+    boot = ""
+    start = ""
+print(boot)
+print(start)
+PY
+)"
+OWNER_BOOT_ID="$(printf '%s\n' "$OWNER_ID" | sed -n '1p')"
+OWNER_START_TIME="$(printf '%s\n' "$OWNER_ID" | sed -n '2p')"
 temporary_marker="$ROLE_HOME_MARKER.tmp"
-printf '{"path":"%s","pid":%s,"schema":"symphony-pilot-role-home/v1"}\n' \
-  "$ROLE_CODEX_HOME" "$$" > "$temporary_marker"
+lease_file="$ROLE_CODEX_HOME/.symphony-pilot-role-home.json"
+"$PYTHON_BIN" - "$ROLE_CODEX_HOME" "$ROLE_LEASE_ID" "$PWD" "$$" \
+  "$OWNER_BOOT_ID" "$OWNER_START_TIME" <<'PY' > "$lease_file"
+import json
+import sys
+
+home, lease_id, workspace, pid, boot_id, start_time = sys.argv[1:]
+owner = {"pid": int(pid), "boot_id": boot_id or None, "start_time": start_time or None}
+print(json.dumps({"schema": "symphony-pilot-role-home/v2", "lease_id": lease_id,
+                  "path": home, "workspace": workspace, "owner": owner}, sort_keys=True))
+PY
+"$PYTHON_BIN" - "$ROLE_CODEX_HOME" "$ROLE_LEASE_ID" "$PWD" "$$" \
+  "$OWNER_BOOT_ID" "$OWNER_START_TIME" <<'PY' > "$temporary_marker"
+import json
+import sys
+
+home, lease_id, workspace, pid, boot_id, start_time = sys.argv[1:]
+owner = {"pid": int(pid), "boot_id": boot_id or None, "start_time": start_time or None}
+print(json.dumps({"schema": "symphony-pilot-role-home/v2", "lease_id": lease_id,
+                  "path": home, "workspace": workspace, "owner": owner}, sort_keys=True))
+PY
 mv -- "$temporary_marker" "$ROLE_HOME_MARKER"
 ROLE_HOME_MARKER_CREATED=1
 

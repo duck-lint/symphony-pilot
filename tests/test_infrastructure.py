@@ -291,11 +291,13 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('mktemp -d "/tmp/symphony-pilot-codex-home.XXXXXX"', launcher)
         self.assertIn('exec "${CODEX_BIN:-codex}"', launcher)
         self.assertIn("trap - EXIT INT TERM", launcher)
-        self.assertIn("symphony-pilot-role-home/v1", launcher)
+        self.assertIn("symphony-pilot-role-home/v2", launcher)
         self.assertIn("tomllib", launcher)
         self.assertNotIn('ROLE_TARGET="$PWD/.codex/agents"', launcher)
 
-    def test_launcher_role_setup_leaves_target_git_state_clean(self):
+    def test_launcher_overlay_preserves_operator_policy_surface_and_target_clean(self):
+        if os.name == "nt":
+            self.skipTest("launcher process fixture requires POSIX process semantics")
         bash = None
         if os.name == "nt":
             for candidate in (r"C:\Program Files\Git\bin\bash.exe",
@@ -339,22 +341,23 @@ class InfrastructureTests(unittest.TestCase):
             (original_home / "agents" / "personal.toml").write_text(
                 'name = "personal"\ndescription = "operator policy"\n'
                 'developer_instructions = "operator policy"\n', encoding="utf-8")
+            operator_reviewer = original_home / "agents" / "reviewer.toml"
+            operator_reviewer.write_text(
+                'name = "not-the-symphony-reviewer"\n'
+                'description = "operator"\n'
+                'developer_instructions = "operator"\n', encoding="utf-8")
+            operator_reviewer_digest = hashlib.sha256(operator_reviewer.read_bytes()).hexdigest()
             probe = root / "probe"
             pid_probe = root / "pid"
             fake = root / "fake-codex"
             fake.write_text(
                 "#!/usr/bin/env bash\n"
-                "test -f \"$CODEX_HOME/agents/reviewer.toml\" || exit 41\n"
-                "test -f \"$CODEX_HOME/agents/personal.toml\" || exit 43\n"
-                "test -f \"$CODEX_HOME/hooks.json\" || exit 44\n"
-                "grep -q harmless_hook \"$CODEX_HOME/hooks.json\" || exit 45\n"
-                "hook_path=\"$(python - \"$CODEX_HOME/hooks.json\" <<'PY'\n"
-                "import json, sys\n"
-                "print(json.load(open(sys.argv[1]))[\"harmless_hook\"])\n"
-                "PY\n"
-                ")\"\n"
-                "\"$hook_path\" || exit 46\n"
-                "test -z \"${SYMPHONY_PILOT_GITHUB_TOKEN:-}\" || exit 42\n"
+                "grep -l '^name = \"reviewer\"$' \"$CODEX_HOME\"/agents/*.toml >/dev/null || { echo reviewer-missing >&2; exit 41; }\n"
+                "grep -l '^name = \"not-the-symphony-reviewer\"$' \"$CODEX_HOME\"/agents/*.toml >/dev/null || { echo operator-reviewer-missing >&2; exit 43; }\n"
+                "grep -l '^name = \"personal\"$' \"$CODEX_HOME\"/agents/*.toml >/dev/null || { echo personal-missing >&2; exit 47; }\n"
+                "test -f \"$CODEX_HOME/hooks.json\" || { echo hooks-missing >&2; exit 44; }\n"
+                "grep -q harmless_hook \"$CODEX_HOME/hooks.json\" || { echo hook-entry-missing >&2; exit 45; }\n"
+                "test -z \"${SYMPHONY_PILOT_GITHUB_TOKEN:-}\" || { echo token-leaked >&2; exit 42; }\n"
                 "printf '%s' \"$CODEX_HOME\" > \"$ROLE_PROBE\"\n"
                 "printf '%s' \"$$\" > \"$PID_PROBE\"\n"
                 "touch \"$ROLE_READY\"\n"
@@ -367,7 +370,6 @@ class InfrastructureTests(unittest.TestCase):
                         "SYMPHONY_PILOT_GITHUB_TOKEN": "must-not-reach-child",
                         "ROLE_PROBE": bash_path(probe),
                         "PID_PROBE": bash_path(pid_probe),
-                        "HOOK_OBSERVATION": bash_path(root / "hook-observation"),
                         "ROLE_READY": bash_path(root / "ready"),
                         "ROLE_RELEASE": bash_path(root / "release")})
             child = subprocess.Popen([bash, bash_path(ROOT / "runtime/launch_codex.sh")],
@@ -379,7 +381,6 @@ class InfrastructureTests(unittest.TestCase):
                         break
                     time.sleep(0.01)
                 self.assertTrue((root / "ready").exists())
-                self.assertTrue((root / "hook-observation").exists())
                 status_while_running = subprocess.run(
                     ["git", "status", "--porcelain"], cwd=repo,
                     text=True, capture_output=True, check=True)
@@ -410,6 +411,8 @@ class InfrastructureTests(unittest.TestCase):
                     os.kill(child.pid, 0)
             self.assertTrue(probe.exists())
             self.assertNotIn(str(repo), probe.read_text(encoding="utf-8"))
+            self.assertEqual(hashlib.sha256(operator_reviewer.read_bytes()).hexdigest(),
+                             operator_reviewer_digest)
             if os.name != "nt":
                 self.assertEqual(int(pid_probe.read_text()), child.pid)
             self.assertFalse((repo / ".codex").exists())
@@ -475,30 +478,86 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = pathlib.Path(directory) / "repo"
             (repo / ".git").mkdir(parents=True)
-            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home."))
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
             (role_home / "agents").mkdir()
             marker = repo / ".git" / "symphony-role-home.json"
-            marker.write_text(json.dumps({
-                "schema": "symphony-pilot-role-home/v1",
-                "pid": 999,
-                "path": str(role_home),
-            }), encoding="utf-8")
+            lease = {
+                "schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                "path": str(role_home), "workspace": str(repo.resolve()),
+                "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            marker.write_text(json.dumps(lease), encoding="utf-8")
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
             self.assertTrue(pw.reconcile_role_home(repo))
             self.assertFalse(role_home.exists())
             self.assertFalse(marker.exists())
+
+    def test_role_home_lease_cannot_cross_authorize_workspaces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo_a = root / "A"
+            repo_b = root / "B"
+            (repo_a / ".git").mkdir(parents=True)
+            (repo_b / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo_b.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            marker = repo_a / ".git" / "symphony-role-home.json"
+            marker.write_text(json.dumps({**lease, "workspace": str(repo_a.resolve())}), encoding="utf-8")
+            with self.assertRaisesRegex(pw.PreparationError, "does not match its workspace marker"):
+                pw.reconcile_role_home(repo_a)
+            self.assertTrue(role_home.exists())
+            self.assertTrue(marker.exists())
+
+    def test_active_role_home_owner_prevents_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            (repo / ".git" / "symphony-role-home.json").write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "process_identity_matches", return_value=True):
+                with self.assertRaisesRegex(pw.PreparationError, "App Server is active"):
+                    pw.reconcile_role_home(repo)
+            self.assertTrue(role_home.exists())
+
+    def test_pid_identity_mismatch_allows_stale_own_home_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "old-boot", "start_time": "old-start"}}
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            (repo / ".git" / "symphony-role-home.json").write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "process_identity_matches", return_value=False):
+                self.assertTrue(pw.reconcile_role_home(repo))
+            self.assertFalse(role_home.exists())
 
     def test_after_run_reconciles_role_home_before_tracker_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             repo = root / "workspace"
             (repo / ".git").mkdir(parents=True)
-            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home."))
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
             marker = repo / ".git" / "symphony-role-home.json"
             marker.write_text(json.dumps({
-                "schema": "symphony-pilot-role-home/v1", "pid": 999,
-                "path": str(role_home)}), encoding="utf-8")
+                "schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                "path": str(role_home), "workspace": str(repo.resolve()),
+                "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}),
+                encoding="utf-8")
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(marker.read_text(), encoding="utf-8")
             with mock.patch.object(after_run, "load_profile", return_value=make_profile(root)), \
                     mock.patch.object(after_run, "read_secret", return_value="redacted"), \
+                    mock.patch.object(pw, "process_owns_workspace", return_value=False), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=False), \
                     mock.patch.object(sys, "argv", ["after_run", "--profile", "x",
                                                       "--workspace", str(repo)]):
                 self.assertEqual(after_run.main(), 0)

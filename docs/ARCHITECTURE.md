@@ -43,7 +43,11 @@ personal agents, and overlays the six pilot policies. It refuses collisions by
 logical TOML `name` across personal, project, and pilot layers without creating
 `.codex` in the target. A host-owned lease under `.git` lets `after_run`, next
 preparation, or recovery remove the exact external home after normal or
-abnormal termination. Project-owned `.codex/agents` remains untouched.
+abnormal termination. Pilot files use generated non-hidden filenames, so an
+operator file such as `reviewer.toml` is never overwritten even when its
+logical name is unrelated. Cleanup also requires the matching external lease,
+workspace binding, and boot/start process identity to be stale. Project-owned
+`.codex/agents` remains untouched.
 
 The role pack and launcher preflight are deployment wiring. A complete
 named-role lifecycle remains unproven until a harmless target issue is run and

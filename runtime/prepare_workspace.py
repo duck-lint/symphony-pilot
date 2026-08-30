@@ -30,6 +30,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from process_identity import matches as process_identity_matches
+
 
 class PreparationError(RuntimeError):
     def __init__(self, kind: str, message: str, persisted: bool = False):
@@ -322,9 +324,10 @@ def process_owns_workspace(workspace: pathlib.Path) -> bool:
     return False
 
 
-ROLE_HOME_SCHEMA = "symphony-pilot-role-home/v1"
+ROLE_HOME_SCHEMA = "symphony-pilot-role-home/v2"
 ROLE_HOME_MARKER = pathlib.PurePosixPath(".git/symphony-role-home.json")
 ROLE_HOME_PREFIX = "symphony-pilot-codex-home."
+ROLE_HOME_LEASE_FILE = ".symphony-pilot-role-home.json"
 
 
 def _role_home_path(value: object) -> pathlib.Path:
@@ -352,11 +355,30 @@ def reconcile_role_home(workspace: pathlib.Path) -> bool:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise PreparationError("role_home_recovery", "role-home marker cannot be read") from exc
-    if (not isinstance(data, dict) or data.get("schema") != ROLE_HOME_SCHEMA or
-            not isinstance(data.get("pid"), int) or isinstance(data.get("pid"), bool) or
-            data.get("pid") < 1):
+    if not isinstance(data, dict) or data.get("schema") != ROLE_HOME_SCHEMA:
         raise PreparationError("role_home_recovery", "role-home marker schema is invalid")
+    if data.get("workspace") != str(workspace.resolve()):
+        raise PreparationError("role_home_recovery", "role-home marker does not belong to this workspace")
+    lease_id = data.get("lease_id")
+    owner = data.get("owner")
+    if (not isinstance(lease_id, str) or not re.fullmatch(r"symphony-pilot-codex-home\.[A-Za-z0-9_]+", lease_id) or
+            not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or
+            isinstance(owner.get("pid"), bool) or owner.get("pid") < 1 or
+            not isinstance(owner.get("boot_id"), str) or not owner.get("boot_id") or
+            not isinstance(owner.get("start_time"), str) or not owner.get("start_time")):
+        raise PreparationError("role_home_recovery", "role-home owner identity is invalid")
     role_home = _role_home_path(data.get("path"))
+    if role_home.name != lease_id:
+        raise PreparationError("role_home_recovery", "role-home lease does not match its path")
+    lease_file = role_home / ROLE_HOME_LEASE_FILE
+    try:
+        lease = json.loads(lease_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreparationError("role_home_recovery", "role-home lease cannot be read") from exc
+    if lease != data:
+        raise PreparationError("role_home_recovery", "role-home lease does not match its workspace marker")
+    if process_identity_matches(owner):
+        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its App Server is active")
     try:
         if role_home.is_symlink():
             role_home.unlink()
