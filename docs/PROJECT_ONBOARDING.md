@@ -2,7 +2,7 @@
 
 Use this checklist for the mechanical control-plane side of onboarding.
 
-For the two reusable role-specific contracts, see:
+For the reusable role and authority contracts, see:
 
 - [Human onboarding](HUMAN_ONBOARDING.md) — determines only human-authority inputs and credential actions.
 - [Codex onboarding](CODEX_ONBOARDING.md) — inspects target-project authority and registers the project without duplicating pilot infrastructure.
@@ -17,7 +17,7 @@ For the two reusable role-specific contracts, see:
 6. Have the human provision the tracker credential with `python3 scripts/provision_secret.py projects/<slug>/profile.toml`. The helper writes the resolved host secret under `~/.config/symphony-pilot/secrets/<slug>/<reference>` with the required permissions.
 7. Run `scripts/deploy.py --profile ... --dry-run`, then deploy and inspect `DEPLOYMENT.json`.
 8. Run the deployed `test` action.
-9. Create one harmless target-project issue with an explicit authorized starting ref/SHA and the profile dispatch label. Verify the project-specific integration: correct repository/profile, issue workspace, preparation marker, single workpad, architect/worker handoff, supported toolchain preflight, publication preflight, completion/handoff behavior, and cleanup.
+9. Create one harmless target-project issue with an explicit authorized starting ref/SHA and the profile dispatch label. Verify the project-specific integration: correct repository/profile, issue workspace, preparation marker, single workpad, project-manager/planner/implementer/reviewer/adversary/archivist handoff, supported toolchain preflight, publication preflight, completion/handoff behavior, and cleanup. Treat the named-role handoff as unproven until the app-server events and workpad show it; deployment presence alone is insufficient.
 10. Only then authorize real unattended work.
 
 Do not make the canary re-prove generic stale-workspace recovery, unique-state archiving, retry/circuit-breaker, locking, or credential-isolation mechanics already owned by `symphony-pilot` regression tests. If onboarding exposes a real generic defect, fix that boundary in `symphony-pilot` separately.

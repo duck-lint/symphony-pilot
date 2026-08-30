@@ -24,10 +24,13 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+from process_identity import matches as process_identity_matches
 
 
 class PreparationError(RuntimeError):
@@ -205,14 +208,36 @@ def github(profile: Profile, token: str, method: str, path: str, body: object | 
         raise PreparationError("github_transport", f"GitHub transport failure: {exc}") from exc
 
 
+def github_all(profile: Profile, token: str, path: str, page_size: int = 100) -> list[dict]:
+    """Fetch a complete paginated collection before applying cardinality rules."""
+    result: list[dict] = []
+    page = 1
+    while True:
+        separator = "&" if "?" in path else "?"
+        batch = github(profile, token, "GET",
+                       f"{path}{separator}per_page={page_size}&page={page}")
+        if not isinstance(batch, list):
+            raise PreparationError("github_response", f"GitHub collection was not a list: {path}")
+        result.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < page_size:
+            return result
+        page += 1
+        if page > 1000:
+            raise PreparationError("github_pagination", f"GitHub collection exceeded pagination bound: {path}")
+
+
+def workpad_candidates(items: list[dict], marker: str = "<!-- symphony-workpad:v1 -->") -> list[dict]:
+    return [item for item in items if marker in (item.get("body") or "")]
+
+
 def workpad(items: list[dict], marker: str = "<!-- symphony-workpad:v1 -->") -> dict | None:
-    pads = [item for item in items if marker in (item.get("body") or "")]
-    return pads[-1] if pads else None
+    """Return the sole workpad; ambiguity must never select an arbitrary one."""
+    pads = workpad_candidates(items, marker)
+    return pads[0] if len(pads) == 1 else None
 
 
 def comments(profile: Profile, token: str, issue: int) -> list[dict]:
-    result = github(profile, token, "GET", f"/issues/{issue}/comments?per_page=100")
-    return result if isinstance(result, list) else []
+    return github_all(profile, token, f"/issues/{issue}/comments")
 
 
 def parse_sha(text: str) -> str | None:
@@ -233,7 +258,10 @@ def issue_facts(profile: Profile, workspace: pathlib.Path, token: str) -> IssueF
     issue_json = github(profile, token, "GET", f"/issues/{issue}")
     issue_comments = comments(profile, token, issue)
     body = issue_json.get("body") or ""
-    pad_body = (workpad(issue_comments) or {}).get("body") or ""
+    pads = workpad_candidates(issue_comments)
+    if len(pads) > 1:
+        raise PreparationError("ambiguous_workpad", "issue has more than one symphony-workpad:v1 comment")
+    pad_body = (pads[0] if pads else {}).get("body") or ""
     required_match = re.search(r"required starting commit\s*:\s*`?([0-9a-fA-F]{40})", body, re.I)
     required_sha = required_match.group(1).lower() if required_match else parse_sha(body)
     required_ref = parse_ref(body, r"required starting ref\s*:\s*`?([A-Za-z0-9._/-]+)")
@@ -244,11 +272,15 @@ def issue_facts(profile: Profile, workspace: pathlib.Path, token: str) -> IssueF
     base_ref = parse_ref(body, r"(?:PR base|base ref)\s*:\s*`?([A-Za-z0-9._/-]+)")
     if not base_ref:
         base_ref = parse_ref(body, r"(?:PR base|base ref):\s*[\r\n]+`?([A-Za-z0-9._/-]+)") or required_ref
-    pull_requests = github(profile, token, "GET", "/pulls?state=open&per_page=100")
+    pull_requests = github_all(profile, token, "/pulls?state=open")
     matching = [pr for pr in pull_requests if
                 (pr.get("head") or {}).get("repo", {}).get("full_name") == profile.repository and
                 (pr.get("head") or {}).get("ref", "").startswith(f"codex/gh-{issue}-")]
+    if len(matching) > 1:
+        raise PreparationError("ambiguous_issue_pr", "issue has more than one matching published issue PR")
     pr = matching[0] if matching else None
+    if pr and not pr.get("draft", False):
+        raise PreparationError("non_draft_issue_pr", "matching issue PR is not a draft pull request")
     branch = (pr or {}).get("head", {}).get("ref")
     if not branch:
         branch = parse_ref(body + "\n" + pad_body,
@@ -292,19 +324,138 @@ def process_owns_workspace(workspace: pathlib.Path) -> bool:
     return False
 
 
+ROLE_HOME_SCHEMA = "symphony-pilot-role-home/v2"
+ROLE_HOME_MARKER = pathlib.PurePosixPath(".git/symphony-role-home.json")
+ROLE_HOME_ROOT = pathlib.Path("/tmp")
+ROLE_HOME_PREFIX = "symphony-pilot-codex-home."
+ROLE_HOME_LEASE_FILE = ".symphony-pilot-role-home.json"
+
+
+def _role_home_path(value: object) -> pathlib.Path:
+    if not isinstance(value, str):
+        raise PreparationError("role_home_recovery", "role-home marker path is invalid")
+    path = pathlib.Path(value).resolve()
+    if path.parent != ROLE_HOME_ROOT.resolve() or not path.name.startswith(ROLE_HOME_PREFIX):
+        raise PreparationError("role_home_recovery", "role-home marker escapes the pilot staging directory")
+    return path
+
+
+def reconcile_role_home(workspace: pathlib.Path) -> bool:
+    """Remove the exact external role home left by a completed or crashed run.
+
+    The marker is host-owned state under .git, not a target-project file. Its
+    path is accepted only when it is the launcher-created /tmp prefix, so a
+    malformed marker fails closed instead of becoming a deletion primitive.
+    """
+    marker = workspace / pathlib.Path(ROLE_HOME_MARKER)
+    if not marker.exists():
+        return False
+    if process_owns_workspace(workspace):
+        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its workspace is active")
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreparationError("role_home_recovery", "role-home marker cannot be read") from exc
+    if not isinstance(data, dict) or data.get("schema") != ROLE_HOME_SCHEMA:
+        raise PreparationError("role_home_recovery", "role-home marker schema is invalid")
+    if data.get("workspace") != str(workspace.resolve()):
+        raise PreparationError("role_home_recovery", "role-home marker does not belong to this workspace")
+    lease_id = data.get("lease_id")
+    owner = data.get("owner")
+    if (not isinstance(lease_id, str) or not re.fullmatch(r"symphony-pilot-codex-home\.[A-Za-z0-9_]+", lease_id) or
+            not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or
+            isinstance(owner.get("pid"), bool) or owner.get("pid") < 1 or
+            not isinstance(owner.get("boot_id"), str) or not owner.get("boot_id") or
+            not isinstance(owner.get("start_time"), str) or not owner.get("start_time")):
+        raise PreparationError("role_home_recovery", "role-home owner identity is invalid")
+    role_home = _role_home_path(data.get("path"))
+    if role_home.name != lease_id:
+        raise PreparationError("role_home_recovery", "role-home lease does not match its path")
+    if process_identity_matches(owner):
+        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its App Server is active")
+    # A reboot may remove the ephemeral /tmp home while preserving .git. Once
+    # the recorded owner is stale, clearing only that durable marker is safe:
+    # there is no external path left to delete. If any path entry remains,
+    # bilateral lease equality is still mandatory before recursive deletion.
+    if not role_home.exists() and not role_home.is_symlink():
+        try:
+            marker.unlink()
+        except OSError as exc:
+            raise PreparationError("role_home_recovery", "stale role-home marker could not be removed") from exc
+        return True
+    lease_file = role_home / ROLE_HOME_LEASE_FILE
+    try:
+        lease = json.loads(lease_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreparationError("role_home_recovery", "role-home lease cannot be read") from exc
+    if lease != data:
+        raise PreparationError("role_home_recovery", "role-home lease does not match its workspace marker")
+    try:
+        if role_home.is_symlink():
+            role_home.unlink()
+        elif role_home.is_dir():
+            shutil.rmtree(role_home)
+        elif role_home.exists():
+            role_home.unlink()
+        marker.unlink()
+    except OSError as exc:
+        raise PreparationError("role_home_recovery", "stale role home could not be removed") from exc
+    return True
+
+
+def recovery_path_is_safe(path: pathlib.Path) -> bool:
+    """Apply the pre-existing host rule that secrets never enter archives."""
+    sensitive_names = {".env", "credentials", "credential", "secret", "secrets",
+                       "token", "tokens", "private-key", "private_keys"}
+    sensitive_suffixes = {".key", ".pem", ".p12", ".pfx", ".kdbx", ".token", ".secret"}
+    for part in path.parts:
+        name = part.lower()
+        if name in sensitive_names or name.startswith(".env."):
+            return False
+    name = path.name.lower()
+    return not name.endswith(".env") and not any(name.endswith(suffix) for suffix in sensitive_suffixes)
+
+
+def recovery_entries(workspace: pathlib.Path) -> tuple[list[tuple[pathlib.Path, str]], list[str]]:
+    """Walk recovery input recursively without crossing excluded paths."""
+    entries: list[tuple[pathlib.Path, str]] = []
+    excluded: list[str] = []
+
+    def visit(path: pathlib.Path, relative: pathlib.PurePath) -> None:
+        relative_text = relative.as_posix()
+        if not recovery_path_is_safe(relative):
+            excluded.append(relative_text)
+            return
+        if path.is_symlink():
+            excluded.append(relative_text)
+            return
+        if path.is_dir():
+            entries.append((path, relative_text))
+            for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
+                visit(child, relative / child.name)
+        else:
+            entries.append((path, relative_text))
+
+    for child in sorted(workspace.iterdir(), key=lambda item: item.name.lower()):
+        if child.name in {".git", "target"}:
+            continue
+        visit(child, pathlib.PurePath(child.name))
+    return entries, excluded
+
+
 def archive_recovery(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, status: str) -> pathlib.Path:
     directory = profile.state_root / "recovery" / f"GH-{facts.issue}"
     directory.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     archive = directory / f"{stamp}-{uuid.uuid4().hex[:8]}.tar.gz"
+    entries, excluded = recovery_entries(workspace)
     with tarfile.open(archive, "w:gz") as output:
-        for path in workspace.iterdir():
-            if path.name not in {".git", "target"}:
-                output.add(path, arcname=path.name, recursive=True)
+        for path, relative in entries:
+            output.add(path, arcname=relative, recursive=False)
         manifest = json.dumps({"repo": profile.repository, "issue": facts.issue,
                                "local_head": git(workspace, "rev-parse", "HEAD", check=False),
                                "remote_head": facts.target_sha, "status": status,
-                               "created_utc": stamp}, sort_keys=True).encode()
+                               "created_utc": stamp, "excluded_paths": excluded}, sort_keys=True).encode()
         import io
         info = tarfile.TarInfo("RECOVERY-MANIFEST.json")
         info.size = len(manifest)
@@ -459,6 +610,7 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
         try:
             if process_owns_workspace(workspace):
                 raise PreparationError("workspace_in_use", "another process currently owns the issue workspace")
+            reconcile_role_home(workspace)
             facts = issue_facts(profile, workspace, token)
             fetch = subprocess.run(["git", "fetch", "origin", "refs/heads/" + facts.branch + ":refs/remotes/origin/" + facts.branch],
                                    cwd=workspace, text=True, capture_output=True)

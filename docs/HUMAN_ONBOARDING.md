@@ -2,7 +2,7 @@
 
 This document is a reusable assistant-facing contract for onboarding a target repository onto `symphony-pilot` while asking the human operator only for decisions that genuinely require human authority.
 
-The generic Symphony lifecycle, workspace recovery, workpad mechanics, secret isolation, retry handling, publication preflight, deployment mechanics, and process management already belong to `symphony-pilot`. Do not ask the human to redesign or manually reproduce them.
+The generic Symphony lifecycle, sequential project-manager/planner/implementer/reviewer/adversary/archivist issue loop, workspace recovery, workpad mechanics, secret isolation, retry handling, publication preflight, deployment mechanics, and process management already belong to `symphony-pilot`. The archivist produces a closeout packet; the architect persists only accepted facts to the single workpad. Do not ask the human to redesign or manually reproduce them.
 
 ## Human operator role
 

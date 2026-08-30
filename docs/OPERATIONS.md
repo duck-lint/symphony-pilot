@@ -27,9 +27,20 @@ on the next start. Windows adapters invoke the deployed command
 `<deployment>/scripts/project.py`, never a source checkout.
 
 The deployed `test` action is deployment-safe: it checks that the deployed
-profile, manifest, workflow, operator command, and required runtime modules
-exist. Source-only validation remains the responsibility of the pilot
-checkout.
+profile, manifest, workflow, operator command, required runtime modules, and
+the six generic role-policy files exist. Source-only validation remains the
+responsibility of the pilot checkout.
+
+During an app-server run, the launcher exposes those role policies through a
+temporary external `CODEX_HOME`; it does not create pilot role files in the
+target checkout. The temporary home overlays the complete operator Codex home
+surface, including user hooks and personal agents, and records a host-owned
+lease under `.git` for normal and stale cleanup. The launcher and reconciler
+use the fixed host `/tmp` staging root, not ambient `TMPDIR`. If a reboot has
+already removed the external home, reconciliation clears only the stale
+durable marker after verifying that its recorded owner is dead. The archivist
+returns a closeout packet, while the architect persists only accepted archival
+facts to the single workpad.
 
 Start performs a GitHub dispatch-label count before launching and enforces the
 profile's one-issue limit. Deployment and preparation fail closed when a
@@ -46,5 +57,14 @@ and completed states, with fingerprints under the profile state root. They are
 convenience only; GitHub labels and the workpad remain authoritative.
 
 To add a project: commit a non-secret profile under projects/<slug>/, review
-the generated workflow, provision its host secret, run deployment, and perform
-a harmless canary before enabling its dispatch label.
+the generated workflow and role pack, provision its host secret, run
+deployment, and perform a harmless canary before enabling its dispatch label.
+The canary must prove a real app-server role handoff, not just deployment
+presence: observe project-manager and planner packets, an implementer change,
+a fresh reviewer verdict, a fresh adversarial verdict, and the same final HEAD
+in both acceptance records and mechanical validation. For reviewer and
+adversary isolation, the canary must also request an explicitly harmless
+sentinel mutation and observe a runtime denial/error while confirming the
+worktree is unchanged; voluntary non-editing is not sandbox evidence. If role
+selection is not available in the installed Codex path, record that capability
+boundary and do not silently run the old architect-worker lifecycle.

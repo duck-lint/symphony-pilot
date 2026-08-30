@@ -1,11 +1,14 @@
 """Focused infrastructure regression tests for the reusable pilot runtime."""
 from __future__ import annotations
 import json
+import hashlib
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -16,6 +19,7 @@ import prepare_workspace as pw
 import after_run
 sys.path.insert(0, str(ROOT / "scripts"))
 import project as project_control
+import deploy
 import host_integration
 import process_identity
 
@@ -149,6 +153,12 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(compact.count("same"), 1)
         self.assertLessEqual(len(bounded), 1000)
 
+    def test_duplicate_workpads_are_not_selected(self):
+        comments = [{"id": 1, "body": "<!-- symphony-workpad:v1 --> one"},
+                    {"id": 2, "body": "<!-- symphony-workpad:v1 --> two"}]
+        self.assertEqual(pw.workpad_candidates(comments), comments)
+        self.assertIsNone(pw.workpad(comments))
+
     def test_blocker_fingerprint_is_stable(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -181,10 +191,541 @@ class InfrastructureTests(unittest.TestCase):
             finally:
                 pw.github, pw.git = old_github, old_git
 
+    def test_multiple_matching_issue_prs_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-11"
+            repo.mkdir(parents=True)
+            p = make_profile(root)
+            old_github, old_git = pw.github, pw.git
+            try:
+                def fake_github(_p, _t, _m, path, _body=None):
+                    if path == "/issues/11":
+                        return {"body": "required starting commit: " + "e"*40}
+                    if path.startswith("/issues/11/comments"):
+                        return []
+                    if path.startswith("/pulls"):
+                        return [
+                            {"number": 1, "head": {"repo": {"full_name": p.repository},
+                                                     "ref": "codex/gh-11-one"}},
+                            {"number": 2, "head": {"repo": {"full_name": p.repository},
+                                                     "ref": "codex/gh-11-two"}},
+                        ]
+                    return []
+                pw.github = fake_github
+                pw.git = lambda *_args, **_kwargs: ""
+                with self.assertRaisesRegex(pw.PreparationError, "more than one matching"):
+                    pw.issue_facts(p, repo, "secret")
+            finally:
+                pw.github, pw.git = old_github, old_git
+
+    def test_cardinality_checks_include_later_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-13"
+            repo.mkdir(parents=True)
+            p = make_profile(root)
+            old_github, old_git = pw.github, pw.git
+            try:
+                pad = {"id": 9, "body": "<!-- symphony-workpad:v1 -->\nlate pad"}
+                matching_pr = {"number": 4, "draft": True,
+                               "head": {"repo": {"full_name": p.repository},
+                                        "ref": "codex/gh-13-work"}}
+
+                def fake_github(_p, _t, _m, path, _body=None):
+                    if path == "/issues/13":
+                        return {"body": "required starting commit: " + "d"*40}
+                    if path.startswith("/issues/13/comments"):
+                        return ([{"body": "ordinary comment"}] * 100
+                                if "&page=1" in path else [pad])
+                    if path.startswith("/pulls"):
+                        return ([{"head": {"repo": {"full_name": "other/repo"},
+                                            "ref": "unrelated"}}] * 100
+                                if "&page=1" in path else [matching_pr])
+                    return []
+
+                pw.github = fake_github
+                pw.git = lambda *_args, **_kwargs: ""
+                facts = pw.issue_facts(p, repo, "secret")
+                self.assertEqual(facts.pr_number, 4)
+                self.assertIn("<!-- symphony-workpad:v1 -->", facts.comments[-1]["body"])
+            finally:
+                pw.github, pw.git = old_github, old_git
+
+    def test_non_draft_issue_pr_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-12"
+            repo.mkdir(parents=True)
+            p = make_profile(root)
+            old_github, old_git = pw.github, pw.git
+            try:
+                def fake_github(_p, _t, _m, path, _body=None):
+                    if path == "/issues/12":
+                        return {"body": "required starting commit: " + "f"*40}
+                    if path.startswith("/issues/12/comments"):
+                        return []
+                    if path.startswith("/pulls"):
+                        return [{"number": 3, "draft": False,
+                                 "head": {"repo": {"full_name": p.repository},
+                                          "ref": "codex/gh-12-work"}}]
+                    return []
+                pw.github = fake_github
+                pw.git = lambda *_args, **_kwargs: ""
+                with self.assertRaisesRegex(pw.PreparationError, "not a draft"):
+                    pw.issue_facts(p, repo, "secret")
+            finally:
+                pw.github, pw.git = old_github, old_git
+
     def test_launcher_unsets_tracker_variables(self):
         launcher = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")
         self.assertIn("unset SYMPHONY_PILOT_GITHUB_TOKEN", launcher)
+        self.assertLess(launcher.index("unset SYMPHONY_PILOT_GITHUB_TOKEN"),
+                        launcher.index("source .git/symphony-toolchain.env"))
+        self.assertGreater(launcher.rindex("unset SYMPHONY_PILOT_GITHUB_TOKEN"),
+                           launcher.index("source .git/symphony-toolchain.env"))
         self.assertIn("app-server", launcher)
+        self.assertIn(".codex/agents", launcher)
+        self.assertIn("reserved Codex agent name collision", launcher)
+        self.assertIn("export CODEX_HOME", launcher)
+        self.assertIn('mktemp -d "/tmp/symphony-pilot-codex-home.XXXXXX"', launcher)
+        self.assertIn('exec "${CODEX_BIN:-codex}"', launcher)
+        self.assertIn("trap - EXIT INT TERM", launcher)
+        self.assertIn("symphony-pilot-role-home/v2", launcher)
+        self.assertIn("tomllib", launcher)
+        self.assertNotIn('ROLE_TARGET="$PWD/.codex/agents"', launcher)
+        self.assertIn('cannot establish App Server process identity', launcher)
+
+    def test_role_home_cleanup_uses_fixed_root_not_ambient_tempdir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(tempfile, "gettempdir", return_value=str(root / "redirected")):
+                self.assertEqual(pw._role_home_path(str(role_home)), role_home.resolve())
+            shutil.rmtree(role_home)
+
+    def test_launcher_overlay_preserves_operator_policy_surface_and_target_clean(self):
+        if os.name == "nt":
+            self.skipTest("launcher process fixture requires POSIX process semantics")
+        bash = None
+        if os.name == "nt":
+            for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                              r"C:\Program Files\Git\usr\bin\bash.exe"):
+                if pathlib.Path(candidate).exists():
+                    bash = candidate
+                    break
+        else:
+            bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("Bash is unavailable")
+
+        def bash_path(path):
+            value = str(path)
+            if os.name == "nt" and len(value) > 2 and value[1] == ":":
+                return "/" + value[0].lower() + value[2:].replace("\\", "/")
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            git_repo(repo)
+            (repo / ".git" / "symphony-toolchain.env").write_text(
+                "export GITHUB_TOKEN=must-not-reach-child\n"
+                "export TMPDIR=\"$PWD\"\n", encoding="utf-8")
+            role_source = root / "role-source"
+            role_source.mkdir()
+            for policy in (ROOT / "workflow/agents").glob("*.toml"):
+                shutil.copy2(policy, role_source / policy.name)
+            original_home = root / "operator-codex"
+            original_home.mkdir()
+            operator_hook = original_home / "harmless-hook.sh"
+            operator_hook.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf executed > \"$HOOK_OBSERVATION\"\n", encoding="utf-8")
+            operator_hook.chmod(0o755)
+            (original_home / "hooks.json").write_text(
+                json.dumps({"harmless_hook": bash_path(operator_hook)}) + "\n", encoding="utf-8")
+            (original_home / "agents").mkdir()
+            (original_home / "agents" / "personal.toml").write_text(
+                'name = "personal"\ndescription = "operator policy"\n'
+                'developer_instructions = "operator policy"\n', encoding="utf-8")
+            operator_reviewer = original_home / "agents" / "reviewer.toml"
+            operator_reviewer.write_text(
+                'name = "not-the-symphony-reviewer"\n'
+                'description = "operator"\n'
+                'developer_instructions = "operator"\n', encoding="utf-8")
+            operator_reviewer_digest = hashlib.sha256(operator_reviewer.read_bytes()).hexdigest()
+            probe = root / "probe"
+            pid_probe = root / "pid"
+            fake = root / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env bash\n"
+                "grep -l '^name = \"reviewer\"$' \"$CODEX_HOME\"/agents/*.toml >/dev/null || { echo reviewer-missing >&2; exit 41; }\n"
+                "grep -l '^name = \"not-the-symphony-reviewer\"$' \"$CODEX_HOME\"/agents/*.toml >/dev/null || { echo operator-reviewer-missing >&2; exit 43; }\n"
+                "grep -l '^name = \"personal\"$' \"$CODEX_HOME\"/agents/*.toml >/dev/null || { echo personal-missing >&2; exit 47; }\n"
+                "test -f \"$CODEX_HOME/hooks.json\" || { echo hooks-missing >&2; exit 44; }\n"
+                "grep -q harmless_hook \"$CODEX_HOME/hooks.json\" || { echo hook-entry-missing >&2; exit 45; }\n"
+                "test -z \"${SYMPHONY_PILOT_GITHUB_TOKEN:-}\" || { echo token-leaked >&2; exit 42; }\n"
+                "printf '%s' \"$CODEX_HOME\" > \"$ROLE_PROBE\"\n"
+                "printf '%s' \"$$\" > \"$PID_PROBE\"\n"
+                "touch \"$ROLE_READY\"\n"
+                "while [[ ! -e \"$ROLE_RELEASE\" ]]; do sleep 0.01; done\n"
+                "exit 143\n", encoding="utf-8")
+            fake.chmod(0o755)
+            env = os.environ.copy()
+            env.update({"CODEX_BIN": bash_path(fake), "CODEX_HOME": bash_path(original_home),
+                        "SYMPHONY_PILOT_ROLE_POLICY_DIR": bash_path(role_source),
+                        "SYMPHONY_PILOT_GITHUB_TOKEN": "must-not-reach-child",
+                        "ROLE_PROBE": bash_path(probe),
+                        "PID_PROBE": bash_path(pid_probe),
+                        "ROLE_READY": bash_path(root / "ready"),
+                        "ROLE_RELEASE": bash_path(root / "release")})
+            child = subprocess.Popen([bash, bash_path(ROOT / "runtime/launch_codex.sh")],
+                                     cwd=repo, env=env, text=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(100):
+                    if (root / "ready").exists():
+                        break
+                    time.sleep(0.01)
+                self.assertTrue((root / "ready").exists())
+                status_while_running = subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=repo,
+                    text=True, capture_output=True, check=True)
+                self.assertEqual(status_while_running.stdout, "")
+                self.assertFalse((repo / ".codex").exists())
+                lease = json.loads((repo / ".git" / "symphony-role-home.json").read_text())
+                role_home = pathlib.Path(lease["path"])
+                self.assertNotIn(str(repo), str(role_home))
+                if os.name == "nt":
+                    self.assertTrue(str(role_home).startswith("\\tmp\\") or
+                                    str(lease["path"]).startswith("/tmp/"))
+                else:
+                    self.assertTrue(role_home.is_dir())
+                if os.name == "nt":
+                    (root / "release").touch()
+                else:
+                    child.terminate()
+                result_code = child.wait(timeout=10)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+            if os.name == "nt":
+                self.assertEqual(result_code, 143)
+            else:
+                self.assertLess(result_code, 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child.pid, 0)
+            self.assertTrue(probe.exists())
+            self.assertNotIn(str(repo), probe.read_text(encoding="utf-8"))
+            self.assertEqual(hashlib.sha256(operator_reviewer.read_bytes()).hexdigest(),
+                             operator_reviewer_digest)
+            if os.name != "nt":
+                self.assertEqual(int(pid_probe.read_text()), child.pid)
+            self.assertFalse((repo / ".codex").exists())
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                                    text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+            if os.name == "nt":
+                subprocess.run([bash, "-c", "rm -rf -- \"$1\"", "cleanup",
+                                lease["path"]], check=True)
+                (repo / ".git" / "symphony-role-home.json").unlink()
+            else:
+                self.assertTrue(pw.reconcile_role_home(repo))
+                self.assertFalse(role_home.exists())
+            self.assertFalse((repo / ".git" / "symphony-role-home.json").exists())
+
+    def test_launcher_rejects_logical_role_name_collision(self):
+        bash = None
+        if os.name == "nt":
+            for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                              r"C:\Program Files\Git\usr\bin\bash.exe"):
+                if pathlib.Path(candidate).exists():
+                    bash = candidate
+                    break
+        else:
+            bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("Bash is unavailable")
+
+        def bash_path(path):
+            value = str(path)
+            if os.name == "nt" and len(value) > 2 and value[1] == ":":
+                return "/" + value[0].lower() + value[2:].replace("\\", "/")
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            git_repo(repo)
+            collision = repo / ".codex" / "agents"
+            collision.mkdir(parents=True)
+            (collision / "not-reviewer.toml").write_text(
+                'name = "reviewer"\ndescription = "collision"\n'
+                'developer_instructions = "collision"\n', encoding="utf-8")
+            subprocess.run(["git", "add", ".codex"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "project agent"], cwd=repo, check=True)
+            role_source = root / "role-source"
+            role_source.mkdir()
+            for policy in (ROOT / "workflow/agents").glob("*.toml"):
+                shutil.copy2(policy, role_source / policy.name)
+            result = subprocess.run(
+                [bash, bash_path(ROOT / "runtime/launch_codex.sh")], cwd=repo,
+                env={**os.environ, "CODEX_HOME": bash_path(root / "operator-codex"),
+                     "SYMPHONY_PILOT_ROLE_POLICY_DIR": bash_path(role_source),
+                     "CODEX_BIN": "false"}, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("reserved Codex agent name collision", result.stderr)
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                                    text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+
+    def test_launcher_fails_closed_when_process_identity_is_unavailable(self):
+        if os.name != "nt":
+            self.skipTest("the host provides /proc process identity")
+        bash = None
+        for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                          r"C:\Program Files\Git\usr\bin\bash.exe"):
+            if pathlib.Path(candidate).exists():
+                bash = candidate
+                break
+        if not bash:
+            self.skipTest("Bash is unavailable")
+
+        def bash_path(path):
+            value = str(path)
+            if len(value) > 2 and value[1] == ":":
+                return "/" + value[0].lower() + value[2:].replace("\\", "/")
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            git_repo(repo)
+            original_home = root / "operator-codex"
+            original_home.mkdir()
+            role_source = root / "role-source"
+            role_source.mkdir()
+            for policy in (ROOT / "workflow/agents").glob("*.toml"):
+                shutil.copy2(policy, role_source / policy.name)
+            result = subprocess.run(
+                [bash, bash_path(ROOT / "runtime/launch_codex.sh")], cwd=repo,
+                env={**os.environ, "CODEX_HOME": bash_path(original_home),
+                     "SYMPHONY_PILOT_ROLE_POLICY_DIR": bash_path(role_source),
+                     "CODEX_BIN": "false", "TMPDIR": bash_path(repo)},
+                text=True, capture_output=True)
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("cannot establish App Server process identity", result.stderr)
+            self.assertFalse((repo / ".git" / "symphony-role-home.json").exists())
+            self.assertFalse((repo / ".codex").exists())
+
+    def test_role_home_reconciliation_removes_exact_external_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            (role_home / "agents").mkdir()
+            marker = repo / ".git" / "symphony-role-home.json"
+            lease = {
+                "schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                "path": str(role_home), "workspace": str(repo.resolve()),
+                "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            marker.write_text(json.dumps(lease), encoding="utf-8")
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent):
+                self.assertTrue(pw.reconcile_role_home(repo))
+            self.assertFalse(role_home.exists())
+            self.assertFalse(marker.exists())
+
+    def test_role_home_lease_cannot_cross_authorize_workspaces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo_a = root / "A"
+            repo_b = root / "B"
+            (repo_a / ".git").mkdir(parents=True)
+            (repo_b / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo_b.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            marker = repo_a / ".git" / "symphony-role-home.json"
+            marker.write_text(json.dumps({**lease, "workspace": str(repo_a.resolve())}), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent):
+                with self.assertRaisesRegex(pw.PreparationError, "does not match its workspace marker"):
+                    pw.reconcile_role_home(repo_a)
+            self.assertTrue(role_home.exists())
+            self.assertTrue(marker.exists())
+
+    def test_active_role_home_owner_prevents_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            (repo / ".git" / "symphony-role-home.json").write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=True):
+                with self.assertRaisesRegex(pw.PreparationError, "App Server is active"):
+                    pw.reconcile_role_home(repo)
+            self.assertTrue(role_home.exists())
+
+    def test_pid_identity_mismatch_allows_stale_own_home_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "old-boot", "start_time": "old-start"}}
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
+            (repo / ".git" / "symphony-role-home.json").write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=False):
+                self.assertTrue(pw.reconcile_role_home(repo))
+            self.assertFalse(role_home.exists())
+
+    def test_absent_role_home_clears_only_stale_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            shutil.rmtree(role_home)
+            marker = repo / ".git" / "symphony-role-home.json"
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            marker.write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=False):
+                self.assertTrue(pw.reconcile_role_home(repo))
+            self.assertFalse(marker.exists())
+
+    def test_absent_role_home_with_live_owner_keeps_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            shutil.rmtree(role_home)
+            marker = repo / ".git" / "symphony-role-home.json"
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            marker.write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=True):
+                with self.assertRaisesRegex(pw.PreparationError, "App Server is active"):
+                    pw.reconcile_role_home(repo)
+            self.assertTrue(marker.exists())
+
+    def test_after_run_reconciles_role_home_before_tracker_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "workspace"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            marker = repo / ".git" / "symphony-role-home.json"
+            marker.write_text(json.dumps({
+                "schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                "path": str(role_home), "workspace": str(repo.resolve()),
+                "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}),
+                encoding="utf-8")
+            (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(marker.read_text(), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(after_run, "load_profile", return_value=make_profile(root)), \
+                    mock.patch.object(after_run, "read_secret", return_value="redacted"), \
+                    mock.patch.object(pw, "process_owns_workspace", return_value=False), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=False), \
+                    mock.patch.object(sys, "argv", ["after_run", "--profile", "x",
+                                                      "--workspace", str(repo)]):
+                self.assertEqual(after_run.main(), 0)
+            self.assertFalse(role_home.exists())
+            self.assertFalse(marker.exists())
+
+    def test_generic_role_policies_have_distinct_contracts(self):
+        import tomllib
+
+        expected = {
+            "project-manager": "read-only",
+            "planner": "read-only",
+            "implementer": "workspace-write",
+            "reviewer": "read-only",
+            "adversary": "read-only",
+            "archivist": "read-only",
+        }
+        policies = sorted((ROOT / "workflow/agents").glob("*.toml"))
+        self.assertEqual({path.stem for path in policies}, set(expected))
+        descriptions = set()
+        for path in policies:
+            with path.open("rb") as stream:
+                data = tomllib.load(stream)
+            self.assertEqual(data["name"], path.stem)
+            self.assertEqual(data["sandbox_mode"], expected[path.stem])
+            self.assertTrue(data["description"])
+            self.assertTrue(data["developer_instructions"])
+            descriptions.add(data["developer_instructions"])
+        self.assertEqual(len(descriptions), len(expected))
+        archivist = next(path for path in policies if path.stem == "archivist")
+        archivist_text = archivist.read_text(encoding="utf-8")
+        self.assertIn("bounded archival packet", archivist_text)
+        self.assertIn("only role that persists", archivist_text)
+        self.assertIn("Do not mutate the workpad", archivist_text)
+
+    def test_architect_policy_defines_independent_gates_and_adjudication(self):
+        policy = (ROOT / "workflow/architect_policy.md").read_text(encoding="utf-8")
+        for phrase in (
+            "ARCHITECT / ORCHESTRATOR",
+            "PROJECT-MANAGER",
+            "PLANNER",
+            "IMPLEMENTER",
+            "REVIEWER",
+            "ADVERSARY",
+            "ARCHIVIST",
+            "licensed correction | unresolved project decision | infrastructure condition",
+            "A correction invalidates every prior acceptance of the older HEAD",
+            "Reviewer and adversary findings are internal orchestration state",
+            "<!-- symphony-workpad:v1 -->",
+            "final fresh REVIEWER",
+            "final fresh ADVERSARY",
+            "ARCHIVIST is a read-only continuity/closeout role",
+            "alone persists accepted durable state",
+        ):
+            self.assertIn(phrase, policy)
+        self.assertNotIn("built-in worker subagent", policy)
+
+    def test_canary_requires_mechanical_isolation_evidence(self):
+        operations = (ROOT / "docs/OPERATIONS.md").read_text(encoding="utf-8")
+        self.assertIn("sentinel mutation", operations)
+        self.assertIn("runtime denial/error", operations)
+        self.assertIn("voluntary non-editing is not sandbox evidence", operations)
+
+    def test_deployment_inventory_includes_all_generic_role_policies(self):
+        self.assertEqual({path.stem for path in deploy.ROLE_POLICY_FILES},
+                         deploy.EXPECTED_ROLE_NAMES)
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
+            "--profile", str(ROOT / "projects/cleanroom/profile.toml"), "--dry-run"],
+            text=True, capture_output=True, check=True)
+        data = json.loads(result.stdout)
+        self.assertEqual(set(data["role_policies"]), deploy.EXPECTED_ROLE_NAMES)
+        self.assertEqual(data["files"], 17)
+
+    def test_deployed_test_requires_and_verifies_role_policy_files(self):
+        source = (ROOT / "scripts/project.py").read_text(encoding="utf-8")
+        for name in ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"):
+            self.assertIn(f'"{name}"', source)
+        self.assertIn("deployed file does not match its manifest", source)
 
     def test_schema_has_no_credential_property(self):
         schema = json.loads((ROOT / "schemas/project-profile.schema.json").read_text())
@@ -206,6 +747,51 @@ class InfrastructureTests(unittest.TestCase):
                 names = tar.getnames()
             self.assertIn("RECOVERY-MANIFEST.json", names)
             self.assertFalse(any(name.startswith(".git") for name in names))
+
+    def test_recovery_archive_excludes_secret_named_paths_recursively(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "work" / "GH-10"
+            repo.mkdir(parents=True)
+            git_repo(repo)
+            (repo / ".env").write_text("PRIVATE=do-not-archive\n", encoding="utf-8")
+            (repo / "private.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
+            (repo / "safe-dir").mkdir()
+            (repo / "safe-dir" / ".env").write_text("NESTED=do-not-archive\n", encoding="utf-8")
+            (repo / "safe-dir" / "private.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
+            (repo / "safe-dir" / "credentials").mkdir()
+            (repo / "safe-dir" / "credentials" / "token.txt").write_text("TOKEN\n", encoding="utf-8")
+            (repo / "dirty.txt").write_text("recover\n", encoding="utf-8")
+            p = make_profile(root)
+            facts = pw.IssueFacts(10, "branch", "c"*40, None, None, None, None, "initial", None, None, [])
+            archive = pw.archive_recovery(p, repo, facts, "?? dirty.txt")
+            import tarfile
+            with tarfile.open(archive) as tar:
+                names = tar.getnames()
+                manifest = json.loads(tar.extractfile("RECOVERY-MANIFEST.json").read())
+            self.assertIn("dirty.txt", names)
+            self.assertNotIn(".env", names)
+            self.assertNotIn("private.pem", names)
+            self.assertNotIn("safe-dir/.env", names)
+            self.assertNotIn("safe-dir/private.pem", names)
+            self.assertNotIn("safe-dir/credentials/token.txt", names)
+            self.assertEqual(set(manifest["excluded_paths"]), {
+                ".env", "private.pem", "safe-dir/.env", "safe-dir/private.pem",
+                "safe-dir/credentials"})
+
+    def test_manifest_verification_rejects_tampered_or_uninventoried_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "runtime").mkdir()
+            (root / "runtime" / "launch_codex.sh").write_text("original\n", encoding="utf-8")
+            manifest_path = root / "DEPLOYMENT.json"
+            digest = hashlib.sha256(
+                (root / "runtime" / "launch_codex.sh").read_bytes()).hexdigest()
+            manifest = {"files": {"runtime/launch_codex.sh": digest}}
+            project_control.verify_manifest(root, manifest_path, manifest)
+            (root / "runtime" / "launch_codex.sh").write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                project_control.verify_manifest(root, manifest_path, manifest)
 
     def test_initial_facts_use_licensed_sha_when_remote_branch_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -9,8 +9,10 @@ The durable state boundary is:
       -> host preparation
       -> clean WSL-native issue workspace
       -> official Symphony
-      -> Codex architect
-      -> bounded built-in worker
+      -> Codex architect / orchestrator
+      -> project-manager -> planner -> implementer
+      -> independent reviewer -> adversary
+      -> archivist and human merge handoff
 
 A project profile supplies repository identity, non-secret paths, labels, limits,
 and Codex settings. runtime/prepare_workspace.py resolves issue-specific
@@ -29,9 +31,33 @@ repository remain the authority for project work.
 
 The host owns Git, recovery archives, toolchain discovery, publication
 preflight, credential isolation, host-awake inhibition, and best-effort generic
-notifications. The architect owns issue interpretation,
-authority review, bounded delegation, evidence review, and the issue workpad.
-The target repository owns semantic decisions.
+notifications. The architect/orchestrator owns one issue lifecycle, authority
+integration, role routing, adjudication, evidence-specific workpad state,
+publication, and final acceptance. The target repository owns semantic
+decisions.
+
+The generic role policies are deployed under `workflow/agents/`. The Codex
+launcher creates a temporary per-process `CODEX_HOME` outside the target
+checkout, symlinks the complete operator home surface into it, preserves
+personal agents, and overlays the six pilot policies. It refuses collisions by
+logical TOML `name` across personal, project, and pilot layers without creating
+`.codex` in the target. A host-owned lease under `.git` lets `after_run`, next
+preparation, or recovery remove the exact external home after normal or
+abnormal termination. Pilot files use generated non-hidden filenames, so an
+operator file such as `reviewer.toml` is never overwritten even when its
+logical name is unrelated. Cleanup also requires the matching external lease,
+workspace binding, and boot/start process identity to be stale. Both launcher
+and reconciler use the fixed host `/tmp` staging root; ambient `TMPDIR` cannot
+redirect it. If `/tmp` is cleared after a reboot, a stale durable marker is
+removed without authorizing deletion of any replacement path. Project-owned
+`.codex/agents` remains untouched.
+
+The role pack and launcher preflight are deployment wiring. A complete
+named-role lifecycle remains unproven until a harmless target issue is run and
+the workpad, app-server events, and exact HEADs confirm each role handoff. The
+repository therefore makes no unconditional claim that every deployed
+Codex/App Server version can execute named roles; a failed capability follows
+the existing infrastructure blocker path.
 
 Upstream runtime: OpenAI openai/symphony Elixir reference implementation.
 Upstream lifecycle authority: OpenAI SPEC.md.

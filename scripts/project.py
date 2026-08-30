@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import establish_awake_guard, release_awake_guard
 from process_identity import capture, matches, read
@@ -163,6 +164,9 @@ def active_issues(profile, token):
                     urllib.parse.quote(",".join(profile.dispatch_labels)) + "&per_page=100")
     return issues if isinstance(issues, list) else []
 
+def project_name(profile):
+    return profile.display_name or profile.slug
+
 def start(profile):
     token = read_secret(profile)
     pid_path, log_path = state_paths(profile)
@@ -173,7 +177,7 @@ def start(profile):
             try:
                 establish_awake_guard(profile)
             except RuntimeError as exc:
-                print(f"Cannot keep CLEANROOM awake: {exc}")
+                print(f"Cannot keep {project_name(profile)} awake: {exc}")
                 return 1
             print("Symphony is already running.")
             return 0
@@ -194,7 +198,7 @@ def start(profile):
     try:
         establish_awake_guard(profile)
     except RuntimeError as exc:
-        print(f"Cannot start CLEANROOM: {exc}")
+        print(f"Cannot start {project_name(profile)}: {exc}")
         return 1
     env = os.environ.copy()
     env["SYMPHONY_PILOT_GITHUB_TOKEN"] = token
@@ -317,7 +321,7 @@ def finish(profile):
         print("Cannot finish safely: more than one issue is active in the one-issue pilot.")
         return 1
     if initial:
-        print("CLEANROOM is finishing; current work will be allowed to finish before Symphony stops.")
+        print(f"{project_name(profile)} is finishing; current work will be allowed to finish before Symphony stops.")
     try:
         while True:
             active = _active_entries(view)
@@ -371,6 +375,32 @@ def status(profile):
         print("WORKING - DO NOT SHUT DOWN")
     return 0
 
+def verify_manifest(root, manifest_path, manifest):
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("manifest files inventory is missing")
+    root = root.resolve()
+    actual_files = {str(path.relative_to(root)).replace("\\", "/")
+                    for path in root.rglob("*")
+                    if path.is_file() and path.resolve() != manifest_path.resolve()}
+    if actual_files != set(files):
+        missing = sorted(set(files) - actual_files)
+        unexpected = sorted(actual_files - set(files))
+        raise ValueError(f"manifest inventory mismatch: missing={missing}, unexpected={unexpected}")
+    for relative, expected in files.items():
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise ValueError("manifest files inventory is malformed")
+        path = (root / pathlib.PurePosixPath(relative)).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"manifest path escapes deployment root: {relative}") from exc
+        if path == manifest_path.resolve() or not path.is_file():
+            raise ValueError(f"manifest file is missing: {relative}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if expected != actual:
+            raise ValueError(f"deployed file does not match its manifest: {relative}")
+
 def test(profile):
     root = install_root(profile)
     manifest_path = root / "DEPLOYMENT.json"
@@ -378,6 +408,8 @@ def test(profile):
                 root / "scripts" / "project.py", root / "runtime" / "prepare_workspace.py",
                 root / "runtime" / "host_integration.py", root / "runtime" / "process_identity.py",
                 root / "projects" / profile.slug / "WORKFLOW.md"]
+    required += [root / "workflow" / "agents" / f"{name}.toml"
+                 for name in ROLE_POLICY_NAMES]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         print("Deployment validation failed; missing: " + ", ".join(missing))
@@ -387,10 +419,7 @@ def test(profile):
         cli_name = manifest.get("operator_cli")
         if cli_name != "scripts/project.py":
             raise ValueError("manifest operator_cli is not scripts/project.py")
-        expected = manifest.get("files", {}).get(cli_name)
-        actual = hashlib.sha256((root / cli_name).read_bytes()).hexdigest()
-        if expected != actual:
-            raise ValueError("deployed operator command does not match its manifest")
+        verify_manifest(root, manifest_path, manifest)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Deployment validation failed: {exc}")
         return 1
