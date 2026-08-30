@@ -35,9 +35,12 @@ During an app-server run, the launcher exposes those role policies through a
 temporary external `CODEX_HOME`; it does not create pilot role files in the
 target checkout. The temporary home overlays the complete operator Codex home
 surface, including user hooks and personal agents, and records a host-owned
-lease under `.git` for normal and stale cleanup. The archivist returns a
-closeout packet, while the architect persists only accepted archival facts to
-the single workpad.
+lease under `.git` for normal and stale cleanup. The launcher and reconciler
+use the fixed host `/tmp` staging root, not ambient `TMPDIR`. If a reboot has
+already removed the external home, reconciliation clears only the stale
+durable marker after verifying that its recorded owner is dead. The archivist
+returns a closeout packet, while the architect persists only accepted archival
+facts to the single workpad.
 
 Start performs a GitHub dispatch-label count before launching and enforces the
 profile's one-issue limit. Deployment and preparation fail closed when a

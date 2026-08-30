@@ -153,6 +153,10 @@ PY
 )"
 OWNER_BOOT_ID="$(printf '%s\n' "$OWNER_ID" | sed -n '1p')"
 OWNER_START_TIME="$(printf '%s\n' "$OWNER_ID" | sed -n '2p')"
+if [[ -z "$OWNER_BOOT_ID" || -z "$OWNER_START_TIME" ]]; then
+  echo "symphony-pilot: cannot establish App Server process identity" >&2
+  exit 78
+fi
 temporary_marker="$ROLE_HOME_MARKER.tmp"
 lease_file="$ROLE_CODEX_HOME/.symphony-pilot-role-home.json"
 "$PYTHON_BIN" - "$ROLE_CODEX_HOME" "$ROLE_LEASE_ID" "$PWD" "$$" \

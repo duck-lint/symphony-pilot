@@ -46,7 +46,10 @@ preparation, or recovery remove the exact external home after normal or
 abnormal termination. Pilot files use generated non-hidden filenames, so an
 operator file such as `reviewer.toml` is never overwritten even when its
 logical name is unrelated. Cleanup also requires the matching external lease,
-workspace binding, and boot/start process identity to be stale. Project-owned
+workspace binding, and boot/start process identity to be stale. Both launcher
+and reconciler use the fixed host `/tmp` staging root; ambient `TMPDIR` cannot
+redirect it. If `/tmp` is cleared after a reboot, a stale durable marker is
+removed without authorizing deletion of any replacement path. Project-owned
 `.codex/agents` remains untouched.
 
 The role pack and launcher preflight are deployment wiring. A complete

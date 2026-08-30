@@ -294,6 +294,16 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("symphony-pilot-role-home/v2", launcher)
         self.assertIn("tomllib", launcher)
         self.assertNotIn('ROLE_TARGET="$PWD/.codex/agents"', launcher)
+        self.assertIn('cannot establish App Server process identity', launcher)
+
+    def test_role_home_cleanup_uses_fixed_root_not_ambient_tempdir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(tempfile, "gettempdir", return_value=str(root / "redirected")):
+                self.assertEqual(pw._role_home_path(str(role_home)), role_home.resolve())
+            shutil.rmtree(role_home)
 
     def test_launcher_overlay_preserves_operator_policy_surface_and_target_clean(self):
         if os.name == "nt":
@@ -474,6 +484,46 @@ class InfrastructureTests(unittest.TestCase):
                                     text=True, capture_output=True, check=True)
             self.assertEqual(status.stdout, "")
 
+    def test_launcher_fails_closed_when_process_identity_is_unavailable(self):
+        if os.name != "nt":
+            self.skipTest("the host provides /proc process identity")
+        bash = None
+        for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                          r"C:\Program Files\Git\usr\bin\bash.exe"):
+            if pathlib.Path(candidate).exists():
+                bash = candidate
+                break
+        if not bash:
+            self.skipTest("Bash is unavailable")
+
+        def bash_path(path):
+            value = str(path)
+            if len(value) > 2 and value[1] == ":":
+                return "/" + value[0].lower() + value[2:].replace("\\", "/")
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            git_repo(repo)
+            original_home = root / "operator-codex"
+            original_home.mkdir()
+            role_source = root / "role-source"
+            role_source.mkdir()
+            for policy in (ROOT / "workflow/agents").glob("*.toml"):
+                shutil.copy2(policy, role_source / policy.name)
+            result = subprocess.run(
+                [bash, bash_path(ROOT / "runtime/launch_codex.sh")], cwd=repo,
+                env={**os.environ, "CODEX_HOME": bash_path(original_home),
+                     "SYMPHONY_PILOT_ROLE_POLICY_DIR": bash_path(role_source),
+                     "CODEX_BIN": "false", "TMPDIR": bash_path(repo)},
+                text=True, capture_output=True)
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("cannot establish App Server process identity", result.stderr)
+            self.assertFalse((repo / ".git" / "symphony-role-home.json").exists())
+            self.assertFalse((repo / ".codex").exists())
+
     def test_role_home_reconciliation_removes_exact_external_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = pathlib.Path(directory) / "repo"
@@ -487,7 +537,8 @@ class InfrastructureTests(unittest.TestCase):
                 "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
             marker.write_text(json.dumps(lease), encoding="utf-8")
             (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
-            self.assertTrue(pw.reconcile_role_home(repo))
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent):
+                self.assertTrue(pw.reconcile_role_home(repo))
             self.assertFalse(role_home.exists())
             self.assertFalse(marker.exists())
 
@@ -505,8 +556,9 @@ class InfrastructureTests(unittest.TestCase):
             (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
             marker = repo_a / ".git" / "symphony-role-home.json"
             marker.write_text(json.dumps({**lease, "workspace": str(repo_a.resolve())}), encoding="utf-8")
-            with self.assertRaisesRegex(pw.PreparationError, "does not match its workspace marker"):
-                pw.reconcile_role_home(repo_a)
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent):
+                with self.assertRaisesRegex(pw.PreparationError, "does not match its workspace marker"):
+                    pw.reconcile_role_home(repo_a)
             self.assertTrue(role_home.exists())
             self.assertTrue(marker.exists())
 
@@ -521,7 +573,8 @@ class InfrastructureTests(unittest.TestCase):
                      "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
             (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
             (repo / ".git" / "symphony-role-home.json").write_text(json.dumps(lease), encoding="utf-8")
-            with mock.patch.object(pw, "process_identity_matches", return_value=True):
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=True):
                 with self.assertRaisesRegex(pw.PreparationError, "App Server is active"):
                     pw.reconcile_role_home(repo)
             self.assertTrue(role_home.exists())
@@ -537,9 +590,45 @@ class InfrastructureTests(unittest.TestCase):
                      "owner": {"pid": 999, "boot_id": "old-boot", "start_time": "old-start"}}
             (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(json.dumps(lease), encoding="utf-8")
             (repo / ".git" / "symphony-role-home.json").write_text(json.dumps(lease), encoding="utf-8")
-            with mock.patch.object(pw, "process_identity_matches", return_value=False):
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=False):
                 self.assertTrue(pw.reconcile_role_home(repo))
             self.assertFalse(role_home.exists())
+
+    def test_absent_role_home_clears_only_stale_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            shutil.rmtree(role_home)
+            marker = repo / ".git" / "symphony-role-home.json"
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            marker.write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=False):
+                self.assertTrue(pw.reconcile_role_home(repo))
+            self.assertFalse(marker.exists())
+
+    def test_absent_role_home_with_live_owner_keeps_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            role_home = pathlib.Path(tempfile.mkdtemp(prefix="symphony-pilot-codex-home.fixture"))
+            shutil.rmtree(role_home)
+            marker = repo / ".git" / "symphony-role-home.json"
+            lease = {"schema": "symphony-pilot-role-home/v2", "lease_id": role_home.name,
+                     "path": str(role_home), "workspace": str(repo.resolve()),
+                     "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}
+            marker.write_text(json.dumps(lease), encoding="utf-8")
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(pw, "process_identity_matches", return_value=True):
+                with self.assertRaisesRegex(pw.PreparationError, "App Server is active"):
+                    pw.reconcile_role_home(repo)
+            self.assertTrue(marker.exists())
 
     def test_after_run_reconciles_role_home_before_tracker_work(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -554,7 +643,8 @@ class InfrastructureTests(unittest.TestCase):
                 "owner": {"pid": 999, "boot_id": "boot", "start_time": "start"}}),
                 encoding="utf-8")
             (role_home / pw.ROLE_HOME_LEASE_FILE).write_text(marker.read_text(), encoding="utf-8")
-            with mock.patch.object(after_run, "load_profile", return_value=make_profile(root)), \
+            with mock.patch.object(pw, "ROLE_HOME_ROOT", role_home.parent), \
+                    mock.patch.object(after_run, "load_profile", return_value=make_profile(root)), \
                     mock.patch.object(after_run, "read_secret", return_value="redacted"), \
                     mock.patch.object(pw, "process_owns_workspace", return_value=False), \
                     mock.patch.object(pw, "process_identity_matches", return_value=False), \

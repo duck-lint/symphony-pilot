@@ -326,6 +326,7 @@ def process_owns_workspace(workspace: pathlib.Path) -> bool:
 
 ROLE_HOME_SCHEMA = "symphony-pilot-role-home/v2"
 ROLE_HOME_MARKER = pathlib.PurePosixPath(".git/symphony-role-home.json")
+ROLE_HOME_ROOT = pathlib.Path("/tmp")
 ROLE_HOME_PREFIX = "symphony-pilot-codex-home."
 ROLE_HOME_LEASE_FILE = ".symphony-pilot-role-home.json"
 
@@ -334,7 +335,7 @@ def _role_home_path(value: object) -> pathlib.Path:
     if not isinstance(value, str):
         raise PreparationError("role_home_recovery", "role-home marker path is invalid")
     path = pathlib.Path(value).resolve()
-    if path.parent != pathlib.Path(tempfile.gettempdir()).resolve() or not path.name.startswith(ROLE_HOME_PREFIX):
+    if path.parent != ROLE_HOME_ROOT.resolve() or not path.name.startswith(ROLE_HOME_PREFIX):
         raise PreparationError("role_home_recovery", "role-home marker escapes the pilot staging directory")
     return path
 
@@ -370,6 +371,18 @@ def reconcile_role_home(workspace: pathlib.Path) -> bool:
     role_home = _role_home_path(data.get("path"))
     if role_home.name != lease_id:
         raise PreparationError("role_home_recovery", "role-home lease does not match its path")
+    if process_identity_matches(owner):
+        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its App Server is active")
+    # A reboot may remove the ephemeral /tmp home while preserving .git. Once
+    # the recorded owner is stale, clearing only that durable marker is safe:
+    # there is no external path left to delete. If any path entry remains,
+    # bilateral lease equality is still mandatory before recursive deletion.
+    if not role_home.exists() and not role_home.is_symlink():
+        try:
+            marker.unlink()
+        except OSError as exc:
+            raise PreparationError("role_home_recovery", "stale role-home marker could not be removed") from exc
+        return True
     lease_file = role_home / ROLE_HOME_LEASE_FILE
     try:
         lease = json.loads(lease_file.read_text(encoding="utf-8"))
@@ -377,8 +390,6 @@ def reconcile_role_home(workspace: pathlib.Path) -> bool:
         raise PreparationError("role_home_recovery", "role-home lease cannot be read") from exc
     if lease != data:
         raise PreparationError("role_home_recovery", "role-home lease does not match its workspace marker")
-    if process_identity_matches(owner):
-        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its App Server is active")
     try:
         if role_home.is_symlink():
             role_home.unlink()
