@@ -19,8 +19,7 @@ ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "a
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import establish_awake_guard, release_awake_guard
 from process_identity import capture, matches, read
-from prepare_workspace import (PreparationError, deployment_path, github, load_profile,
-                               read_secret)
+from prepare_workspace import PreparationError, deployment_path, github, read_secret
 from project_registry import resolve_project
 
 def state_paths(profile):
@@ -424,7 +423,7 @@ def test(profile):
     root = install_root(profile)
     manifest_path = root / "DEPLOYMENT.json"
     required = [root / "profile.toml", manifest_path,
-                root / "scripts" / "project.py", root / "runtime" / "prepare_workspace.py",
+                root / "runtime" / "prepare_workspace.py",
                 root / "runtime" / "host_integration.py", root / "runtime" / "process_identity.py",
                 root / "projects" / profile.slug / "WORKFLOW.md"]
     required += [root / "workflow" / "agents" / f"{name}.toml"
@@ -435,9 +434,6 @@ def test(profile):
         return 1
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        cli_name = manifest.get("operator_cli")
-        if cli_name != "scripts/project.py":
-            raise ValueError("manifest operator_cli is not scripts/project.py")
         verify_manifest(root, manifest_path, manifest)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Deployment validation failed: {exc}")
@@ -447,15 +443,13 @@ def test(profile):
 
 def main():
     parser = argparse.ArgumentParser(description="symphony-pilot project lifecycle")
-    selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--project", help="registered project slug")
-    selection.add_argument("--profile", type=pathlib.Path,
-                           help="explicit profile path for a selected deployment")
+    parser.add_argument("--project", required=True, help="registered project slug")
     parser.add_argument("action", choices=("start", "status", "stop", "stop-now", "finish", "test"))
     args = parser.parse_args()
     try:
-        profile = (resolve_project(args.project, ROOT / "projects") if args.project
-                   else load_profile(args.profile))
+        if not args.project:
+            raise PreparationError("project", "ordinary source operation requires --project <registered-slug>")
+        profile = resolve_project(args.project, ROOT / "projects")
     except PreparationError as exc:
         print(f"symphony-pilot project resolution stopped: {exc.kind}: {exc}", file=sys.stderr)
         return 78

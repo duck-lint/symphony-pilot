@@ -6,17 +6,16 @@ import pathlib
 import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
-from prepare_workspace import PreparationError, load_profile, secret_path
-from project_registry import validate_registry
+from prepare_workspace import PreparationError, secret_path
+from project_registry import resolve_project, validate_registry
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("profile", nargs="?", type=pathlib.Path,
-                        help="optional profile; omit to validate the complete registry")
+    parser.add_argument("--project", help="validate one registered project after full registry validation")
     args = parser.parse_args()
     try:
-        if args.profile:
-            profile = load_profile(args.profile)
+        if args.project:
+            profile = resolve_project(args.project, ROOT / "projects")
             print(f"valid profile: {profile.slug} ({profile.repository})")
             print(f"workspace_root: {profile.workspace_root}")
             print(f"secret namespace: {secret_path(profile).parent}")

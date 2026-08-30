@@ -1,6 +1,6 @@
 # Operations
 
-Run from the pilot source checkout. Every operation names a project or uses an explicit selected profile; no command defaults to CLEANROOM.
+Run from the pilot source checkout. Every ordinary source operation names a registered project slug; no command defaults to CLEANROOM.
 
 ```bash
 python3 scripts/validate_profile.py

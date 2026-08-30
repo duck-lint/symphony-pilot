@@ -745,7 +745,7 @@ class InfrastructureTests(unittest.TestCase):
             text=True, capture_output=True, check=True)
         data = json.loads(result.stdout)
         self.assertEqual(set(data["role_policies"]), deploy.EXPECTED_ROLE_NAMES)
-        self.assertEqual(data["files"], 17)
+        self.assertEqual(data["files"], 15)
 
     def test_deployed_test_requires_and_verifies_role_policy_files(self):
         source = (ROOT / "scripts/project.py").read_text(encoding="utf-8")
@@ -1219,11 +1219,12 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(run.call_count, 3)
             self.assertNotIn("secret", (profile.state_root / host_integration.NOTIFICATION_STATE).read_text())
 
-    def test_deployment_contains_operator_cli_and_host_backend(self):
+    def test_deployment_manifest_has_no_source_operator_claim(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/deploy.py"),
             "--project", "cleanroom", "--dry-run"],
             text=True, capture_output=True, check=True)
         self.assertIn('"source_commit"', result.stdout)
+        self.assertNotIn("operator_cli", result.stdout)
 
     def test_registry_accepts_empty_one_and_arbitrary_n_projects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1309,6 +1310,19 @@ class InfrastructureTests(unittest.TestCase):
             with mock.patch.object(deploy.subprocess, "run", side_effect=fake_run):
                 for slug, path in profiles.items():
                     deploy.deploy(path, targets[slug], False)
+            generated_modules = sorted(path.stem for path in targets["alpha"].rglob("*.py"))
+            module_env = os.environ.copy()
+            module_env["PYTHONPATH"] = os.pathsep.join(
+                [str(targets["alpha"] / "runtime"), str(targets["alpha"] / "scripts")]
+            )
+            subprocess.run(
+                [sys.executable, "-c", "import " + ", ".join(generated_modules)],
+                cwd=targets["alpha"], env=module_env, check=True,
+                capture_output=True, text=True,
+            )
+            self.assertFalse((targets["alpha"] / "scripts" / "project.py").exists())
+            manifest = json.loads((targets["alpha"] / "DEPLOYMENT.json").read_text(encoding="utf-8"))
+            self.assertNotIn("operator_cli", manifest)
             self.assertEqual(len({str(path) for path in targets.values()}), 3)
             before = {slug: {str(p.relative_to(targets[slug])): hashlib.sha256(p.read_bytes()).hexdigest()
                              for p in targets[slug].rglob("*") if p.is_file()}
@@ -1351,12 +1365,40 @@ class InfrastructureTests(unittest.TestCase):
         self.assertNotIn("cleanroom", (missing.stdout + missing.stderr).lower())
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
+            standalone = root / "standalone.toml"
+            standalone.write_text("slug = \"standalone\"\n", encoding="utf-8")
+            for script, arguments in (
+                    (ROOT / "scripts/project.py", ["--profile", str(standalone), "status"]),
+                    (ROOT / "scripts/deploy.py", ["--profile", str(standalone), "--dry-run"]),
+                    (ROOT / "scripts/validate_profile.py", ["--profile", str(standalone)]),
+                    (ROOT / "scripts/provision_secret.py", ["--profile", str(standalone)])):
+                rejected = subprocess.run([sys.executable, str(script), *arguments],
+                                          text=True, capture_output=True)
+                self.assertNotEqual(rejected.returncode, 0)
+            registered = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/validate_profile.py"), "--project", "cleanroom"],
+                text=True, capture_output=True, check=True,
+            )
+            self.assertIn("valid profile: cleanroom", registered.stdout)
             write_registry_profile(root, "alpha")
             write_registry_profile(root, "beta")
             alpha = project_registry.resolve_project("alpha", root)
             beta = project_registry.resolve_project("beta", root)
             self.assertNotEqual(project_control.install_root(alpha), project_control.install_root(beta))
             self.assertNotEqual(str(alpha.state_root), str(beta.state_root))
+
+    def test_selected_project_fails_when_another_registry_member_collides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry = root / "projects"
+            write_registry_profile(registry, "alpha", "example/shared")
+            write_registry_profile(registry, "beta", "example/shared")
+            with mock.patch.object(project_control, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["project", "--project", "alpha", "status"]):
+                self.assertEqual(project_control.main(), 78)
+            with mock.patch.object(deploy, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["deploy", "--project", "alpha", "--dry-run"]):
+                self.assertEqual(deploy.main(), 78)
 
     def test_selected_operator_lifecycle_does_not_touch_unselected_state(self):
         with tempfile.TemporaryDirectory() as directory:
