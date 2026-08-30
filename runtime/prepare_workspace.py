@@ -60,7 +60,6 @@ class Profile:
     codex_model: str
     codex_reasoning_effort: str
     toolchain: str | None
-    deployment_root: pathlib.Path | None
     prevent_host_sleep: bool = False
     notifications_enabled: bool = False
     display_name: str = ""
@@ -89,14 +88,64 @@ def configured_path(value: str) -> pathlib.Path:
     return pathlib.Path(value).expanduser().resolve()
 
 
+def host_home() -> pathlib.Path | pathlib.PurePosixPath:
+    """Return the host-native home used for derived project namespaces.
+
+    Windows-side validation keeps the WSL path textual; live deployment and
+    runtime execution occur under Linux/WSL where ``Path.home()`` is native.
+    """
+    if os.name == "nt":
+        user = os.environ.get("WSL_USER") or os.environ.get("USER") or os.environ.get("USERNAME")
+        if user and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
+            return pathlib.PurePosixPath("/home") / user
+        return pathlib.PurePosixPath("/home/operator")
+    return pathlib.Path.home()
+
+
+def derived_dashboard_port(slug: str) -> int:
+    """Choose a stable user-space dashboard port; registry validation rejects collisions."""
+    digest = hashlib.sha256(slug.encode("utf-8")).digest()
+    return 30000 + int.from_bytes(digest[:2], "big") % 20000
+
+
+def project_namespaces(profile: Profile) -> dict[str, pathlib.PurePath]:
+    """Return every project-owned host namespace used by the control plane."""
+    home = host_home()
+    data = home / ".local" / "share" / "symphony-pilot" / "deployments" / profile.slug
+    state = home / ".local" / "state" / "symphony-pilot" / profile.slug
+    workspace = home / "symphony-workspaces" / profile.slug
+    return {
+        "deployment": data,
+        "workspace": workspace,
+        "state": state,
+        "logs": state / "logs",
+        "process_state": state / "symphony.pid",
+        "lock": state / "locks",
+        "awake_guard": state / "symphony-awake.json",
+        "workflow": data / "projects" / profile.slug / "WORKFLOW.md",
+        "credentials": home / ".config" / "symphony-pilot" / "secrets" / profile.slug,
+    }
+
+
+def deployment_path(profile: Profile) -> pathlib.Path | pathlib.PurePosixPath:
+    return project_namespaces(profile)["deployment"]
+
+
 def load_profile(path: pathlib.Path) -> Profile:
     import tomllib
 
     with path.open("rb") as stream:
         raw = tomllib.load(stream)
-    required = ["slug", "repository", "git_remote", "workspace_root", "state_root",
-                "log_root", "secret_reference", "dispatch_labels", "blocked_label",
-                "service_identity", "max_concurrent_agents", "max_turns",
+    allowed = {"slug", "repository", "git_remote", "secret_reference", "dispatch_labels",
+               "blocked_label", "max_concurrent_agents", "max_turns", "poll_interval_ms",
+               "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
+               "prevent_host_sleep", "notifications_enabled", "display_name",
+               "notification_backend"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise PreparationError("profile", "unsupported profile fields: " + ",".join(unknown))
+    required = ["slug", "repository", "git_remote", "secret_reference", "dispatch_labels", "blocked_label",
+                "max_concurrent_agents", "max_turns",
                 "poll_interval_ms", "max_retry_backoff_ms", "codex_model",
                 "codex_reasoning_effort"]
     missing = [key for key in required if key not in raw]
@@ -105,23 +154,16 @@ def load_profile(path: pathlib.Path) -> Profile:
     slug = str(raw["slug"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
         raise PreparationError("profile", "profile slug is not a safe identifier")
-    for key in ("repository", "git_remote", "workspace_root", "state_root", "log_root",
-                "secret_reference", "blocked_label", "display_name", "notification_backend"):
+    for key in ("repository", "git_remote", "secret_reference", "blocked_label",
+                "display_name", "notification_backend"):
         if any(character in str(raw.get(key, "")) for character in ("\n", "\r", "\0")):
             raise PreparationError("profile", f"profile field {key} contains control characters")
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", str(raw["repository"])):
         raise PreparationError("profile", "repository must be an owner/name pair")
-    workspace_text = str(raw["workspace_root"])
-    if not workspace_text.startswith("/home/") or ".." in pathlib.PurePosixPath(workspace_text).parts:
-        raise PreparationError("profile", "workspace_root must remain on the WSL-native filesystem")
-    workspace_root = configured_path(workspace_text)
     forbidden_keys = {"token", "password", "credential", "secret", "pat", "api_key"}
     suspicious = [key for key in raw if key.lower() in forbidden_keys]
     if suspicious:
         raise PreparationError("profile", "profiles may contain only secret_reference, not credential values")
-    dashboard = raw.get("dashboard_port")
-    if dashboard is not None and not 1 <= int(dashboard) <= 65535:
-        raise PreparationError("profile", "dashboard_port is invalid")
     if int(raw["max_concurrent_agents"]) != 1:
         raise PreparationError("profile", "the pilot permits exactly one concurrent agent")
     if not raw["dispatch_labels"]:
@@ -130,18 +172,18 @@ def load_profile(path: pathlib.Path) -> Profile:
         raise PreparationError("profile", "prevent_host_sleep must be boolean")
     if not isinstance(raw.get("notifications_enabled", False), bool):
         raise PreparationError("profile", "notifications_enabled must be boolean")
-    return Profile(
+    profile = Profile(
         slug=slug,
         repository=str(raw["repository"]),
         git_remote=str(raw["git_remote"]),
-        workspace_root=workspace_root,
-        state_root=configured_path(str(raw["state_root"])),
-        log_root=configured_path(str(raw["log_root"])),
+        workspace_root=pathlib.Path(),
+        state_root=pathlib.Path(),
+        log_root=pathlib.Path(),
         secret_reference=str(raw["secret_reference"]),
         dispatch_labels=tuple(str(label) for label in raw["dispatch_labels"]),
         blocked_label=str(raw["blocked_label"]),
-        service_identity=str(raw["service_identity"]),
-        dashboard_port=int(dashboard) if dashboard is not None else None,
+        service_identity=f"symphony-pilot-{slug}",
+        dashboard_port=derived_dashboard_port(slug),
         max_concurrent_agents=int(raw["max_concurrent_agents"]),
         max_turns=int(raw["max_turns"]),
         poll_interval_ms=int(raw["poll_interval_ms"]),
@@ -149,12 +191,17 @@ def load_profile(path: pathlib.Path) -> Profile:
         codex_model=str(raw["codex_model"]),
         codex_reasoning_effort=str(raw["codex_reasoning_effort"]),
         toolchain=str(raw["toolchain"]) if raw.get("toolchain") else None,
-        deployment_root=(configured_path(str(raw["deployment_root"]))
-                         if raw.get("deployment_root") else None),
         prevent_host_sleep=bool(raw.get("prevent_host_sleep", False)),
         notifications_enabled=bool(raw.get("notifications_enabled", False)),
         display_name=str(raw.get("display_name", slug)),
         notification_backend=str(raw.get("notification_backend", "windows-toast")),
+    )
+    namespaces = project_namespaces(profile)
+    return dataclasses.replace(
+        profile,
+        workspace_root=configured_path(str(namespaces["workspace"])),
+        state_root=configured_path(str(namespaces["state"])),
+        log_root=configured_path(str(namespaces["logs"])),
     )
 
 
@@ -162,7 +209,7 @@ def secret_path(profile: Profile) -> pathlib.Path:
     reference = pathlib.Path(profile.secret_reference)
     if reference.is_absolute() or ".." in reference.parts:
         raise PreparationError("secret_reference", "secret reference escapes its project boundary")
-    return pathlib.Path.home() / ".config/symphony-pilot/secrets" / profile.slug / reference
+    return configured_path(str(host_home())) / ".config/symphony-pilot/secrets" / profile.slug / reference
 
 
 def read_secret(profile: Profile) -> str:

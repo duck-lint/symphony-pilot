@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -18,14 +19,30 @@ ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "a
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import establish_awake_guard, release_awake_guard
 from process_identity import capture, matches, read
-from prepare_workspace import github, load_profile, read_secret
+from prepare_workspace import (PreparationError, deployment_path, github, load_profile,
+                               read_secret)
+from project_registry import resolve_project
 
 def state_paths(profile):
     profile.state_root.mkdir(parents=True, exist_ok=True)
     return profile.state_root / "symphony.pid", profile.state_root / "symphony.log"
 
 def install_root(profile):
-    return profile.deployment_root or pathlib.Path.home() / ".local/share/symphony-pilot/deployments" / profile.slug
+    return deployment_path(profile)
+
+
+def resolve_symphony_binary() -> str:
+    """Resolve the shared host executable without consulting any deployment."""
+    configured = os.environ.get("SYMPHONY_BIN")
+    candidate = pathlib.Path(configured).expanduser() if configured else None
+    if candidate:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise FileNotFoundError("SYMPHONY_BIN does not name an executable file")
+    found = shutil.which("symphony")
+    if found:
+        return found
+    raise FileNotFoundError("official Symphony executable was not found on PATH")
 
 def pid_alive(pid):
     try:
@@ -206,10 +223,12 @@ def start(profile):
     env["SYMPHONY_WORKFLOW"] = str(workflow)
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
-    binary = os.environ.get("SYMPHONY_BIN")
-    if not binary:
-        candidates = sorted((root / "bin").glob("symphony-*"))
-        binary = str(candidates[0]) if candidates else "symphony"
+    try:
+        binary = resolve_symphony_binary()
+    except FileNotFoundError as exc:
+        release_awake_guard(profile)
+        print(f"Cannot start Symphony: {exc}. Install the shared host executable or set SYMPHONY_BIN.")
+        return 1
     log = log_path.open("ab")
     command = [binary, "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
                "--logs-root", str(profile.log_root)]
@@ -428,10 +447,18 @@ def test(profile):
 
 def main():
     parser = argparse.ArgumentParser(description="symphony-pilot project lifecycle")
-    parser.add_argument("--profile", default=str(ROOT / "projects/cleanroom/profile.toml"))
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--project", help="registered project slug")
+    selection.add_argument("--profile", type=pathlib.Path,
+                           help="explicit profile path for a selected deployment")
     parser.add_argument("action", choices=("start", "status", "stop", "stop-now", "finish", "test"))
     args = parser.parse_args()
-    profile = load_profile(pathlib.Path(args.profile))
+    try:
+        profile = (resolve_project(args.project, ROOT / "projects") if args.project
+                   else load_profile(args.profile))
+    except PreparationError as exc:
+        print(f"symphony-pilot project resolution stopped: {exc.kind}: {exc}", file=sys.stderr)
+        return 78
     if args.action == "start": return start(profile)
     if args.action == "stop": return stop(profile)
     if args.action == "stop-now": return stop(profile, force=True)

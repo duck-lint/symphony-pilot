@@ -1,15 +1,9 @@
 slug = "symphony-canary"
 repository = "duck-lint/symphony-canary"
 git_remote = "git@github-symphony-canary:duck-lint/symphony-canary.git"
-workspace_root = "/home/duck-lint/symphony-workspaces/symphony-canary"
-deployment_root = "/home/duck-lint/symphony"
-state_root = "/home/duck-lint/.local/state/symphony-pilot/symphony-canary"
-log_root = "/home/duck-lint/.local/state/symphony-pilot/symphony-canary/logs"
 secret_reference = "github.token"
 dispatch_labels = ["symphony:auto"]
 blocked_label = "symphony:human"
-service_identity = "symphony-pilot-symphony-canary"
-dashboard_port = 4041
 max_concurrent_agents = 1
 max_turns = 8
 poll_interval_ms = 5000

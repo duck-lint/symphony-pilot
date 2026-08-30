@@ -13,7 +13,8 @@ import sys
 import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
-from prepare_workspace import load_profile
+from prepare_workspace import Profile, PreparationError, deployment_path, load_profile
+from project_registry import resolve_project, validate_registry
 from render_workflow import render
 
 ROLE_POLICY_FILES = tuple(sorted((ROOT / "workflow" / "agents").glob("*.toml")))
@@ -22,18 +23,19 @@ EXPECTED_ROLE_NAMES = {"project-manager", "planner", "implementer", "reviewer", 
 def file_digest(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def deployment_root(profile):
-    return profile.deployment_root or pathlib.Path.home() / ".local/share/symphony-pilot/deployments" / profile.slug
+def selected_deployment(profile: Profile):
+    """Resolve the derived deployment namespace; profiles cannot override it."""
+    return deployment_path(profile)
 
 def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_run: bool) -> pathlib.Path:
     profile = load_profile(profile_path)
     role_names = {path.stem for path in ROLE_POLICY_FILES}
     if role_names != EXPECTED_ROLE_NAMES:
         raise SystemExit("role policy pack must contain exactly the six generic roles")
-    raw_target = install_root or deployment_root(profile)
+    raw_target = install_root or selected_deployment(profile)
     target = (raw_target if isinstance(raw_target, pathlib.PurePosixPath) and os.name == "nt"
               else pathlib.Path(raw_target).expanduser().resolve())
-    if not str(target).startswith("/home/"):
+    if install_root is None and os.name != "nt" and not str(target).startswith("/home/"):
         raise SystemExit("deployment root must remain on the WSL-native filesystem")
     source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
                                   capture_output=True, check=True).stdout.strip()
@@ -55,13 +57,8 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
         (stage / "workflow").mkdir()
         (stage / "workflow" / "agents").mkdir()
         (stage / "projects" / profile.slug).mkdir(parents=True)
-        # Keep the separately installed official Symphony executable when the
-        # profile intentionally deploys into its existing runtime directory.
-        if (target / "bin").is_dir():
-            (stage / "bin").mkdir()
-            for asset in (target / "bin").iterdir():
-                if asset.is_file() and (asset.name.startswith("symphony-") or asset.name.endswith(".sha256")):
-                    shutil.copy2(asset, stage / "bin" / asset.name)
+        # The official executable is shared host infrastructure.  It is
+        # intentionally absent from generated project deployments.
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
                      "host_integration.py", "process_identity.py", "launch_codex.sh"):
             shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
@@ -96,11 +93,22 @@ def deploy(profile_path: pathlib.Path, install_root: pathlib.Path | None, dry_ru
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", default=str(ROOT / "projects/cleanroom/profile.toml"))
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--project", help="registered project slug")
+    selection.add_argument("--profile", type=pathlib.Path,
+                           help="explicit profile path for a selected deployment")
     parser.add_argument("--install-root", type=pathlib.Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    deploy(pathlib.Path(args.profile), args.install_root, args.dry_run)
+    try:
+        profile_path = (ROOT / "projects" / args.project / "profile.toml") if args.project else args.profile
+        profile = resolve_project(args.project, ROOT / "projects") if args.project else load_profile(profile_path)
+        deploy_path = deploy(profile_path, args.install_root, args.dry_run)
+        if deploy_path != selected_deployment(profile) and args.install_root is not None:
+            print("warning: --install-root is a non-persisted developer/test override", file=sys.stderr)
+    except PreparationError as exc:
+        print(f"symphony-pilot deployment stopped: {exc.kind}: {exc}", file=sys.stderr)
+        return 78
     return 0
 
 if __name__ == "__main__":

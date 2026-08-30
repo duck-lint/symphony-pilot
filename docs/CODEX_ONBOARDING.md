@@ -243,12 +243,10 @@ Profiles contain non-secret configuration only. Register project-isolated values
 - `slug`;
 - `repository`;
 - `git_remote`;
-- WSL-native `workspace_root`;
-- `deployment_root` where used;
-- `state_root` and `log_root`;
+- WSL-native derived workspace, state, and log namespaces;
 - `secret_reference`;
 - dispatch and blocked labels;
-- `service_identity`;
+- derived service identity (not profile-configurable);
 - Codex model/reasoning settings;
 - optional dashboard/host integration;
 - target toolchain hint.
