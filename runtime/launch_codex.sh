@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ORIGINAL_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+
 # The host may need the tracker credential; the Codex child must not receive it.
-# Clear it before sourcing any workspace-controlled shell fragment.
+# Clear it before and after sourcing any workspace-controlled shell fragment.
 unset SYMPHONY_PILOT_GITHUB_TOKEN SYMPHONY_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
 
 if [[ -f .git/symphony-toolchain.env ]]; then
   source .git/symphony-toolchain.env
 fi
+unset SYMPHONY_PILOT_GITHUB_TOKEN SYMPHONY_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
 
-# Codex discovers project-scoped custom agents from .codex/agents. Materialize
-# the deployed, generic role pack only for this app-server lifetime so the
-# target repository is not modified in Git and the operator's global CODEX_HOME
-# (including authentication) is not replaced. Never overwrite target-owned
-# role files; a collision is an infrastructure/capability blocker.
+# Codex supports personal custom agents below $CODEX_HOME/agents as well as
+# project-scoped agents below .codex/agents. Use a temporary per-process home so
+# role setup is control-plane state outside the target checkout. Preserve the
+# operator's authentication/configuration through symlinks; do not copy or
+# inspect credential contents. Never shadow a target-owned same-name role.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROLE_SOURCE="${SYMPHONY_PILOT_ROLE_POLICY_DIR:-$SCRIPT_DIR/../workflow/agents}"
-ROLE_TARGET="$PWD/.codex/agents"
 ROLE_FILES=("$ROLE_SOURCE"/*.toml)
 EXPECTED_ROLE_FILES=(adversary archivist implementer planner project-manager reviewer)
 
@@ -31,48 +33,38 @@ for name in "${EXPECTED_ROLE_FILES[@]}"; do
   fi
 done
 
-# Preflight all collisions before creating anything in the target checkout.
-for source in "${ROLE_FILES[@]}"; do
-  target="$ROLE_TARGET/$(basename "$source")"
+# A target-owned project role with the same name would make the selected
+# policy ambiguous. Refuse it without creating or modifying .codex.
+for name in "${EXPECTED_ROLE_FILES[@]}"; do
+  target="$PWD/.codex/agents/$name.toml"
   if [[ -e "$target" ]]; then
     echo "symphony-pilot: target-owned role policy collision: $target" >&2
     exit 78
   fi
 done
 
-CREATED_CODEX_DIR=0
-CREATED_ROLE_DIR=0
-if [[ ! -d "$PWD/.codex" ]]; then
-  mkdir "$PWD/.codex"
-  CREATED_CODEX_DIR=1
-else
-  CREATED_CODEX_DIR=0
-fi
-if [[ ! -d "$ROLE_TARGET" ]]; then
-  mkdir "$ROLE_TARGET"
-  CREATED_ROLE_DIR=1
-else
-  CREATED_ROLE_DIR=0
-fi
+# Keep the staging location independent of workspace-controlled TMPDIR values.
+ROLE_CODEX_HOME="$(mktemp -d "/tmp/symphony-pilot-codex-home.XXXXXX")"
+mkdir "$ROLE_CODEX_HOME/agents"
+for preserved in auth.json config.toml; do
+  if [[ -f "$ORIGINAL_CODEX_HOME/$preserved" ]]; then
+    ln -s "$ORIGINAL_CODEX_HOME/$preserved" "$ROLE_CODEX_HOME/$preserved"
+  fi
+done
+export CODEX_HOME="$ROLE_CODEX_HOME"
 
 INSTALLED_ROLE_FILES=()
 for source in "${ROLE_FILES[@]}"; do
-  target="$ROLE_TARGET/$(basename "$source")"
+  target="$ROLE_CODEX_HOME/agents/$(basename "$source")"
   INSTALLED_ROLE_FILES+=("$target")
 done
 
-cleanup_role_policies() {
-  for target in "${INSTALLED_ROLE_FILES[@]}"; do
-    rm -f -- "$target"
-  done
-  if [[ "$CREATED_ROLE_DIR" -eq 1 ]]; then
-    rmdir -- "$ROLE_TARGET" 2>/dev/null || true
-  fi
-  if [[ "$CREATED_CODEX_DIR" -eq 1 ]]; then
-    rmdir -- "$PWD/.codex" 2>/dev/null || true
+cleanup_role_home() {
+  if [[ -n "$ROLE_CODEX_HOME" && -d "$ROLE_CODEX_HOME" ]]; then
+    rm -rf -- "$ROLE_CODEX_HOME"
   fi
 }
-trap cleanup_role_policies EXIT
+trap cleanup_role_home EXIT INT TERM
 
 for index in "${!ROLE_FILES[@]}"; do
   cp "${ROLE_FILES[$index]}" "${INSTALLED_ROLE_FILES[$index]}"

@@ -31,6 +31,11 @@ profile, manifest, workflow, operator command, required runtime modules, and
 the six generic role-policy files exist. Source-only validation remains the
 responsibility of the pilot checkout.
 
+During an app-server run, the launcher exposes those role policies through a
+temporary external `CODEX_HOME`; it does not create pilot role files in the
+target checkout. The archivist returns a closeout packet, while the architect
+persists only accepted archival facts to the single workpad.
+
 Start performs a GitHub dispatch-label count before launching and enforces the
 profile's one-issue limit. Deployment and preparation fail closed when a
 profile secret, Git repository, upstream, toolchain, clean worktree, or

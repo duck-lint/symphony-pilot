@@ -103,10 +103,12 @@ is described as operational.
 
 ### ARCHIVIST
 
-The continuity role records accepted lifecycle conclusions, review history,
-decisions, validation evidence, limitations, publication state, and final
-status in the existing workpad or explicitly authorized project surface. It
-does not invent decisions or create a `harness/` directory.
+The continuity role produces a bounded archival packet containing accepted
+lifecycle conclusions, review history, decisions, validation evidence,
+limitations, publication state, and final status. The architect adjudicates
+that packet and alone persists accepted durable state to the existing workpad
+or explicitly authorized project surface. The archivist does not mutate the
+workpad, invent decisions, or create a `harness/` directory.
 
 ### HUMAN OPERATOR
 

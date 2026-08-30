@@ -205,6 +205,24 @@ def github(profile: Profile, token: str, method: str, path: str, body: object | 
         raise PreparationError("github_transport", f"GitHub transport failure: {exc}") from exc
 
 
+def github_all(profile: Profile, token: str, path: str, page_size: int = 100) -> list[dict]:
+    """Fetch a complete paginated collection before applying cardinality rules."""
+    result: list[dict] = []
+    page = 1
+    while True:
+        separator = "&" if "?" in path else "?"
+        batch = github(profile, token, "GET",
+                       f"{path}{separator}per_page={page_size}&page={page}")
+        if not isinstance(batch, list):
+            raise PreparationError("github_response", f"GitHub collection was not a list: {path}")
+        result.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < page_size:
+            return result
+        page += 1
+        if page > 1000:
+            raise PreparationError("github_pagination", f"GitHub collection exceeded pagination bound: {path}")
+
+
 def workpad_candidates(items: list[dict], marker: str = "<!-- symphony-workpad:v1 -->") -> list[dict]:
     return [item for item in items if marker in (item.get("body") or "")]
 
@@ -216,8 +234,7 @@ def workpad(items: list[dict], marker: str = "<!-- symphony-workpad:v1 -->") -> 
 
 
 def comments(profile: Profile, token: str, issue: int) -> list[dict]:
-    result = github(profile, token, "GET", f"/issues/{issue}/comments?per_page=100")
-    return result if isinstance(result, list) else []
+    return github_all(profile, token, f"/issues/{issue}/comments")
 
 
 def parse_sha(text: str) -> str | None:
@@ -252,7 +269,7 @@ def issue_facts(profile: Profile, workspace: pathlib.Path, token: str) -> IssueF
     base_ref = parse_ref(body, r"(?:PR base|base ref)\s*:\s*`?([A-Za-z0-9._/-]+)")
     if not base_ref:
         base_ref = parse_ref(body, r"(?:PR base|base ref):\s*[\r\n]+`?([A-Za-z0-9._/-]+)") or required_ref
-    pull_requests = github(profile, token, "GET", "/pulls?state=open&per_page=100")
+    pull_requests = github_all(profile, token, "/pulls?state=open")
     matching = [pr for pr in pull_requests if
                 (pr.get("head") or {}).get("repo", {}).get("full_name") == profile.repository and
                 (pr.get("head") or {}).get("ref", "").startswith(f"codex/gh-{issue}-")]
@@ -314,7 +331,34 @@ def recovery_path_is_safe(path: pathlib.Path) -> bool:
         if name in sensitive_names or name.startswith(".env."):
             return False
     name = path.name.lower()
-    return not any(name.endswith(suffix) for suffix in sensitive_suffixes)
+    return not name.endswith(".env") and not any(name.endswith(suffix) for suffix in sensitive_suffixes)
+
+
+def recovery_entries(workspace: pathlib.Path) -> tuple[list[tuple[pathlib.Path, str]], list[str]]:
+    """Walk recovery input without recursively crossing excluded paths or symlinks."""
+    entries: list[tuple[pathlib.Path, str]] = []
+    excluded: list[str] = []
+
+    def visit(path: pathlib.Path, relative: pathlib.PurePath) -> None:
+        relative_text = relative.as_posix()
+        if not recovery_path_is_safe(relative):
+            excluded.append(relative_text)
+            return
+        if path.is_symlink():
+            excluded.append(relative_text)
+            return
+        if path.is_dir():
+            entries.append((path, relative_text))
+            for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
+                visit(child, relative / child.name)
+        else:
+            entries.append((path, relative_text))
+
+    for child in sorted(workspace.iterdir(), key=lambda item: item.name.lower()):
+        if child.name in {".git", "target"}:
+            continue
+        visit(child, pathlib.PurePath(child.name))
+    return entries, excluded
 
 
 def archive_recovery(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, status: str) -> pathlib.Path:
@@ -322,15 +366,10 @@ def archive_recovery(profile: Profile, workspace: pathlib.Path, facts: IssueFact
     directory.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     archive = directory / f"{stamp}-{uuid.uuid4().hex[:8]}.tar.gz"
-    excluded = []
+    entries, excluded = recovery_entries(workspace)
     with tarfile.open(archive, "w:gz") as output:
-        for path in workspace.iterdir():
-            if path.name in {".git", "target"}:
-                continue
-            if not recovery_path_is_safe(path):
-                excluded.append(path.name)
-                continue
-            output.add(path, arcname=path.name, recursive=True)
+        for path, relative in entries:
+            output.add(path, arcname=relative, recursive=False)
         manifest = json.dumps({"repo": profile.repository, "issue": facts.issue,
                                "local_head": git(workspace, "rev-parse", "HEAD", check=False),
                                "remote_head": facts.target_sha, "status": status,

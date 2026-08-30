@@ -106,7 +106,7 @@ schemas/    machine-readable profile contracts
 scripts/    deployment and operator commands
 tests/      infrastructure regression tests
 workflow/   generic architect policy and role policies rendered into deployments
-workflow/agents/  project-scoped Codex custom-agent policies
+workflow/agents/  generic Codex custom-agent policy sources
 ```
 
 ## Tests

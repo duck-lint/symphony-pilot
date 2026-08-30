@@ -59,10 +59,12 @@ expand issue scope or independently change the lifecycle.
 5. ADVERSARY is read-only and independently attempts to falsify the claim
    that the current HEAD satisfies the bounded objective. Its verdict is
    `PASS` or `FINDINGS`. It is not a second conformance checklist.
-6. ARCHIVIST is a continuity/closeout role. It records only accepted facts,
-   decisions, evidence, limitations, and final state in the existing workpad
-   or explicitly authorized target continuity surface. It cannot invent
-   decisions or create a target-project `harness/` directory.
+6. ARCHIVIST is a read-only continuity/closeout role. It produces a bounded
+   archival packet containing accepted facts, decisions, evidence, limitations,
+   and final state. The ARCHITECT / ORCHESTRATOR adjudicates that packet and
+   alone persists accepted durable state to the existing workpad or explicitly
+   authorized target continuity surface. It cannot invent decisions or create
+   a target-project `harness/` directory.
 
 Reviewer and adversary findings are internal orchestration state. They do not
 become new GitHub issues, PRs, or human work orders automatically.
