@@ -79,7 +79,10 @@ persisted process identity for inspection or emergency shutdown. Recovery
 the exact persisted host-awake helper record. It never reads a current profile
 or grants new project authority. A malformed, reused, or otherwise unresolved
 helper identity makes shutdown incomplete; the operator is not told that the
-host is safe to shut down until both managed resources are reconciled.
+host is safe to shut down until both managed resources are reconciled. Awake
+startup uses the same strict parser: malformed or unresolved state is retained
+and blocks replacement, while only a valid dead helper with an unused PID may
+be removed before establishing a new guard.
 
 Physical namespace operations are WSL/Linux operations. Native Windows Python
 may perform host-neutral registry validation and port allocation, but it must

@@ -49,7 +49,13 @@ exact process, then validates and reconciles the exact `host-awake.json` in the
 same slug-derived state directory. It does not read credentials, query the
 tracker, or reconstruct a profile. Missing or already-dead helper state is
 safe to reconcile; malformed or reused helper identity fails closed and is
-reported as incomplete rather than producing a clean shutdown result.
+reported as incomplete rather than producing a clean shutdown result. Startup
+uses the same strict host-awake parser: malformed or unresolved state remains
+in place and prevents a replacement helper; only a valid dead helper whose PID
+is unused may be replaced. Normal `stop`, `finish`, and not-running `status`
+apply the same result rule: a stopped Symphony process is reported separately
+from complete host cleanup, and no clean-shutdown claim is printed when awake
+reconciliation fails.
 
 `finish` drains active work before stopping. `stop` refuses active work and `stop-now` is the emergency path. PID, awake-guard, lock, recovery, and log state are project-derived. Tracker requests contain only the selected profile's repository and dispatch labels. A shared label string in another repository is not dispatchable by this instance.
 

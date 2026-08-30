@@ -14,7 +14,7 @@ import subprocess
 import time
 from typing import Any
 
-from process_identity import capture, matches, read
+from process_identity import capture, matches
 from prepare_workspace import PreparationError, Profile, require_physical_namespace
 
 
@@ -88,8 +88,10 @@ def _pid_alive(pid: int) -> bool:
 
 def _read_awake_state(path: pathlib.Path) -> dict[str, Any] | None:
     """Read the exact host-owned helper record without accepting reconstruction."""
-    if not path.is_file():
+    if not path.exists():
         return None
+    if not path.is_file():
+        raise PreparationError("awake_state", "host-awake state is not a regular file")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -111,14 +113,23 @@ def _read_awake_state(path: pathlib.Path) -> dict[str, Any] | None:
 
 
 def recover_awake_guard(profile: Profile) -> None:
-    """Forget a dead helper after a crash/reboot; retain a live guard."""
+    """Reconcile an existing helper before startup using the strict contract."""
     path = _state_path(profile, AWAKE_STATE)
-    if not path.exists():
+    state = _read_awake_state(path)
+    if state is None:
         return
-    identity = read(path)
-    if not identity or not _identity_alive(identity.get("identity")):
+    identity = state["identity"]
+    if _identity_alive(identity):
+        return
+    if _pid_alive(state["pid"]):
+        raise PreparationError(
+            "awake_state",
+            "host-awake helper identity is stale or reused; state was retained",
+        )
+    try:
         path.unlink(missing_ok=True)
-        return
+    except OSError as exc:
+        raise PreparationError("awake_state", "stale host-awake state could not be removed") from exc
 
 
 def establish_awake_guard(profile: Profile) -> None:

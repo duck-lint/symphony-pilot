@@ -245,8 +245,10 @@ def _terminate_unverified_child(child, profile):
               "and child exit could not be confirmed; the awake guard was retained "
               "for operator attention.")
         return False
-    release_awake_guard(profile)
-    return True
+    if release_awake_guard(profile):
+        return True
+    print("Cannot start Symphony: its process exited, but host-awake cleanup is incomplete.")
+    return False
 
 def _dashboard_url(profile):
     if not profile.dashboard_port:
@@ -306,7 +308,7 @@ def start(profile):
         if identity and _identity_alive(identity):
             try:
                 establish_awake_guard(profile)
-            except RuntimeError as exc:
+            except (RuntimeError, PreparationError) as exc:
                 print(f"Cannot keep {project_name(profile)} awake: {exc}")
                 return 1
             print("Symphony is already running.")
@@ -339,7 +341,7 @@ def start(profile):
         return 1
     try:
         establish_awake_guard(profile)
-    except RuntimeError as exc:
+    except (RuntimeError, PreparationError) as exc:
         print(f"Cannot start {project_name(profile)}: {exc}")
         return 1
     env = os.environ.copy()
@@ -386,7 +388,7 @@ def start(profile):
         if child.poll() is not None:
             print("Symphony exited during startup. Review the project log.")
             pid_path.unlink(missing_ok=True)
-            release_awake_guard(profile)
+            _report_startup_cleanup(profile, "Symphony exited during startup")
             return 1
         time.sleep(0.5)
     print("Symphony dashboard did not become reachable within 30 seconds; requesting normal shutdown.")
@@ -395,8 +397,7 @@ def start(profile):
             print("Startup identity could not be confirmed; PID and awake guard were retained for operator attention.")
             return 1
         pid_path.unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("Symphony exited during startup; awake guard released.")
+        _report_startup_cleanup(profile, "Symphony exited during startup")
         return 1
     try:
         os.kill(int(identity["pid"]), signal.SIGTERM)
@@ -415,16 +416,38 @@ def start(profile):
         print("Startup failed; Symphony may still be running. PID and awake guard were retained for operator attention.")
         return 1
     pid_path.unlink(missing_ok=True)
-    release_awake_guard(profile)
-    print("Symphony exited after startup timeout; awake guard released.")
+    _report_startup_cleanup(profile, "Symphony exited after startup timeout")
     return 1
+
+
+def _release_awake_for_shutdown(profile) -> bool:
+    try:
+        return release_awake_guard(profile)
+    except (OSError, PreparationError):
+        return False
+
+
+def _report_stopped(profile, prefix: str) -> int:
+    """Report process state separately from complete pilot-owned cleanup."""
+    if _release_awake_for_shutdown(profile):
+        print(f"{prefix} - SAFE TO SHUT DOWN")
+        return 0
+    print(f"{prefix}, but host-awake cleanup is incomplete.")
+    print("SAFE TO SHUT DOWN cannot be reported.")
+    return 1
+
+
+def _report_startup_cleanup(profile, prefix: str) -> bool:
+    if _release_awake_for_shutdown(profile):
+        print(f"{prefix}; awake guard released.")
+        return True
+    print(f"{prefix}; host-awake cleanup is incomplete.")
+    return False
 
 def stop(profile, force=False):
     pid_path, _ = state_paths(profile)
     if not pid_path.exists():
-        release_awake_guard(profile)
-        print("Symphony is stopped - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "Symphony is stopped")
     state = read(pid_path)
     identity = state.get("identity") if state else None
     if not identity:
@@ -435,9 +458,7 @@ def stop(profile, force=False):
             print("Cannot stop safely: managed Symphony PID identity is stale or reused; no process was terminated.")
             return 1
         pid_path.unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("Symphony is stopped - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "Symphony is stopped")
     if not force:
         view = runtime_state(profile)
         if view is None:
@@ -453,9 +474,7 @@ def finish(profile):
     """Drain one pilot issue, then perform the normal stop operation."""
     pid = _safe_pid(profile)
     if pid is None:
-        release_awake_guard(profile)
-        print("STOPPED - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "STOPPED")
     view = runtime_state(profile)
     if view is None:
         print("Cannot finish safely: authoritative Symphony runtime state is unavailable.")
@@ -491,9 +510,7 @@ def status(profile):
     running = identity is not None
     if not running:
         pid_path.unlink(missing_ok=True)
-        release_awake_guard(profile)
-        print("STOPPED - SAFE TO SHUT DOWN")
-        return 0
+        return _report_stopped(profile, "STOPPED")
     view = runtime_state(profile) or dashboard(profile)
     if isinstance(view, dict):
         blocked = view.get("blocked") or []

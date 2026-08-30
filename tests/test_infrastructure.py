@@ -1302,16 +1302,65 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(data["pid"], 456)
             self.assertNotIn("github", json.dumps(popen.call_args).lower())
 
-    def test_awake_guard_releases_on_stale_or_normal_cleanup(self):
+    def test_awake_guard_recovery_rejects_malformed_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
             path = profile.state_root / host_integration.AWAKE_STATE
             profile.state_root.mkdir(parents=True)
             path.write_text(json.dumps({"pid": 456, "identity": {"pid": 456}}) + "\n", encoding="utf-8")
-            with mock.patch.object(host_integration, "_identity_alive", return_value=False):
-                host_integration.recover_awake_guard(profile)
-            self.assertFalse(path.exists())
+            with self.assertRaises(pw.PreparationError), \
+                    mock.patch.object(host_integration.subprocess, "Popen") as popen:
+                host_integration.establish_awake_guard(profile)
+            popen.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_awake_guard_recovery_rejects_reused_helper_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            self.write_awake_state(path)
+            with self.assertRaises(pw.PreparationError), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=True), \
+                    mock.patch.object(host_integration.subprocess, "Popen") as popen, \
+                    mock.patch.object(host_integration.os, "kill") as kill:
+                host_integration.establish_awake_guard(profile)
+            popen.assert_not_called()
+            kill.assert_not_called()
+            self.assertTrue(path.exists())
+
+    def test_awake_guard_recovery_retains_exact_live_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            before = self.write_awake_state(path)
+            with mock.patch.object(host_integration, "_identity_alive", return_value=True), \
+                    mock.patch.object(host_integration.subprocess, "Popen") as popen:
+                host_integration.establish_awake_guard(profile)
+            popen.assert_not_called()
+            self.assertEqual(json.loads(path.read_text()), before)
+
+    def test_awake_guard_recovery_replaces_only_dead_unused_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            self.write_awake_state(path)
+            helper = mock.Mock(pid=789)
+            identity = {"pid": 789, "boot_id": "new-boot", "start_time": "new-start"}
+            with mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=False), \
+                    mock.patch.object(host_integration.subprocess, "Popen", return_value=helper) as popen, \
+                    mock.patch.object(host_integration, "capture", return_value=identity):
+                host_integration.establish_awake_guard(profile)
+            popen.assert_called_once()
+            self.assertEqual(json.loads(path.read_text())["pid"], 789)
 
     def test_start_failure_releases_awake_guard(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1329,6 +1378,77 @@ class InfrastructureTests(unittest.TestCase):
                     mock.patch.object(project_control.subprocess, "Popen", side_effect=OSError("missing")):
                 self.assertEqual(project_control.start(profile), 1)
             release.assert_called_once_with(profile)
+
+    def test_stop_without_process_does_not_claim_clean_with_malformed_awake_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            path = profile.state_root / host_integration.AWAKE_STATE
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                result = project_control.stop(profile)
+            self.assertEqual(result, 1)
+            self.assertIn("Symphony is stopped", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("Symphony is stopped - SAFE TO SHUT DOWN", output.getvalue())
+            self.assertTrue(path.exists())
+
+    def test_stop_after_process_exit_does_not_claim_clean_with_reused_awake_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            pid_path, _ = project_control.state_paths(profile)
+            pid_path.write_text(json.dumps(process_state()) + "\n", encoding="ascii")
+            awake_path = profile.state_root / host_integration.AWAKE_STATE
+            self.write_awake_state(awake_path)
+            output = StringIO()
+            with mock.patch.object(project_control, "_identity_alive", return_value=False), \
+                    mock.patch.object(project_control, "pid_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_identity_alive", return_value=False), \
+                    mock.patch.object(host_integration, "_pid_alive", return_value=True), \
+                    mock.patch.object(project_control.os, "kill") as kill, \
+                    redirect_stdout(output):
+                result = project_control.stop(profile, force=True)
+            self.assertEqual(result, 1)
+            kill.assert_not_called()
+            self.assertIn("Symphony is stopped", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("Symphony is stopped - SAFE TO SHUT DOWN", output.getvalue())
+            self.assertTrue(awake_path.exists())
+
+    def test_finish_without_process_does_not_claim_clean_with_unresolved_awake_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            awake_path = profile.state_root / host_integration.AWAKE_STATE
+            awake_path.parent.mkdir(parents=True)
+            awake_path.write_text("{}\n", encoding="utf-8")
+            output = StringIO()
+            with mock.patch.object(project_control, "_safe_pid", return_value=None), \
+                    redirect_stdout(output):
+                result = project_control.finish(profile)
+            self.assertEqual(result, 1)
+            self.assertIn("STOPPED", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("STOPPED - SAFE TO SHUT DOWN", output.getvalue())
+
+    def test_status_without_process_reports_stopped_but_incomplete_awake_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = self.profile_with(make_profile(root), prevent_host_sleep=True)
+            awake_path = profile.state_root / host_integration.AWAKE_STATE
+            awake_path.parent.mkdir(parents=True)
+            awake_path.write_text("{}\n", encoding="utf-8")
+            output = StringIO()
+            with mock.patch.object(project_control, "_managed_identity", return_value=None), \
+                    redirect_stdout(output):
+                result = project_control.status(profile)
+            self.assertEqual(result, 1)
+            self.assertIn("STOPPED", output.getvalue())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("STOPPED - SAFE TO SHUT DOWN", output.getvalue())
 
     def test_start_verifies_deployment_before_secret_tracker_or_process(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1391,10 +1511,15 @@ class InfrastructureTests(unittest.TestCase):
                     mock.patch.object(project_control, "_identity_alive", side_effect=[True, False]), \
                     mock.patch.object(project_control.time, "monotonic", side_effect=[0, 31, 0, 31]), \
                     mock.patch.object(project_control.os, "kill") as kill:
-                self.assertEqual(project_control.start(profile), 1)
+                release.return_value = False
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(project_control.start(profile), 1)
             kill.assert_called_once_with(123, project_control.signal.SIGTERM)
             release.assert_called_once_with(profile)
             self.assertFalse(project_control.state_paths(profile)[0].exists())
+            self.assertIn("host-awake cleanup is incomplete", output.getvalue())
+            self.assertNotIn("awake guard released.", output.getvalue())
 
     def test_start_timeout_retains_pid_and_awake_guard_if_child_survives(self):
         with tempfile.TemporaryDirectory() as directory:
