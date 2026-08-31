@@ -33,7 +33,7 @@ from prepare_workspace import (
     state_namespace_for_slug,
 )
 from deployment_contract import contract_digest, deployment_identity
-from containment import ContainmentError, require_execution_capability
+from containment import ContainmentError, backend_identity, require_execution_capability
 from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
 from protection import ProtectionError, require_protected_default
 from project_registry import resolve_project
@@ -330,18 +330,6 @@ def project_name(profile):
 
 def start(profile):
     pid_path, log_path = state_paths(profile)
-    if pid_path.exists():
-        identity = read(pid_path)
-        identity = identity.get("identity") if identity else None
-        if identity and _identity_alive(identity):
-            try:
-                establish_awake_guard(profile)
-            except (RuntimeError, PreparationError) as exc:
-                print(f"Cannot keep {project_name(profile)} awake: {exc}")
-                return 1
-            print("Symphony is already running.")
-            return 0
-        pid_path.unlink(missing_ok=True)
     try:
         verification = verify_deployment(profile)
     except (OSError, ValueError, TypeError, PreparationError) as exc:
@@ -354,6 +342,24 @@ def start(profile):
     except PreparationError as exc:
         print(f"Cannot start Symphony: {exc}")
         return 1
+    try:
+        binary = resolve_symphony_binary()
+        codex = shutil.which("codex")
+        if not codex:
+            raise RuntimeLockError("official Codex executable was not found on PATH")
+        containment = backend_identity()
+        lock_path = require_physical_namespace(profile.state_root) / "runtime-lock.json"
+        lock = validate_lock(json.loads(lock_path.read_text(encoding="utf-8")))
+        verify_entry(lock["symphony"], identify(binary), "Symphony")
+        verify_entry(lock["codex"], identify(codex), "Codex")
+        verify_entry(lock["containment"], {
+            "executable": containment.executable,
+            "version": containment.version,
+            "sha256": containment.sha256,
+        }, "containment")
+    except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError, ContainmentError) as exc:
+        print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
+        return 78
     # This gate runs before tracker credential acquisition or process launch.
     # It is intentionally not a fallback to the old same-user architecture.
     try:
@@ -361,13 +367,13 @@ def start(profile):
     except ContainmentError as exc:
         print(f"Cannot start Symphony: containment capability blocker: {exc}")
         return 78
-    try:
-        binary = resolve_symphony_binary()
-        lock_path = require_physical_namespace(profile.state_root) / "runtime-lock.json"
-        lock = validate_lock(json.loads(lock_path.read_text(encoding="utf-8")))
-        verify_entry(lock["symphony"], identify(binary), "Symphony")
-    except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError) as exc:
-        print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
+    if pid_path.exists():
+        identity = read(pid_path)
+        identity = identity.get("identity") if identity else None
+        if identity and _identity_alive(identity):
+            print("Cannot start Symphony: a pre-existing managed process must be stopped before cutover")
+            return 78
+        print("Cannot start Symphony: stale process state requires explicit recovery before cutover")
         return 78
     try:
         token = read_secret(profile)

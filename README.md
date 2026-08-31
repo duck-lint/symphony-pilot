@@ -18,8 +18,11 @@ remote, credential, or process state.
 
 Codex policy is defense in depth. The one supported structural backend is the
 Linux/WSL unshare namespace contract with mount, PID, network, and resource
-limits. The task has no tracker/publication credentials, operator CODEX_HOME,
-SSH agent, sibling workspace, host state, or arbitrary tool network.
+limits. These are admission invariants, not a claim that an unblocked task is
+currently running: the exact runtime remains stopped at the auth-boundary
+gate. Once activated, the task must have no tracker/publication credentials,
+operator CODEX_HOME, SSH agent, sibling workspace, host state, or arbitrary
+tool network.
 
 ## Current status
 

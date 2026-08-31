@@ -289,15 +289,6 @@ def github(profile: Profile, token: str, method: str, path: str, body: object | 
         raise PreparationError("github_transport", f"GitHub transport failure: {exc}") from exc
 
 
-def issue_facts(profile: Profile, workspace: pathlib.Path, token: str) -> IssueFacts:
-    # Kept only as an explicit migration failure for callers that still name
-    # the removed function. There is no prose parser or compatibility path.
-    raise PreparationError(
-        "prose_control_removed",
-        "Git branch and starting state must come from the host task admission record",
-    )
-
-
 def admitted_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[IssueFacts, dict[str, object]]:
     match = re.fullmatch(r"GH-(\d+)", workspace.name)
     if not match:
@@ -311,11 +302,10 @@ def admitted_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[Issu
         raise PreparationError("task_admission", "host task record does not belong to this project")
     branch = str(record["issue_branch"])
     base_sha = str(record["base_sha"])
-    remote_line = git(workspace, "ls-remote", "origin", f"refs/heads/{branch}", check=False)
-    remote_sha = remote_line.split()[0].lower() if remote_line else None
-    published_head = record["published_head"]
-    if remote_sha and published_head != remote_sha:
-        raise PreparationError("task_admission", "remote task branch differs from host task state")
+    # The task-local origin and its refs are not authority. The host record is
+    # the only continuation identity; prepare() fetches the exact recorded
+    # commit from the profile remote below.
+    remote_sha = record["published_head"]
     target_sha = remote_sha or base_sha
     facts = IssueFacts(issue, branch, target_sha, str(record["default_ref"]), base_sha,
                        "continuation" if remote_sha else "initial", remote_sha,
@@ -324,10 +314,11 @@ def admitted_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[Issu
 
 
 def verify_repository(profile: Profile, workspace: pathlib.Path) -> None:
-    origin = git(workspace, "remote", "get-url", "origin")
-    normalized = re.sub(r"\.git$", "", origin).replace(":", "/")
-    if not normalized.endswith(profile.repository):
-        raise PreparationError("repository_identity", "workspace origin is not the profile repository")
+    git_dir = pathlib.Path(git(workspace, "rev-parse", "--git-dir")).resolve()
+    try:
+        git_dir.relative_to(workspace / ".git")
+    except ValueError as exc:
+        raise PreparationError("repository_identity", "task Git directory escapes the task workspace") from exc
 
 
 def process_owns_workspace(workspace: pathlib.Path) -> bool:
@@ -386,7 +377,6 @@ def marker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, tools: 
             "repo": profile.repository, "issue": facts.issue, "task_branch": facts.branch,
             "task_head": facts.target_sha, "published_head": facts.remote_sha,
             "default_ref": facts.default_ref, "base_sha": facts.base_sha,
-            "upstream": "origin/" + facts.branch if facts.remote_sha else None,
             "mode": facts.mode, "clean_status": True,
             "prepared_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "run_id": uuid.uuid4().hex, "toolchain": tools,
@@ -400,20 +390,21 @@ def marker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, tools: 
 def blocker_fingerprint(profile: Profile, workspace: pathlib.Path, facts: IssueFacts,
                         kind: str, detail: str) -> str:
     status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False)
-    stable = re.sub(r"; recovery artifact [^;]+", "", detail)
-    value = "\0".join((profile.slug, str(facts.issue), facts.branch, facts.target_sha, kind, stable, status))
+    value = "\0".join((profile.slug, str(facts.issue), facts.branch, facts.target_sha, kind, detail, status))
     return hashlib.sha256(value.encode()).hexdigest()[:24]
 
 
-def record_blocker(profile: Profile, token: str, workspace: pathlib.Path, facts: IssueFacts,
+def record_blocker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts,
                    kind: str, detail: str) -> None:
     digest = blocker_fingerprint(profile, workspace, facts, kind, detail)
     path = require_physical_namespace(profile.state_root) / "blockers" / f"GH-{facts.issue}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     old = json.loads(path.read_text()) if path.exists() else {}
     repeated = old.get("fingerprint") == digest
-    path.write_text(json.dumps({"fingerprint": digest, "kind": kind,
-                                "issue": facts.issue, "status": "active"}, indent=2))
+    path.write_text(json.dumps({"schema": "symphony-pilot-blocker/v1",
+                                "fingerprint": digest, "kind": kind,
+                                "issue": facts.issue, "detail": detail,
+                                "status": "active"}, indent=2) + "\n")
     if repeated:
         return
     # A blocker record is host audit state. Workpad discovery and mutation are
@@ -447,26 +438,26 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
             if process_owns_workspace(workspace):
                 raise PreparationError("workspace_in_use", "another process currently owns the issue workspace")
             facts, record = admitted_task_facts(profile, workspace)
-            fetch = subprocess.run(["git", "fetch", "origin", "refs/heads/" + facts.branch + ":refs/remotes/origin/" + facts.branch],
+            fetch_ref = facts.branch if facts.remote_sha else facts.default_ref
+            fetch = subprocess.run(["git", "fetch", profile.git_remote, fetch_ref],
                                    cwd=workspace, text=True, capture_output=True)
             if fetch.returncode:
-                if facts.remote_sha:
-                    raise PreparationError("git_fetch", "authoritative issue branch fetch failed")
-                requested = facts.default_ref.removeprefix("origin/")
-                if subprocess.run(["git", "fetch", "origin", requested], cwd=workspace).returncode:
-                    raise PreparationError("git_fetch", "licensed starting ref fetch failed")
-            if facts.base_sha:
-                subprocess.run(["git", "fetch", "origin", facts.default_ref.removeprefix("origin/")], cwd=workspace, check=False)
-                if subprocess.run(["git", "merge-base", "--is-ancestor", facts.base_sha, facts.target_sha], cwd=workspace).returncode:
-                    raise PreparationError("ancestry", "issue continuation is not based on the required base")
+                raise PreparationError("git_fetch", "licensed starting ref fetch failed")
+            fetched_sha = git(workspace, "rev-parse", "FETCH_HEAD")
+            expected_sha = facts.target_sha if facts.remote_sha else facts.base_sha
+            if fetched_sha != expected_sha:
+                raise PreparationError("server_ref_changed",
+                                       "server-fetched starting ref does not match host admission")
+            if facts.base_sha and subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", facts.base_sha, facts.target_sha],
+                    cwd=workspace, check=False).returncode:
+                raise PreparationError("ancestry", "issue continuation is not based on the required base")
             status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
             if status:
-                record_blocker(profile, "", workspace, facts, "dirty_task_workspace",
+                record_blocker(profile, workspace, facts, "dirty_task_workspace",
                                "task workspace is not a fresh clean checkout; no legacy recovery import is attempted")
                 raise PreparationError("dirty_task_workspace", "task workspace must be clean for straight-cutover admission", persisted=True)
             git(workspace, "switch", "-C", facts.branch, facts.target_sha)
-            if facts.remote_sha:
-                git(workspace, "branch", "--set-upstream-to", "origin/" + facts.branch, facts.branch)
             if git(workspace, "status", "--porcelain"):
                 raise PreparationError("clean_verification", "workspace remained dirty")
             tools = prepare_toolchain(profile, workspace, facts.issue)
@@ -476,7 +467,7 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
         except PreparationError as exc:
             if facts is not None and not exc.persisted:
                 try:
-                    record_blocker(profile, "", workspace, facts, exc.kind, str(exc))
+                    record_blocker(profile, workspace, facts, exc.kind, str(exc))
                 except PreparationError:
                     pass
             raise

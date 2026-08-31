@@ -29,7 +29,7 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "  before_run: |", "    set -eu",
         f"    exec python3 {shell(runtime / 'prepare_workspace.py')} --profile {shell(profile_path)} --workspace \"$PWD\"",
         "  after_run: |", "    set -eu",
-        f"    python3 {shell(runtime / 'after_run.py')} --profile {shell(profile_path)} --workspace \"$PWD\" || true",
+        f"    exec python3 {shell(runtime / 'after_run.py')} --profile {shell(profile_path)} --workspace \"$PWD\"",
         "  before_remove: |",
         f"    python3 {shell(runtime / 'before_remove.py')} --profile {shell(profile_path)} --workspace \"$PWD\" || true",
         "agent:", f"  max_concurrent_agents: {profile.max_concurrent_agents}",

@@ -14,7 +14,7 @@ else
 fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ROLE_SOURCE=${SYMPHONY_PILOT_ROLE_POLICY_DIR:-$SCRIPT_DIR/../workflow/agents}
+ROLE_SOURCE=$SCRIPT_DIR/../workflow/agents
 EXPECTED_ROLES="adversary archivist implementer planner project-manager reviewer"
 
 if [ ! -d "$ROLE_SOURCE" ]; then

@@ -8,7 +8,7 @@ import re
 
 
 OUTBOX_SCHEMA = "symphony-pilot-task-outbox/v1"
-ALLOWED_ACTIONS = {"publish", "complete", "block"}
+ALLOWED_ACTIONS = {"publish"}
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 

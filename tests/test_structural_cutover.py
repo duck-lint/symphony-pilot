@@ -38,9 +38,6 @@ class StructuralCutoverTests(unittest.TestCase):
         tampered = dict(task, issue_branch="master")
         with self.assertRaises(task_admission.TaskAdmissionError):
             task_admission.validate_task_record(tampered)
-        with self.assertRaises(pw.PreparationError) as raised:
-            pw.issue_facts(mock.Mock(), pathlib.Path("GH-10"), "synthetic")
-        self.assertEqual(raised.exception.kind, "prose_control_removed")
 
     def test_task_record_is_strict_and_round_trips_outside_workspace(self):
         task = self.task()
@@ -61,6 +58,8 @@ class StructuralCutoverTests(unittest.TestCase):
             outbox.validate_request(dict(request, branch="master"), task)
         with self.assertRaises(outbox.OutboxError):
             outbox.validate_request(dict(request, task_id="e" * 32), task)
+        with self.assertRaises(outbox.OutboxError):
+            outbox.validate_request(dict(request, action="complete", head=None), task)
 
     def test_branch_protection_is_fail_closed(self):
         good = {"protected": True, "required_pull_request": True,
@@ -100,6 +99,7 @@ class StructuralCutoverTests(unittest.TestCase):
     def test_launcher_does_not_reference_operator_codex_home_or_symlinks(self):
         text = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")
         self.assertNotIn("ORIGINAL_CODEX_HOME", text)
+        self.assertNotIn("SYMPHONY_PILOT_ROLE_POLICY_DIR", text)
         self.assertNotIn("ln -s", text)
         self.assertIn("CODEX_API_KEY", text)
         self.assertIn("exit 78", text)
@@ -122,6 +122,18 @@ class StructuralCutoverTests(unittest.TestCase):
         self.assertEqual(runtime_lock.validate_lock(lock), lock)
         with self.assertRaises(runtime_lock.RuntimeLockError):
             runtime_lock.validate_lock(dict(lock, extra=True))
+
+    def test_blocker_detail_is_persisted_in_host_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = mock.Mock(state_root=pathlib.Path(directory))
+            profile.slug = "demo"
+            pw.record_blocker(profile, ROOT,
+                              pw.IssueFacts(10, "codex/gh-10-cccccccccccc", "b" * 40,
+                                            "master", "b" * 40, "initial", None, None, []),
+                              "test_blocker", "exact diagnostic detail")
+            saved = json.loads((pathlib.Path(directory) / "blockers" / "GH-10.json").read_text())
+        self.assertEqual(saved["schema"], "symphony-pilot-blocker/v1")
+        self.assertEqual(saved["detail"], "exact diagnostic detail")
 
 
 if __name__ == "__main__":

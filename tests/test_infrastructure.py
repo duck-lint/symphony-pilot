@@ -76,9 +76,6 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(task["issue_branch"], "codex/gh-10-cccccccccccc")
         with self.assertRaises(task_admission.TaskAdmissionError):
             task_admission.validate_task_record(dict(task, issue_branch="master"))
-        with self.assertRaises(pw.PreparationError) as raised:
-            pw.issue_facts(mock.Mock(), pathlib.Path("GH-10"), "synthetic")
-        self.assertEqual(raised.exception.kind, "prose_control_removed")
 
     def test_task_record_is_strict_and_host_owned(self):
         task = self.task()

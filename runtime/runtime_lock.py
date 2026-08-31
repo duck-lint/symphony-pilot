@@ -8,7 +8,6 @@ import pathlib
 import shutil
 import subprocess
 import re
-import shutil
 
 
 LOCK_SCHEMA = "symphony-pilot-runtime-lock/v1"
