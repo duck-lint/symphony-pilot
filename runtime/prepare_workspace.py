@@ -23,14 +23,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
-from process_identity import matches as process_identity_matches
+from task_admission import read_task, task_state_path
 
 
 class PreparationError(RuntimeError):
@@ -72,10 +70,8 @@ class IssueFacts:
     issue: int
     branch: str
     target_sha: str
-    required_ref: str | None
-    required_sha: str | None
-    base_ref: str | None
-    base_sha: str | None
+    default_ref: str
+    base_sha: str
     mode: str
     remote_sha: str | None
     pr_number: int | None
@@ -293,92 +289,38 @@ def github(profile: Profile, token: str, method: str, path: str, body: object | 
         raise PreparationError("github_transport", f"GitHub transport failure: {exc}") from exc
 
 
-def github_all(profile: Profile, token: str, path: str, page_size: int = 100) -> list[dict]:
-    """Fetch a complete paginated collection before applying cardinality rules."""
-    result: list[dict] = []
-    page = 1
-    while True:
-        separator = "&" if "?" in path else "?"
-        batch = github(profile, token, "GET",
-                       f"{path}{separator}per_page={page_size}&page={page}")
-        if not isinstance(batch, list):
-            raise PreparationError("github_response", f"GitHub collection was not a list: {path}")
-        result.extend(item for item in batch if isinstance(item, dict))
-        if len(batch) < page_size:
-            return result
-        page += 1
-        if page > 1000:
-            raise PreparationError("github_pagination", f"GitHub collection exceeded pagination bound: {path}")
-
-
-def workpad_candidates(items: list[dict], marker: str = "<!-- symphony-workpad:v1 -->") -> list[dict]:
-    return [item for item in items if marker in (item.get("body") or "")]
-
-
-def workpad(items: list[dict], marker: str = "<!-- symphony-workpad:v1 -->") -> dict | None:
-    """Return the sole workpad; ambiguity must never select an arbitrary one."""
-    pads = workpad_candidates(items, marker)
-    return pads[0] if len(pads) == 1 else None
-
-
-def comments(profile: Profile, token: str, issue: int) -> list[dict]:
-    return github_all(profile, token, f"/issues/{issue}/comments")
-
-
-def parse_sha(text: str) -> str | None:
-    match = re.search(r"\b([0-9a-fA-F]{40})\b", text)
-    return match.group(1).lower() if match else None
-
-
-def parse_ref(body: str, pattern: str) -> str | None:
-    match = re.search(pattern, body, re.I)
-    return match.group(1).strip("`.,)") if match else None
-
-
 def issue_facts(profile: Profile, workspace: pathlib.Path, token: str) -> IssueFacts:
+    # Kept only as an explicit migration failure for callers that still name
+    # the removed function. There is no prose parser or compatibility path.
+    raise PreparationError(
+        "prose_control_removed",
+        "Git branch and starting state must come from the host task admission record",
+    )
+
+
+def admitted_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[IssueFacts, dict[str, object]]:
     match = re.fullmatch(r"GH-(\d+)", workspace.name)
     if not match:
         raise PreparationError("workspace_identity", "workspace name is not GH-N")
     issue = int(match.group(1))
-    issue_json = github(profile, token, "GET", f"/issues/{issue}")
-    issue_comments = comments(profile, token, issue)
-    body = issue_json.get("body") or ""
-    pads = workpad_candidates(issue_comments)
-    if len(pads) > 1:
-        raise PreparationError("ambiguous_workpad", "issue has more than one symphony-workpad:v1 comment")
-    pad_body = (pads[0] if pads else {}).get("body") or ""
-    required_match = re.search(r"required starting commit\s*:\s*`?([0-9a-fA-F]{40})", body, re.I)
-    required_sha = required_match.group(1).lower() if required_match else parse_sha(body)
-    required_ref = parse_ref(body, r"required starting ref\s*:\s*`?([A-Za-z0-9._/-]+)")
-    if not required_ref:
-        required_ref = parse_ref(body, r"Work from:\s*[\r\n]+`?(origin/[A-Za-z0-9._/-]+)")
-    base_sha_match = re.search(r"(?:baseline SHA|base commit)\s*:\s*`?([0-9a-fA-F]{40})", body, re.I)
-    base_sha = base_sha_match.group(1).lower() if base_sha_match else required_sha
-    base_ref = parse_ref(body, r"(?:PR base|base ref)\s*:\s*`?([A-Za-z0-9._/-]+)")
-    if not base_ref:
-        base_ref = parse_ref(body, r"(?:PR base|base ref):\s*[\r\n]+`?([A-Za-z0-9._/-]+)") or required_ref
-    pull_requests = github_all(profile, token, "/pulls?state=open")
-    matching = [pr for pr in pull_requests if
-                (pr.get("head") or {}).get("repo", {}).get("full_name") == profile.repository and
-                (pr.get("head") or {}).get("ref", "").startswith(f"codex/gh-{issue}-")]
-    if len(matching) > 1:
-        raise PreparationError("ambiguous_issue_pr", "issue has more than one matching published issue PR")
-    pr = matching[0] if matching else None
-    if pr and not pr.get("draft", False):
-        raise PreparationError("non_draft_issue_pr", "matching issue PR is not a draft pull request")
-    branch = (pr or {}).get("head", {}).get("ref")
-    if not branch:
-        branch = parse_ref(body + "\n" + pad_body,
-                           r"(?:issue branch|published remote branch|remote issue branch)\s*:\s*`?([A-Za-z0-9._/-]+)")
-    branch = (branch or f"codex/gh-{issue}-work").removeprefix("origin/")
+    try:
+        record = read_task(task_state_path(require_physical_namespace(profile.state_root), issue))
+    except Exception as exc:
+        raise PreparationError("task_admission", str(exc)) from exc
+    if record["repository"] != profile.repository or record["project_slug"] != profile.slug:
+        raise PreparationError("task_admission", "host task record does not belong to this project")
+    branch = str(record["issue_branch"])
+    base_sha = str(record["base_sha"])
     remote_line = git(workspace, "ls-remote", "origin", f"refs/heads/{branch}", check=False)
     remote_sha = remote_line.split()[0].lower() if remote_line else None
-    target_sha = remote_sha or required_sha
-    if not target_sha:
-        raise PreparationError("starting_state", "issue has no licensed starting commit or published issue branch")
-    return IssueFacts(issue, branch, target_sha, required_ref, required_sha, base_ref, base_sha,
-                      "continuation" if remote_sha else "initial", remote_sha,
-                      pr.get("number") if pr else None, issue_comments)
+    published_head = record["published_head"]
+    if remote_sha and published_head != remote_sha:
+        raise PreparationError("task_admission", "remote task branch differs from host task state")
+    target_sha = remote_sha or base_sha
+    facts = IssueFacts(issue, branch, target_sha, str(record["default_ref"]), base_sha,
+                       "continuation" if remote_sha else "initial", remote_sha,
+                       ((record["draft_pr"] or {}).get("number") if record["draft_pr"] else None), [])
+    return facts, record
 
 
 def verify_repository(profile: Profile, workspace: pathlib.Path) -> None:
@@ -407,162 +349,6 @@ def process_owns_workspace(workspace: pathlib.Path) -> bool:
         except (FileNotFoundError, PermissionError, OSError):
             continue
     return False
-
-
-ROLE_HOME_SCHEMA = "symphony-pilot-role-home/v2"
-ROLE_HOME_MARKER = pathlib.PurePosixPath(".git/symphony-role-home.json")
-ROLE_HOME_ROOT = pathlib.Path("/tmp")
-ROLE_HOME_PREFIX = "symphony-pilot-codex-home."
-ROLE_HOME_LEASE_FILE = ".symphony-pilot-role-home.json"
-
-
-def _role_home_path(value: object) -> pathlib.Path:
-    if not isinstance(value, str):
-        raise PreparationError("role_home_recovery", "role-home marker path is invalid")
-    path = pathlib.Path(value).resolve()
-    if path.parent != ROLE_HOME_ROOT.resolve() or not path.name.startswith(ROLE_HOME_PREFIX):
-        raise PreparationError("role_home_recovery", "role-home marker escapes the pilot staging directory")
-    return path
-
-
-def reconcile_role_home(workspace: pathlib.Path) -> bool:
-    """Remove the exact external role home left by a completed or crashed run.
-
-    The marker is host-owned state under .git, not a target-project file. Its
-    path is accepted only when it is the launcher-created /tmp prefix, so a
-    malformed marker fails closed instead of becoming a deletion primitive.
-    """
-    marker = workspace / pathlib.Path(ROLE_HOME_MARKER)
-    if not marker.exists():
-        return False
-    if process_owns_workspace(workspace):
-        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its workspace is active")
-    try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise PreparationError("role_home_recovery", "role-home marker cannot be read") from exc
-    if not isinstance(data, dict) or data.get("schema") != ROLE_HOME_SCHEMA:
-        raise PreparationError("role_home_recovery", "role-home marker schema is invalid")
-    if data.get("workspace") != str(workspace.resolve()):
-        raise PreparationError("role_home_recovery", "role-home marker does not belong to this workspace")
-    lease_id = data.get("lease_id")
-    owner = data.get("owner")
-    if (not isinstance(lease_id, str) or not re.fullmatch(r"symphony-pilot-codex-home\.[A-Za-z0-9_]+", lease_id) or
-            not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or
-            isinstance(owner.get("pid"), bool) or owner.get("pid") < 1 or
-            not isinstance(owner.get("boot_id"), str) or not owner.get("boot_id") or
-            not isinstance(owner.get("start_time"), str) or not owner.get("start_time")):
-        raise PreparationError("role_home_recovery", "role-home owner identity is invalid")
-    role_home = _role_home_path(data.get("path"))
-    if role_home.name != lease_id:
-        raise PreparationError("role_home_recovery", "role-home lease does not match its path")
-    if process_identity_matches(owner):
-        raise PreparationError("workspace_in_use", "cannot reconcile a role home while its App Server is active")
-    # A reboot may remove the ephemeral /tmp home while preserving .git. Once
-    # the recorded owner is stale, clearing only that durable marker is safe:
-    # there is no external path left to delete. If any path entry remains,
-    # bilateral lease equality is still mandatory before recursive deletion.
-    if not role_home.exists() and not role_home.is_symlink():
-        try:
-            marker.unlink()
-        except OSError as exc:
-            raise PreparationError("role_home_recovery", "stale role-home marker could not be removed") from exc
-        return True
-    lease_file = role_home / ROLE_HOME_LEASE_FILE
-    try:
-        lease = json.loads(lease_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise PreparationError("role_home_recovery", "role-home lease cannot be read") from exc
-    if lease != data:
-        raise PreparationError("role_home_recovery", "role-home lease does not match its workspace marker")
-    try:
-        if role_home.is_symlink():
-            role_home.unlink()
-        elif role_home.is_dir():
-            shutil.rmtree(role_home)
-        elif role_home.exists():
-            role_home.unlink()
-        marker.unlink()
-    except OSError as exc:
-        raise PreparationError("role_home_recovery", "stale role home could not be removed") from exc
-    return True
-
-
-def recovery_path_is_safe(path: pathlib.Path) -> bool:
-    """Apply the pre-existing host rule that secrets never enter archives."""
-    sensitive_names = {".env", "credentials", "credential", "secret", "secrets",
-                       "token", "tokens", "private-key", "private_keys"}
-    sensitive_suffixes = {".key", ".pem", ".p12", ".pfx", ".kdbx", ".token", ".secret"}
-    for part in path.parts:
-        name = part.lower()
-        if name in sensitive_names or name.startswith(".env."):
-            return False
-    name = path.name.lower()
-    return not name.endswith(".env") and not any(name.endswith(suffix) for suffix in sensitive_suffixes)
-
-
-def recovery_entries(workspace: pathlib.Path) -> tuple[list[tuple[pathlib.Path, str]], list[str]]:
-    """Walk recovery input recursively without crossing excluded paths."""
-    entries: list[tuple[pathlib.Path, str]] = []
-    excluded: list[str] = []
-
-    def visit(path: pathlib.Path, relative: pathlib.PurePath) -> None:
-        relative_text = relative.as_posix()
-        if not recovery_path_is_safe(relative):
-            excluded.append(relative_text)
-            return
-        if path.is_symlink():
-            excluded.append(relative_text)
-            return
-        if path.is_dir():
-            entries.append((path, relative_text))
-            for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
-                visit(child, relative / child.name)
-        else:
-            entries.append((path, relative_text))
-
-    for child in sorted(workspace.iterdir(), key=lambda item: item.name.lower()):
-        if child.name in {".git", "target"}:
-            continue
-        visit(child, pathlib.PurePath(child.name))
-    return entries, excluded
-
-
-def archive_recovery(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, status: str) -> pathlib.Path:
-    directory = profile.state_root / "recovery" / f"GH-{facts.issue}"
-    directory.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    archive = directory / f"{stamp}-{uuid.uuid4().hex[:8]}.tar.gz"
-    entries, excluded = recovery_entries(workspace)
-    with tarfile.open(archive, "w:gz") as output:
-        for path, relative in entries:
-            output.add(path, arcname=relative, recursive=False)
-        manifest = json.dumps({"repo": profile.repository, "issue": facts.issue,
-                               "local_head": git(workspace, "rev-parse", "HEAD", check=False),
-                               "remote_head": facts.target_sha, "status": status,
-                               "created_utc": stamp, "excluded_paths": excluded}, sort_keys=True).encode()
-        import io
-        info = tarfile.TarInfo("RECOVERY-MANIFEST.json")
-        info.size = len(manifest)
-        output.addfile(info, io.BytesIO(manifest))
-    return archive
-
-
-def snapshot(workspace: pathlib.Path, commit: str) -> tuple[dict[str, str], dict[str, str]]:
-    expected = {}
-    for row in git(workspace, "ls-tree", "-r", "--full-tree", commit).splitlines():
-        left, path = row.split("\t", 1)
-        expected[path] = left.split()[2]
-    actual = {}
-    for path in git(workspace, "ls-files", "-co", "--exclude-standard", "-z").split("\0"):
-        if path:
-            actual[path] = git(workspace, "hash-object", "--path", path, "--", path)
-    return expected, actual
-
-
-def dirty_equals_remote(workspace: pathlib.Path, commit: str) -> bool:
-    expected, actual = snapshot(workspace, commit)
-    return expected == actual
 
 
 def find_tool(name: str) -> str | None:
@@ -596,36 +382,19 @@ def prepare_toolchain(profile: Profile, workspace: pathlib.Path, issue: int) -> 
 
 
 def marker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, tools: dict) -> None:
-    data = {"schema": "symphony-pilot-preparation/v1", "profile": profile.slug,
-            "repo": profile.repository, "issue": facts.issue, "issue_branch": facts.branch,
-            "resolved_head_sha": facts.target_sha, "remote_issue_branch_sha": facts.remote_sha,
-            "required_start_ref": facts.required_ref, "required_start_sha": facts.required_sha,
-            "base_ref": facts.base_ref, "base_sha": facts.base_sha,
+    data = {"schema": "symphony-pilot-preparation/v2", "profile": profile.slug,
+            "repo": profile.repository, "issue": facts.issue, "task_branch": facts.branch,
+            "task_head": facts.target_sha, "published_head": facts.remote_sha,
+            "default_ref": facts.default_ref, "base_sha": facts.base_sha,
             "upstream": "origin/" + facts.branch if facts.remote_sha else None,
             "mode": facts.mode, "clean_status": True,
             "prepared_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "run_id": uuid.uuid4().hex, "toolchain": tools,
-            "publication_preflight": "git-push-dry-run"}
+            "publication": "host-only"}
     path = workspace / ".git/symphony-preparation.json"
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
-
-
-def compact_workpad(body: str, limit: int = 24000) -> str:
-    sections = re.split(r"(?=^## |\n## )", body, flags=re.M)
-    seen: set[str] = set()
-    kept = []
-    for section in reversed(sections):
-        digest = hashlib.sha256(section.strip().encode()).hexdigest()
-        if digest not in seen:
-            seen.add(digest)
-            kept.append(section)
-    result = "".join(reversed(kept)).strip()
-    if len(result) <= limit:
-        return result
-    header = "<!-- symphony-workpad:v1 -->\n## Symphony Workpad\n\n"
-    return header + result[len(header):][-max(0, limit - len(header)):]
 
 
 def blocker_fingerprint(profile: Profile, workspace: pathlib.Path, facts: IssueFacts,
@@ -639,7 +408,7 @@ def blocker_fingerprint(profile: Profile, workspace: pathlib.Path, facts: IssueF
 def record_blocker(profile: Profile, token: str, workspace: pathlib.Path, facts: IssueFacts,
                    kind: str, detail: str) -> None:
     digest = blocker_fingerprint(profile, workspace, facts, kind, detail)
-    path = profile.state_root / "blockers" / f"GH-{facts.issue}.json"
+    path = require_physical_namespace(profile.state_root) / "blockers" / f"GH-{facts.issue}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     old = json.loads(path.read_text()) if path.exists() else {}
     repeated = old.get("fingerprint") == digest
@@ -647,39 +416,21 @@ def record_blocker(profile: Profile, token: str, workspace: pathlib.Path, facts:
                                 "issue": facts.issue, "status": "active"}, indent=2))
     if repeated:
         return
-    pad = workpad(facts.comments)
-    body = ("<!-- symphony-workpad:v1 -->\n## Symphony Workpad\n\n"
-            "### Infrastructure blocker\n"
-            f"- class: {kind}\n- issue: #{facts.issue}\n- detail: {detail}\n"
-            f"- blocker fingerprint: {digest}\n- worker was not started.\n")
-    if pad:
-        body += "\n### Preserved history\n" + compact_workpad(pad.get("body") or "")[-12000:] + "\n"
-        github(profile, token, "PATCH", f"/issues/comments/{pad['id']}", {"body": body})
-    else:
-        github(profile, token, "POST", f"/issues/{facts.issue}/comments", {"body": body})
-    labels = github(profile, token, "GET", f"/issues/{facts.issue}/labels?per_page=100")
-    names = [item["name"] for item in labels if item.get("name") not in set(profile.dispatch_labels) | {profile.blocked_label}]
-    github(profile, token, "PUT", f"/issues/{facts.issue}/labels", {"labels": names + [profile.blocked_label]})
+    # A blocker record is host audit state. Workpad discovery and mutation are
+    # intentionally absent: only the comment id in task.json is authoritative.
 
 
 def prepare(profile: Profile, workspace: pathlib.Path) -> None:
-    token = read_secret(profile)
-    workspace = workspace.resolve()
+    workspace = require_physical_namespace(workspace.resolve())
     if not str(workspace).startswith(str(profile.workspace_root) + os.sep):
         raise PreparationError("workspace_path", "workspace is outside the profile workspace root")
     if not workspace.exists():
-        workspace.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", "--no-single-branch", profile.git_remote, str(workspace)], check=True)
+        raise PreparationError("workspace_missing", "host dispatch must clone before task preparation")
     try:
         verify_repository(profile, workspace)
     except PreparationError:
-        if process_owns_workspace(workspace):
-            raise PreparationError("workspace_in_use", "cannot replace a workspace owned by another process")
-        if workspace.exists():
-            shutil.move(str(workspace), str(workspace.parent / (workspace.name + ".stale." + uuid.uuid4().hex[:8])))
-        subprocess.run(["git", "clone", "--no-single-branch", profile.git_remote, str(workspace)], check=True)
-        verify_repository(profile, workspace)
-    lock_path = profile.state_root / "locks" / f"{profile.slug}-GH-{workspace.name.removeprefix('GH-')}.lock"
+        raise PreparationError("repository_identity", "task workspace origin is not the registered repository")
+    lock_path = require_physical_namespace(profile.state_root) / "locks" / f"{profile.slug}-GH-{workspace.name.removeprefix('GH-')}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w", encoding="utf-8") as lock:
         try:
@@ -695,47 +446,37 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
         try:
             if process_owns_workspace(workspace):
                 raise PreparationError("workspace_in_use", "another process currently owns the issue workspace")
-            reconcile_role_home(workspace)
-            facts = issue_facts(profile, workspace, token)
+            facts, record = admitted_task_facts(profile, workspace)
             fetch = subprocess.run(["git", "fetch", "origin", "refs/heads/" + facts.branch + ":refs/remotes/origin/" + facts.branch],
                                    cwd=workspace, text=True, capture_output=True)
             if fetch.returncode:
                 if facts.remote_sha:
                     raise PreparationError("git_fetch", "authoritative issue branch fetch failed")
-                requested = (facts.required_ref or "master").removeprefix("origin/")
+                requested = facts.default_ref.removeprefix("origin/")
                 if subprocess.run(["git", "fetch", "origin", requested], cwd=workspace).returncode:
                     raise PreparationError("git_fetch", "licensed starting ref fetch failed")
             if facts.base_sha:
-                subprocess.run(["git", "fetch", "origin", (facts.base_ref or "master").removeprefix("origin/")], cwd=workspace, check=False)
+                subprocess.run(["git", "fetch", "origin", facts.default_ref.removeprefix("origin/")], cwd=workspace, check=False)
                 if subprocess.run(["git", "merge-base", "--is-ancestor", facts.base_sha, facts.target_sha], cwd=workspace).returncode:
                     raise PreparationError("ancestry", "issue continuation is not based on the required base")
             status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
             if status:
-                if dirty_equals_remote(workspace, facts.target_sha):
-                    archive_recovery(profile, workspace, facts, status)
-                    git(workspace, "reset", "--hard", facts.target_sha)
-                    git(workspace, "clean", "-fdx")
-                else:
-                    archive = archive_recovery(profile, workspace, facts, status)
-                    record_blocker(profile, token, workspace, facts, "unique_unpublished_changes",
-                                   "dirty workspace differs from authoritative remote; recovery artifact " + archive.name)
-                    raise PreparationError("unique_unpublished_changes", "dirty workspace differs from authoritative remote", persisted=True)
+                record_blocker(profile, "", workspace, facts, "dirty_task_workspace",
+                               "task workspace is not a fresh clean checkout; no legacy recovery import is attempted")
+                raise PreparationError("dirty_task_workspace", "task workspace must be clean for straight-cutover admission", persisted=True)
             git(workspace, "switch", "-C", facts.branch, facts.target_sha)
             if facts.remote_sha:
                 git(workspace, "branch", "--set-upstream-to", "origin/" + facts.branch, facts.branch)
             if git(workspace, "status", "--porcelain"):
                 raise PreparationError("clean_verification", "workspace remained dirty")
             tools = prepare_toolchain(profile, workspace, facts.issue)
-            push = subprocess.run(["git", "push", "--dry-run", "origin", f"HEAD:refs/heads/{facts.branch}"], cwd=workspace, capture_output=True, text=True)
-            if push.returncode:
-                raise PreparationError("publication_preflight", "Git publication dry-run failed")
             marker(profile, workspace, facts, tools)
             print(json.dumps({"profile": profile.slug, "issue": facts.issue, "branch": facts.branch,
                               "head": facts.target_sha, "mode": facts.mode, "marker": ".git/symphony-preparation.json"}, sort_keys=True))
         except PreparationError as exc:
             if facts is not None and not exc.persisted:
                 try:
-                    record_blocker(profile, token, workspace, facts, exc.kind, str(exc))
+                    record_blocker(profile, "", workspace, facts, exc.kind, str(exc))
                 except PreparationError:
                     pass
             raise

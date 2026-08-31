@@ -1,111 +1,31 @@
 # Architecture
 
-`symphony-pilot` is a generic control plane for an arbitrary finite registry
-of projects. The official OpenAI Symphony executable is shared host
-infrastructure; it is installed independently of this repository and is
-resolved at runtime only through `SYMPHONY_BIN` or `PATH`.
+symphony-pilot is a host control plane around the official OpenAI Symphony lifecycle. Project profiles remain the canonical registry; target repositories remain authoritative for project meaning and validation.
 
-The pilot source checkout contains generic runtime, policy, deployment, and
-operator code. It contains no project architecture or closed list of project
-identities. The canonical registry is the tracked set of
-`projects/<slug>/profile.toml` files. The directory name must equal `slug`.
-An empty registry is valid; every discovered profile is loaded and the full
-collection is validated before a slug is resolved.
+## Trust topology
 
-Each profile supplies repository identity, its Git remote, tracker labels,
-secret reference, execution limits, Codex settings, and optional host
-integration preferences. Deployment, workspace, state, log, credential, lock,
-process, workflow, and service namespaces are derived from the slug. Dashboard
-ports are persisted finite host-resource allocations in the canonical profile;
-onboarding tooling chooses an unused value in the unprivileged TCP range
-`1024–65535` and registry validation rejects duplicate assignments. Runtime
-host occupancy is checked separately and never causes automatic renumbering.
-Adding or removing a project never renumbers existing assignments.
-There is no persisted `deployment_root`, `workspace_root`, `state_root`,
-`log_root`, or `service_identity` field.
+The host owns the registry, GitHub credentials, task admission, runtime locks, process state, logs, recovery decisions, and publication. A task receives only its current source checkout, a task-local home, pilot role policy, and a narrow read-only admission projection. Issue prose, agent output, local Git metadata, and the task outbox are untrusted.
 
-The host topology is:
+The selected execution backend is one Linux/WSL unshare namespace contract: user, mount, PID, and network namespaces plus explicit resource limits. The backend capability probe passes on the current WSL kernel, but activation is not licensed until the Codex credential boundary also passes. Codex policy is defense in depth, not structural proof. If either boundary cannot be proven, admission stops with an infrastructure blocker.
 
-```text
-SOURCE CHECKOUT
-  canonical registry
-  registry-wide validation
-  lifecycle/operator CLI
-  deployment command
+## Task admission
 
-GENERATED PROJECT DEPLOYMENT
-  profile snapshot
-  WORKFLOW.md
-  runtime hooks/preparation
-  architect/role policies
-  DEPLOYMENT.json
+At dispatch the trusted host obtains the repository default branch and its server-reported HEAD, creates the workpad, and writes:
 
-SHARED HOST
-  official Symphony executable
-  canonical WSL/Linux operator root
+    ~/.local/state/symphony-pilot/<slug>/tasks/GH-<N>/task.json
 
-tracked registry
-  projects/<slug>/profile.toml
+The strict symphony-pilot-task/v1 record contains the repository, project, issue, task id, dispatcher, default ref, base SHA, derived issue branch, authoritative workpad comment id, publication/PR state, and reviewed runtime identities. Continuation uses this record and server metadata only. Missing state requires fresh admission.
 
-per project pi
-  ~/.local/share/symphony-pilot/deployments/<slug>
-  ~/symphony-workspaces/<slug>
-  ~/.local/state/symphony-pilot/<slug>
-  ~/.config/symphony-pilot/secrets/<slug>/<reference>
-```
+Branches are host-derived as codex/gh-<issue>-<task-id-prefix>. No issue or workpad text can choose a branch, ref, SHA, checkout, credential, or remote.
 
-The source checkout contains registry discovery, project resolution, deploy,
-and lifecycle commands. A generated `deployment(pi)` contains only the
-generated profile snapshot, `WORKFLOW.md`, runtime hooks and preparation code
-required by Symphony, architect/role policies, and `DEPLOYMENT.json`. It never
-contains the source operator CLI or the official Symphony executable. Atomic
-backup/replacement is bounded to that one derived deployment directory. Source
-checkout lifecycle commands operate on the selected slug's derived state and
-deployment only.
+## Publication
 
-`DEPLOYMENT.json` records the exact generated inventory, its hashes, the
-selected profile digest, and a bounded source lifecycle-contract digest.
-`project.py test` and `project.py start` use the same verifier; `start` runs it
-before reading the project credential or querying the tracker. Process state
-also records the launched deployment identity, profile digest, and dashboard
-endpoint so later status/stop operations continue to address the process that
-actually started.
+The task writes a strict /symphony-outbox/result.json request, which is a separate task-local mount and not project source. The host-side validator checks its task identity, action, and exact commit before a host-owned publication clone may publish with ambient Git configuration, hooks, SSH-agent sockets, and task remotes disabled. Network publication remains disabled while the execution blocker is active. The task has no publication credential and cannot push.
 
-These are separate authority boundaries: the complete canonical registry is
-required for new work, deployment, credentials, and `start`/`test`; recovery
-control accepts only a safe operator-supplied slug and that slug's validated
-persisted process identity for inspection or emergency shutdown. Recovery
-`stop-now` also derives that slug's state namespace to validate and reconcile
-the exact persisted host-awake helper record. It never reads a current profile
-or grants new project authority. A malformed, reused, or otherwise unresolved
-helper identity makes shutdown incomplete; the operator is not told that the
-host is safe to shut down until both managed resources are reconciled. Awake
-startup uses the same strict parser: malformed or unresolved state is retained
-and blocks replacement, while only a valid dead helper with an unused PID may
-be removed before establishing a new guard.
+## Lifecycle
 
-Physical namespace operations are WSL/Linux operations. Native Windows Python
-may perform host-neutral registry validation and port allocation, but it must
-not resolve or mutate a physical project namespace; Windows `USERNAME` is
-never treated as a WSL username.
+There is one issue, one derived issue branch, one draft PR, and one workpad. The default branch must be protected server-side so changes require a pull request and the automation identity cannot bypass protection. Human merge is not a prompt claim; it is an admission prerequisite.
 
-For distinct projects, registry validation rejects duplicate repository
-identity, service identity, dashboard port, or any equality/containment overlap
-among project-owned namespaces. Repository identity is globally unique because
-the same label text in the same repository would otherwise create tracker
-dispatch authority across profiles. Tracker labels remain repository-scoped;
-the same label may be used in different repositories.
+## Current execution status
 
-Adding `p(n+1)` means adding only `projects/<slug>/profile.toml` and satisfying
-real host prerequisites. No generic source, schema, runtime dispatch, or
-operator code changes are needed. The remaining limits are actual host
-resources: available ports, disk, process/memory capacity, GitHub/API access,
-the installed shared executable, and the target repository's credentials and
-toolchain.
-
-The role scaffold remains generic: ARCHITECT/orchestrator ownership,
-PROJECT-MANAGER, PLANNER, IMPLEMENTER, REVIEWER, ADVERSARY, ARCHIVIST,
-conformance review, falsification, fresh correction review, exact-HEAD
-agreement, one issue/branch/draft PR/workpad, pagination, role-home leases,
-process identity, recovery boundaries, and no auto-merge. Named-role App
-Server execution remains a future live-canary capability boundary.
+The host-side contracts are implemented, but unattended execution is disabled. The exact current Codex runtime does not provide a proven boundary keeping App Server authentication inaccessible to hostile tool children, and external execution routing has an observed host-local fallback. This is a concrete runtime blocker, not permission to select a same-user fallback.

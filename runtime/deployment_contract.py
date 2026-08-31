@@ -24,6 +24,13 @@ CONTRACT_FILES = (
     "runtime/render_workflow.py",
     "runtime/project_registry.py",
     "runtime/deployment_contract.py",
+    "runtime/containment.py",
+    "runtime/task_admission.py",
+    "runtime/admit_task.py",
+    "runtime/outbox.py",
+    "runtime/protection.py",
+    "runtime/publication.py",
+    "runtime/runtime_lock.py",
 )
 
 

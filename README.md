@@ -1,151 +1,60 @@
 # symphony-pilot
 
-A host-side control plane for running [OpenAI Symphony](https://github.com/openai/symphony) against issue-driven software projects without moving project authority into the orchestration layer.
+A host-side control plane for issue-driven OpenAI Symphony deployments. The
+canonical project registry is under projects/. Target repositories remain
+authoritative for project meaning, architecture, validation, and stop conditions.
 
-`symphony-pilot` handles the reusable mechanics around a Symphony deployment: project profiles, isolated issue workspaces, deployment snapshots, credential boundaries, lifecycle controls, host integration, and recovery. The target repository still owns its architecture, acceptance criteria, validation authority, and human stop conditions.
+## Architecture
 
-## Why this exists
+The trusted host owns project admission, server-derived Git identity, runtime
+locks, process state, credentials, logs, recovery, branch-protection preflight,
+and publication. A GH-N task receives only its current source checkout and a
+fresh task-local Codex policy home. Task output is an untrusted strict outbox.
 
-Symphony provides the agent runtime and lifecycle model. Real project deployments still need host-side machinery around that runtime: preparing clean workspaces, resuming from durable Git state, keeping secrets out of prompts and repositories, deploying reviewed workflow policy, and giving an operator predictable start/finish/recovery controls.
+Task branches are host-derived as codex/gh-<issue>-<task-id-prefix>. Base ref and
+base SHA come from trusted GitHub metadata and are stored in a strict host task
+record. Issue and workpad prose never controls checkout, branch, ref, SHA,
+remote, credential, or process state.
 
-This repository keeps that machinery separate from the projects it operates on.
+Codex policy is defense in depth. The one supported structural backend is the
+Linux/WSL unshare namespace contract with mount, PID, network, and resource
+limits. The task has no tracker/publication credentials, operator CODEX_HOME,
+SSH agent, sibling workspace, host state, or arbitrary tool network.
 
-```text
-GitHub issue / labels / comments
-            |
-            v
-     host preparation
-            |
-            v
- isolated issue workspace
-            |
-            v
-   official OpenAI Symphony
-            |
-            v
-       Codex architect / orchestrator
-            |
-            v
- project-manager -> planner -> implementer
-             |
-      reviewer -> adversary
-             |
- licensed correction loops / archivist
-            |
-            v
- branch + draft PR + workpad -> human merge
-```
+## Current status
 
-The durable continuation boundary is GitHub state plus the remote issue branch and draft pull request. Local mutable workspaces are disposable execution state.
-
-## What it provides
-
-- **Project profiles** — non-secret TOML configuration for repository identity, labels, limits, Codex settings, and host integration; host namespaces derive from the project slug.
-- **Issue-scoped workspaces** — clean preparation for initial work and continuation from the authorized remote issue branch.
-- **Reviewed deployments** — atomic deployment directories with a `DEPLOYMENT.json` manifest recording the source artifacts that were deployed.
-- **Bounded role lifecycle** — generic project-manager, planner, implementer, reviewer, adversary, and archivist policies under one issue branch, draft PR, and workpad.
-- **Credential isolation** — project credentials live in host-side secret files and are not copied into Git, generated workflows, or Codex child environments.
-- **Operator lifecycle controls** — validate, deploy, test, start, inspect status, finish gracefully, stop when idle, or emergency-stop.
-- **Host integration** — WSL/Linux-native process state with optional Windows sleep inhibition and notifications.
-- **Recovery mechanics** — explicit recovery state and archives without treating a local workspace as durable truth.
-
-## What it deliberately does not own
-
-`symphony-pilot` is not a fork of Symphony and is not a project-architecture framework. Generic infrastructure here must not encode the target project's semantic policy, implementation architecture, phase authority, acceptance criteria, or domain-specific repair rules.
-
-The issue is the work order. The target repository is the authority for the work.
+Host-side admission, outbox, publication validation, branch-protection checks,
+runtime identity locks, and fail-closed containment gates are implemented.
+Unattended execution is intentionally blocked: the exact current Codex App
+Server authentication path has no proven way to keep its credential out of
+hostile tool children, and external execution routing has an observed host-local
+fallback. Do not replace this blocker with a same-user or prompt-only fallback.
 
 ## Requirements
 
-A deployment expects:
+- Python 3
+- Git
+- official OpenAI Symphony
+- official Codex
+- Linux/WSL with unprivileged user, mount, PID, and network namespaces
+- reviewed runtime lock and protected default branch
 
-- a working checkout of this repository;
-- Python 3;
-- Git and authenticated access to the target repository;
-- an installed/configured OpenAI Symphony runtime;
-- a Codex environment usable by Symphony;
-- any toolchain required by the target project's profile.
+Physical lifecycle operations run under WSL/Linux. Native Windows checks may
+validate profiles and dry-run deployment but must not fabricate WSL paths or
+mutate Linux state.
 
-The operational design is Linux-first. Registry validation and port allocation
-may run under native Windows Python; the read-only deployment dry-run may too.
-Actual deployment, lifecycle, secret access, and physical workspace/state
-operations must run from the WSL/Linux operator environment. Windows integration is limited to detected host tooling,
-notifications, and optional sleep inhibition; Windows `USERNAME` is never used
-as a WSL username.
+## Validation
 
-## Quick start
+    python3 -m unittest discover -s tests -v
+    python3 -m compileall -q runtime scripts tests
+    python3 scripts/validate_profile.py
+    python3 scripts/deploy.py --project cleanroom --dry-run
+    python3 scripts/project.py --project cleanroom start
 
-The tracked `projects/<slug>/profile.toml` files are the canonical registry. CLEANROOM and `symphony-canary` are concrete witnesses, not built-in architecture. For another project, add its profile directory without changing generic runtime policy.
+The start command must fail closed until the capability blocker is resolved.
+Run the original multi-role canary only after this repository is reviewed,
+cut over, credentials are rotated, branch protection is configured, runtime
+identities are pinned, and hostile-boundary probes pass.
 
-```bash
-# Validate the complete non-secret registry.
-python3 scripts/validate_profile.py
-
-# Provision the host-side credential referenced by the profile.
-python3 scripts/provision_secret.py --project cleanroom
-
-# Inspect, then perform, an atomic deployment.
-python3 scripts/deploy.py --project cleanroom --dry-run
-python3 scripts/deploy.py --project cleanroom
-
-# Exercise the source-checkout control surface against the generated deployment.
-python3 scripts/project.py --project cleanroom test
-python3 scripts/project.py --project cleanroom start
-python3 scripts/project.py --project cleanroom status
-
-# Normal end-of-session path: drain authorized work, then stop Symphony.
-python3 scripts/project.py --project cleanroom finish
-```
-
-`stop` refuses to terminate active work. `stop-now` is the emergency path.
-
-Before authorizing real work for a new project, run a harmless issue through the complete dispatch/workspace/multi-role/workpad/completion/cleanup lifecycle. The canary must verify that the deployed app-server actually loads and uses the named role policies; files and prompts alone are not proof of role execution. Reviewer and adversary isolation additionally require a harmless attempted sentinel mutation to be denied by the runtime; a voluntary no-edit is not sandbox evidence.
-
-## Repository layout
-
-```text
-docs/       architecture, operations, onboarding, security, and recovery
-projects/   non-secret per-project profiles
-runtime/    host-side preparation, workflow rendering, lifecycle hooks
-schemas/    machine-readable profile contracts
-scripts/    deployment and operator commands
-tests/      infrastructure regression tests
-workflow/   generic architect policy and role policies rendered into deployments
-workflow/agents/  generic Codex custom-agent policy sources
-```
-
-## Tests
-
-The infrastructure tests use Python's standard `unittest` runner:
-
-```bash
-python3 -m unittest tests.test_infrastructure
-```
-
-Lifecycle and security changes should carry focused regression coverage.
-
-## Security model
-
-Secrets do not belong in Git, project profiles, generated workflows, issue comments, workpads, logs, or recovery archives. Deployment and workspace preparation fail closed when required credentials, repositories, upstream state, toolchains, clean-worktree conditions, or publication preflight are unavailable.
-
-See [docs/SECURITY.md](docs/SECURITY.md) for the trust boundary.
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md)
-- [Operations](docs/OPERATIONS.md)
-- [Project onboarding](docs/PROJECT_ONBOARDING.md)
-- [Human onboarding contract](docs/HUMAN_ONBOARDING.md)
-- [Codex onboarding contract](docs/CODEX_ONBOARDING.md)
-- [Security](docs/SECURITY.md)
-- [Recovery](docs/RECOVERY.md)
-
-The upstream Symphony lifecycle specification remains authoritative for Symphony itself. This repository defines a reusable host-side policy and deployment layer around it.
-
-## Contributing
-
-Keep generic infrastructure generic. Project-specific meaning belongs in the target repository and issue, while trust-boundary or credential decisions that are not mechanically determined should be surfaced rather than guessed.
-
-## License
-
-Apache License 2.0. See [LICENSE](LICENSE).
+See docs/ARCHITECTURE.md, docs/SECURITY.md, docs/OPERATIONS.md,
+docs/HUMAN_ONBOARDING.md, docs/CODEX_ONBOARDING.md, and docs/RECOVERY.md.

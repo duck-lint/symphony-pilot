@@ -1,27 +1,19 @@
-# Security boundary
+# Security contract
 
-Tracker credentials are host-only. A profile contains a secret reference, never
-a token. The default path is:
+The threat model treats the model, task processes, issue content, workpad content, task filesystem, task Git metadata, and task outbox as hostile.
 
-    ~/.config/symphony-pilot/secrets/<profile>/<reference>
+Trusted host state is outside the task domain:
 
-The file must be a single-line 0600 file. Provision it out of band; do not
-commit it, print it, place it in a workflow, or put it in a workpad.
-The repository helper scripts/provision_secret.py reads the value with a
-hidden prompt and writes the directory/file permissions without shell history.
+- canonical project registry and deployment identity;
+- tracker and publication credentials;
+- server-derived base/default metadata;
+- task admission records, runtime locks, process state, and host logs;
+- branch-protection and publication preflight.
 
-Symphony receives the tracker token because it must read and update GitHub
-issues. The generated Codex launcher explicitly removes the tracker variables
-before sourcing the workspace toolchain fragment or starting App Server. SSH is
-the preferred source credential for
-repository clone/fetch/push. A tracker PAT is not used as ordinary Git
-authentication.
+The task has no tracker token, publication key, SSH agent, operator Codex home, operator history, recovery state, host logs, sibling workspaces, or arbitrary host network. Model-tool network is denied. App Server transport is a separate host concern and is not evidence that task tools may connect outward.
 
-The deployment excludes local Git metadata, secrets, and state. Logs are host
-artifacts and must be reviewed for accidental credential material. Recovery
-archives exclude .git and target; they are stored outside the execution
-workspace and contain a non-secret manifest.
+The inner Codex policy names only the contained current workspace and denies network access. The outer Linux/WSL unshare backend supplies the filesystem, PID, mount, network, and resource boundary. A live capability probe is required before execution.
 
-No global Git configuration is changed. WSL-native paths are required for
-repositories and workspaces. Windows paths may be selected dynamically for
-Cargo target output when a Windows Rust toolchain is the usable toolchain.
+Authentication is a separate boundary. An App Server credential must be data-plane specific and unrecoverable by hostile tools. The current accepted runtime has no proven broker/descriptor contract for that property, so the launcher fails closed before App Server start.
+
+Never use real secrets in denial probes. Use synthetic sentinels and verify that task tools cannot read host files, sibling workspaces, unrelated processes, credentials, sockets, or arbitrary network destinations.

@@ -20,9 +20,12 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "  active_states:", "    - open", "  terminal_states:", "    - closed",
         "polling:", f"  interval_ms: {profile.poll_interval_ms}",
         f"  max_retry_backoff_ms: {profile.max_retry_backoff_ms}",
+        # Symphony still needs the host workspace allocator. The Codex task
+        # domain is separately contained; its inner cwd is /workspace.
         "workspace:", f"  root: {profile.workspace_root}",
         "hooks:",
         "  after_create: |", f"    git clone --no-single-branch {shell(profile.git_remote)} .",
+        f"    exec python3 {shell(runtime / 'admit_task.py')} --profile {shell(profile_path)} --workspace \"$PWD\" --runtime-lock {shell(profile.state_root / 'runtime-lock.json')}",
         "  before_run: |", "    set -eu",
         f"    exec python3 {shell(runtime / 'prepare_workspace.py')} --profile {shell(profile_path)} --workspace \"$PWD\"",
         "  after_run: |", "    set -eu",
@@ -32,10 +35,9 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "agent:", f"  max_concurrent_agents: {profile.max_concurrent_agents}",
         f"  max_turns: {profile.max_turns}",
         "codex:", f"  command: {shell(runtime / 'launch_codex.sh')}",
-        "  approval_policy: never", "  thread_sandbox: workspace-write",
-        "  turn_sandbox_policy:", "    type: workspaceWrite",
-        "    writableRoots:", f"      - {profile.workspace_root}",
-        "    networkAccess: true",
+        "  approval_policy: never", "  thread_sandbox: external-sandbox",
+        "  turn_sandbox_policy:", "    type: externalSandbox",
+        "    networkAccess: restricted",
     ]
     lines += ["---", "", pathlib.Path(policy).read_text(encoding="utf-8").rstrip(), ""]
     return "\n".join(lines)

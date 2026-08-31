@@ -1,32 +1,9 @@
-# Recovery and one-time CLEANROOM cutover
+# Recovery
 
-Normal recovery remains issue-scoped and fail-closed. Preparation uses the selected project's derived workspace and state namespace. Recovery archives exclude Git metadata, target output, and secret-shaped paths recursively; excluded names are recorded without copying contents. Remote issue branches and draft PRs are the durable continuation boundary.
+Execution domains are disposable. Host task admission records, runtime locks, process identity, and host audit events are the durable machine authority. GitHub issues, the authoritative workpad comment, the derived branch, and the draft PR are durable lifecycle evidence.
 
-This architecture change does not mutate the existing host installation. After the merge, the operator should inspect running processes, the old deployment, logs, and any needed local state. Preserve anything required for audit before removal.
+On restart, validate the exact task record and runtime identities. If the task record is missing or malformed, require clean re-admission. Never import branch, base, SHA, credential, or process state from arbitrary workpad prose or local .git metadata.
 
-The old resolved CLEANROOM topology was:
+Do not migrate old role homes, temporary homes, task caches, stale workspaces, generated deployments, or recovery archives. Preserve a unique unpublished source artifact only through an explicitly host-approved narrow recovery format; it must exclude .git, credentials, sockets, devices, absolute escape paths, and task homes.
 
-```text
-profile deployment -> /home/duck-lint/symphony
-```
-
-The new topology is:
-
-```text
-profile deployment -> ~/.local/share/symphony-pilot/deployments/cleanroom
-workspace          -> ~/symphony-workspaces/cleanroom
-state              -> ~/.local/state/symphony-pilot/cleanroom
-logs               -> ~/.local/state/symphony-pilot/cleanroom/logs
-credentials        -> ~/.config/symphony-pilot/secrets/cleanroom/<reference>
-official binary    -> host PATH or explicit SYMPHONY_BIN
-```
-
-Manual cutover, only after inspecting/preserving old state:
-
-1. Confirm no old CLEANROOM Symphony process is running and preserve its logs or deployment if required by the operator.
-2. Install or identify the shared official executable and set `SYMPHONY_BIN` (or place `symphony` on `PATH`). Do not put it under a project deployment.
-3. Validate the merged registry and provision the existing CLEANROOM secret in its slug namespace if necessary.
-4. Deploy and test with `--project cleanroom`.
-5. Only after the new deployment passes, remove the obsolete `/home/duck-lint/symphony` deployment and any deliberately preserved legacy state. This repository does not perform that deletion.
-
-The canary is then onboarded by validating its profile, provisioning only its own secret namespace, deploying `--project symphony-canary`, and performing a separate harmless canary. This document does not authorize starting it.
+If containment, authentication, runtime identity, or branch protection cannot be proven, stop before task or tracker activity and report the concrete blocker.

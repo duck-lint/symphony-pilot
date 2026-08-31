@@ -33,6 +33,9 @@ from prepare_workspace import (
     state_namespace_for_slug,
 )
 from deployment_contract import contract_digest, deployment_identity
+from containment import ContainmentError, require_execution_capability
+from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
+from protection import ProtectionError, require_protected_default
 from project_registry import resolve_project
 
 
@@ -297,6 +300,31 @@ def active_issues(profile, token):
                     urllib.parse.quote(",".join(profile.dispatch_labels)) + "&per_page=100")
     return issues if isinstance(issues, list) else []
 
+
+def branch_protection_preflight(profile, token):
+    """Normalize GitHub metadata; unknown protection is an admission failure."""
+    repository = github(profile, token, "GET", "")
+    default = repository.get("default_branch") if isinstance(repository, dict) else None
+    if not isinstance(default, str) or not default:
+        raise ProtectionError("GitHub did not report the protected default branch")
+    protection = github(profile, token, "GET", "/branches/" + urllib.parse.quote(default, safe="") + "/protection")
+    if not isinstance(protection, dict):
+        raise ProtectionError("GitHub branch protection metadata is unavailable")
+    reviews = protection.get("required_pull_request_reviews")
+    bypass = protection.get("bypass_pull_request_allowances")
+    human_merge_actor = protection.get("human_merge_actor")
+    if not isinstance(human_merge_actor, str) or not human_merge_actor:
+        raise ProtectionError("GitHub metadata does not identify separate human merge authority")
+    automation_can_bypass = bool(
+        isinstance(bypass, dict) and any(bypass.get(key) for key in ("users", "teams", "apps"))
+    )
+    return require_protected_default({
+        "protected": True,
+        "required_pull_request": isinstance(reviews, dict),
+        "automation_can_bypass": automation_can_bypass,
+        "human_merge_actor": human_merge_actor,
+    }, "symphony-pilot")
+
 def project_name(profile):
     return profile.display_name or profile.slug
 
@@ -326,11 +354,31 @@ def start(profile):
     except PreparationError as exc:
         print(f"Cannot start Symphony: {exc}")
         return 1
+    # This gate runs before tracker credential acquisition or process launch.
+    # It is intentionally not a fallback to the old same-user architecture.
+    try:
+        require_execution_capability()
+    except ContainmentError as exc:
+        print(f"Cannot start Symphony: containment capability blocker: {exc}")
+        return 78
+    try:
+        binary = resolve_symphony_binary()
+        lock_path = require_physical_namespace(profile.state_root) / "runtime-lock.json"
+        lock = validate_lock(json.loads(lock_path.read_text(encoding="utf-8")))
+        verify_entry(lock["symphony"], identify(binary), "Symphony")
+    except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError) as exc:
+        print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
+        return 78
     try:
         token = read_secret(profile)
     except PreparationError as exc:
         print(f"Cannot start Symphony: {exc}")
         return 1
+    try:
+        branch_protection_preflight(profile, token)
+    except (ProtectionError, PreparationError) as exc:
+        print(f"Cannot start Symphony: protected default-branch preflight failed: {exc}")
+        return 78
     try:
         issues = active_issues(profile, token)
     except Exception as exc:
@@ -350,12 +398,6 @@ def start(profile):
     env["SYMPHONY_WORKFLOW"] = str(workflow)
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
-    try:
-        binary = resolve_symphony_binary()
-    except FileNotFoundError as exc:
-        release_awake_guard(profile)
-        print(f"Cannot start Symphony: {exc}. Install the shared host executable or set SYMPHONY_BIN.")
-        return 1
     log = log_path.open("ab")
     command = [binary, "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
                "--logs-root", str(profile.log_root)]
@@ -614,6 +656,13 @@ REQUIRED_DEPLOYMENT_FILES = (
     "runtime/process_identity.py",
     "runtime/launch_codex.sh",
     "runtime/deployment_contract.py",
+    "runtime/containment.py",
+    "runtime/task_admission.py",
+    "runtime/admit_task.py",
+    "runtime/outbox.py",
+    "runtime/protection.py",
+    "runtime/publication.py",
+    "runtime/runtime_lock.py",
     "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",
     "workflow/agents/project-manager.toml",

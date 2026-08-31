@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
-"""Preserve dirty execution state before a workspace is removed."""
+"""Straight-cutover workspace removal hook.
+
+Execution workspaces are disposable. The hook does not archive, reconcile, or
+import task-local state; only a host-admitted recovery artifact may survive,
+and that path is deliberately outside this hook.
+"""
 from __future__ import annotations
+
 import argparse
-import datetime as dt
-import json
 import pathlib
-import sys
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from prepare_workspace import (archive_recovery, git, issue_facts, load_profile,
-                                read_secret, reconcile_role_home)
+
+from prepare_workspace import load_profile
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", required=True, type=pathlib.Path)
     parser.add_argument("--workspace", required=True, type=pathlib.Path)
     args = parser.parse_args()
-    profile = load_profile(args.profile)
+    load_profile(args.profile)
     workspace = args.workspace.resolve()
-    reconcile_role_home(workspace)
-    status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False)
-    if not status:
+    if not workspace.is_dir():
         return 0
-    token = read_secret(profile)
-    facts = issue_facts(profile, workspace, token)
-    archive = archive_recovery(profile, workspace, facts, status)
-    print(json.dumps({"issue": facts.issue, "archive": str(archive),
-                      "created_utc": dt.datetime.now(dt.timezone.utc).isoformat()}, sort_keys=True))
+    # No model-generated workspace state is promoted or copied during removal.
+    print(f"symphony-pilot: disposable task workspace removed from lifecycle: {workspace.name}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

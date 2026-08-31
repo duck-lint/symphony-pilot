@@ -54,7 +54,7 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
                           "source_commit": source_commit,
                           "source_clean": not bool(source_status),
                           "role_policies": sorted(role_names),
-                          "files": 10 + len(ROLE_POLICY_FILES)}, sort_keys=True))
+                          "files": 17 + len(ROLE_POLICY_FILES)}, sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
@@ -67,7 +67,9 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         # intentionally absent from generated project deployments.
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
                      "host_integration.py", "process_identity.py", "launch_codex.sh",
-                     "deployment_contract.py"):
+                     "deployment_contract.py", "containment.py", "task_admission.py",
+                     "admit_task.py", "outbox.py", "protection.py", "publication.py",
+                     "runtime_lock.py"):
             shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
         shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
         for policy in ROLE_POLICY_FILES:
