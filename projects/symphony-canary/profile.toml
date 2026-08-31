@@ -2,6 +2,7 @@ slug = "symphony-canary"
 repository = "duck-lint/symphony-canary"
 git_remote = "git@github-symphony-canary:duck-lint/symphony-canary.git"
 secret_reference = "github.token"
+trusted_dispatchers = ["duck-lint"]
 dispatch_labels = ["symphony:auto"]
 blocked_label = "symphony:human"
 dashboard_port = 4041

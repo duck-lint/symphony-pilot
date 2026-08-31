@@ -47,6 +47,7 @@ class Profile:
     state_root: pathlib.PurePath
     log_root: pathlib.PurePath
     secret_reference: str
+    trusted_dispatchers: tuple[str, ...]
     dispatch_labels: tuple[str, ...]
     blocked_label: str
     service_identity: str
@@ -160,7 +161,7 @@ def load_profile(path: pathlib.Path) -> Profile:
 
     with path.open("rb") as stream:
         raw = tomllib.load(stream)
-    allowed = {"slug", "repository", "git_remote", "secret_reference", "dispatch_labels",
+    allowed = {"slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels",
                "blocked_label", "max_concurrent_agents", "max_turns", "poll_interval_ms",
                "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
                "prevent_host_sleep", "notifications_enabled", "display_name",
@@ -168,7 +169,7 @@ def load_profile(path: pathlib.Path) -> Profile:
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise PreparationError("profile", "unsupported profile fields: " + ",".join(unknown))
-    required = ["slug", "repository", "git_remote", "secret_reference", "dispatch_labels", "blocked_label",
+    required = ["slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels", "blocked_label",
                 "max_concurrent_agents", "max_turns", "dashboard_port",
                 "poll_interval_ms", "max_retry_backoff_ms", "codex_model",
                 "codex_reasoning_effort"]
@@ -182,6 +183,8 @@ def load_profile(path: pathlib.Path) -> Profile:
                 "display_name", "notification_backend"):
         if any(character in str(raw.get(key, "")) for character in ("\n", "\r", "\0")):
             raise PreparationError("profile", f"profile field {key} contains control characters")
+    if re.search(r"://[^/\s]+@|(?:token|password|secret|private[_-]?key)\s*[:=]", str(raw["git_remote"]), re.I):
+        raise PreparationError("profile", "git_remote must not contain embedded credentials")
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", str(raw["repository"])):
         raise PreparationError("profile", "repository must be an owner/name pair")
     forbidden_keys = {"token", "password", "credential", "secret", "pat", "api_key"}
@@ -192,6 +195,15 @@ def load_profile(path: pathlib.Path) -> Profile:
         raise PreparationError("profile", "the pilot permits exactly one concurrent agent")
     if not raw["dispatch_labels"]:
         raise PreparationError("profile", "at least one dispatch label is required")
+    if not isinstance(raw["trusted_dispatchers"], list):
+        raise PreparationError("profile", "trusted_dispatchers must be a list")
+    if not isinstance(raw["dispatch_labels"], list):
+        raise PreparationError("profile", "dispatch_labels must be a list")
+    dispatchers = tuple(str(actor) for actor in raw["trusted_dispatchers"])
+    if not dispatchers or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", actor) for actor in dispatchers):
+        raise PreparationError("profile", "trusted_dispatchers must contain valid non-empty GitHub logins")
+    if len(set(dispatchers)) != len(dispatchers):
+        raise PreparationError("profile", "trusted_dispatchers must not contain duplicates")
     dashboard_port = int(raw["dashboard_port"])
     if not DASHBOARD_PORT_MIN <= dashboard_port <= DASHBOARD_PORT_MAX:
         raise PreparationError(
@@ -210,6 +222,7 @@ def load_profile(path: pathlib.Path) -> Profile:
         state_root=pathlib.PurePosixPath(),
         log_root=pathlib.PurePosixPath(),
         secret_reference=str(raw["secret_reference"]),
+        trusted_dispatchers=dispatchers,
         dispatch_labels=tuple(str(label) for label in raw["dispatch_labels"]),
         blocked_label=str(raw["blocked_label"]),
         service_identity=f"symphony-pilot-{slug}",
@@ -244,6 +257,13 @@ def secret_path(profile: Profile) -> pathlib.PurePath:
     if reference.is_absolute() or ".." in reference.parts:
         raise PreparationError("secret_reference", "secret reference escapes its project boundary")
     return host_namespace_root() / ".config/symphony-pilot/secrets" / profile.slug / reference
+
+
+def publication_key_path(profile: Profile) -> pathlib.Path:
+    """Return the one deterministic host publication-key location."""
+    return require_physical_namespace(
+        host_namespace_root() / ".config/symphony-pilot/secrets" / profile.slug / "publication-ssh-key"
+    )
 
 
 def read_secret(profile: Profile) -> str:

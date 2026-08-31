@@ -26,8 +26,9 @@ tool network.
 
 ## Current status
 
-Host-side admission, outbox, publication validation, branch-protection checks,
-runtime identity locks, and fail-closed containment gates are implemented.
+Host-side admission, dispatch provenance, strict result brokering, sterile
+bundle publication, ruleset protection checks, runtime identity locks, and
+fail-closed containment gates are implemented and fixture-tested.
 Unattended execution is intentionally blocked: the exact current Codex App
 Server authentication path has no proven way to keep its credential out of
 hostile tool children, and external execution routing has an observed host-local
@@ -41,6 +42,7 @@ fallback. Do not replace this blocker with a same-user or prompt-only fallback.
 - official Codex
 - Linux/WSL with unprivileged user, mount, PID, and network namespaces
 - reviewed runtime lock and protected default branch
+- project-scoped publication deploy key at the derived host secret path
 
 Physical lifecycle operations run under WSL/Linux. Native Windows checks may
 validate profiles and dry-run deployment but must not fabricate WSL paths or
@@ -51,6 +53,7 @@ mutate Linux state.
     python3 -m unittest discover -s tests -v
     python3 -m compileall -q runtime scripts tests
     python3 scripts/validate_profile.py
+    python3 scripts/provision_publication_key.py --project cleanroom < publication-key.pem
     python3 scripts/deploy.py --project cleanroom --dry-run
     python3 scripts/project.py --project cleanroom start
 

@@ -14,6 +14,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from prepare_workspace import github, load_profile, read_secret, require_physical_namespace  # noqa: E402
+from dispatch_provenance import DispatchProvenanceError, fetch_all_events, prove_dispatch  # noqa: E402
 from runtime_lock import validate_lock  # noqa: E402
 from task_admission import ServerAdmission, create_task, read_task, task_state_path, write_task  # noqa: E402
 
@@ -35,7 +36,10 @@ def admit(profile_path: pathlib.Path, workspace: pathlib.Path, runtime_lock_path
             raise ValueError("existing task record belongs to another project")
         return state_path
 
-    lock = validate_lock(json.loads(runtime_lock_path.read_text(encoding="utf-8")))
+    lock_path = require_physical_namespace(runtime_lock_path.resolve())
+    if lock_path != require_physical_namespace(profile.state_root) / "runtime-lock.json":
+        raise ValueError("runtime lock must come from the project host state namespace")
+    lock = validate_lock(json.loads(lock_path.read_text(encoding="utf-8")))
     token = read_secret(profile)
     repository = github(profile, token, "GET", "")
     if not isinstance(repository, dict) or not isinstance(repository.get("default_branch"), str):
@@ -45,17 +49,25 @@ def admit(profile_path: pathlib.Path, workspace: pathlib.Path, runtime_lock_path
     base_sha = ((ref.get("object") or {}).get("sha") if isinstance(ref, dict) else None)
     if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
         raise ValueError("GitHub did not return a trusted default-branch HEAD")
+    issue_data = github(profile, token, "GET", f"/issues/{issue}")
+    if not isinstance(issue_data, dict):
+        raise ValueError("GitHub issue metadata is unavailable")
+    events = fetch_all_events(lambda page: github(
+        profile, token, "GET", f"/issues/{issue}/events?per_page=100&page={page}"))
+    try:
+        provenance = prove_dispatch(issue_data, events, profile.dispatch_labels, profile.trusted_dispatchers)
+    except DispatchProvenanceError as exc:
+        raise ValueError(f"dispatch provenance blocked: {exc}") from exc
     body = "<!-- symphony-workpad:v1 -->\n## Symphony Workpad\n\n"
     comment = github(profile, token, "POST", f"/issues/{issue}/comments", {"body": body})
     comment_id = comment.get("id") if isinstance(comment, dict) else None
     if not isinstance(comment_id, int) or comment_id < 1:
         raise ValueError("GitHub did not return the authoritative workpad comment id")
-    dispatcher = "symphony-pilot/host"
     record = create_task(ServerAdmission(
         repository=profile.repository,
         project_slug=profile.slug,
         issue_number=issue,
-        trusted_dispatcher=dispatcher,
+        dispatch_provenance=provenance,
         default_ref=default_ref,
         base_sha=base_sha.lower(),
         workpad_comment_id=comment_id,

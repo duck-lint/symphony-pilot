@@ -24,7 +24,7 @@ REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 BRANCH_PREFIX = "codex/gh-"
 TASK_FIELDS = {
     "schema", "repository", "project_slug", "issue_number", "task_id",
-    "trusted_dispatcher", "default_ref", "base_sha", "issue_branch",
+    "dispatch_provenance", "default_ref", "base_sha", "issue_branch",
     "workpad_comment_id", "published_head", "draft_pr", "runtime_identity",
     "admitted_utc",
 }
@@ -39,7 +39,7 @@ class ServerAdmission:
     repository: str
     project_slug: str
     issue_number: int
-    trusted_dispatcher: str
+    dispatch_provenance: list[dict[str, object]]
     default_ref: str
     base_sha: str
     workpad_comment_id: int
@@ -83,8 +83,19 @@ def validate_task_record(value: object) -> dict[str, object]:
     task_id = value["task_id"]
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
         raise TaskAdmissionError("task id is invalid")
-    if not isinstance(value["trusted_dispatcher"], str) or not value["trusted_dispatcher"]:
-        raise TaskAdmissionError("trusted dispatcher is invalid")
+    provenance = value["dispatch_provenance"]
+    if not isinstance(provenance, list) or not provenance:
+        raise TaskAdmissionError("dispatch provenance is missing")
+    labels = set()
+    for item in provenance:
+        if not isinstance(item, dict) or set(item) != {"label", "actor", "event_id", "created_at"}:
+            raise TaskAdmissionError("dispatch provenance entry is invalid")
+        if (not isinstance(item["label"], str) or not item["label"] or item["label"] in labels or
+                not isinstance(item["actor"], str) or not item["actor"] or
+                not isinstance(item["event_id"], int) or isinstance(item["event_id"], bool) or item["event_id"] < 1 or
+                not isinstance(item["created_at"], str) or not item["created_at"]):
+            raise TaskAdmissionError("dispatch provenance entry is invalid")
+        labels.add(item["label"])
     default_ref = _validate_ref(value["default_ref"], "default ref")
     base_sha = _validate_sha(value["base_sha"], "base SHA")
     branch = _validate_ref(value["issue_branch"], "issue_branch")
@@ -156,7 +167,7 @@ def create_task(admission: ServerAdmission, *, task_id: str | None = None) -> di
         "project_slug": admission.project_slug,
         "issue_number": admission.issue_number,
         "task_id": task_id,
-        "trusted_dispatcher": admission.trusted_dispatcher,
+        "dispatch_provenance": admission.dispatch_provenance,
         "default_ref": admission.default_ref,
         "base_sha": admission.base_sha,
         "issue_branch": branch,

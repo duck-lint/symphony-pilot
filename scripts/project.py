@@ -35,7 +35,7 @@ from prepare_workspace import (
 from deployment_contract import contract_digest, deployment_identity
 from containment import ContainmentError, backend_identity, require_execution_capability
 from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
-from protection import ProtectionError, require_protected_default
+from rulesets import RulesetError, fetch_all_rulesets, fetch_ruleset_details, require_default_branch_ruleset
 from project_registry import resolve_project
 
 
@@ -302,28 +302,16 @@ def active_issues(profile, token):
 
 
 def branch_protection_preflight(profile, token):
-    """Normalize GitHub metadata; unknown protection is an admission failure."""
+    """Require the one supported real GitHub repository-ruleset contract."""
     repository = github(profile, token, "GET", "")
     default = repository.get("default_branch") if isinstance(repository, dict) else None
     if not isinstance(default, str) or not default:
-        raise ProtectionError("GitHub did not report the protected default branch")
-    protection = github(profile, token, "GET", "/branches/" + urllib.parse.quote(default, safe="") + "/protection")
-    if not isinstance(protection, dict):
-        raise ProtectionError("GitHub branch protection metadata is unavailable")
-    reviews = protection.get("required_pull_request_reviews")
-    bypass = protection.get("bypass_pull_request_allowances")
-    human_merge_actor = protection.get("human_merge_actor")
-    if not isinstance(human_merge_actor, str) or not human_merge_actor:
-        raise ProtectionError("GitHub metadata does not identify separate human merge authority")
-    automation_can_bypass = bool(
-        isinstance(bypass, dict) and any(bypass.get(key) for key in ("users", "teams", "apps"))
-    )
-    return require_protected_default({
-        "protected": True,
-        "required_pull_request": isinstance(reviews, dict),
-        "automation_can_bypass": automation_can_bypass,
-        "human_merge_actor": human_merge_actor,
-    }, "symphony-pilot")
+        raise RulesetError("GitHub did not report the protected default branch")
+    summaries = fetch_all_rulesets(lambda page: github(
+        profile, token, "GET", f"/rulesets?includes_parents=true&per_page=100&page={page}"))
+    rulesets = fetch_ruleset_details(summaries, lambda ruleset_id: github(
+        profile, token, "GET", f"/rulesets/{ruleset_id}?includes_parents=true"))
+    return require_default_branch_ruleset(rulesets, default)
 
 def project_name(profile):
     return profile.display_name or profile.slug
@@ -382,7 +370,7 @@ def start(profile):
         return 1
     try:
         branch_protection_preflight(profile, token)
-    except (ProtectionError, PreparationError) as exc:
+    except (RulesetError, PreparationError) as exc:
         print(f"Cannot start Symphony: protected default-branch preflight failed: {exc}")
         return 78
     try:
@@ -657,6 +645,7 @@ REQUIRED_DEPLOYMENT_FILES = (
     "profile.toml",
     "runtime/prepare_workspace.py",
     "runtime/after_run.py",
+    "runtime/broker.py",
     "runtime/before_remove.py",
     "runtime/host_integration.py",
     "runtime/process_identity.py",
@@ -666,7 +655,7 @@ REQUIRED_DEPLOYMENT_FILES = (
     "runtime/task_admission.py",
     "runtime/admit_task.py",
     "runtime/outbox.py",
-    "runtime/protection.py",
+    "runtime/rulesets.py",
     "runtime/publication.py",
     "runtime/runtime_lock.py",
     "workflow/architect_policy.md",

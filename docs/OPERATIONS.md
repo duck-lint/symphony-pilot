@@ -4,13 +4,14 @@ All physical lifecycle operations run in the WSL/Linux operator environment. Nat
 
 ## Before start
 
-1. Validate the complete project registry.
-2. Deploy from a clean reviewed source checkout.
-3. Pin and review the official Symphony, Codex, and unshare executable identities with scripts/pin_runtime.py --project <slug>.
-4. Configure and verify protected default-branch metadata.
-5. Run the containment capability and hostile-fixture probes.
+1. Validate the complete project registry, including `trusted_dispatchers`.
+2. Provision the API-only tracker token and derived publication deploy key.
+3. Deploy from a clean reviewed source checkout.
+4. Pin and review the official Symphony, Codex, and unshare executable identities with scripts/pin_runtime.py --project <slug>.
+5. Configure one active GitHub repository ruleset targeting `~DEFAULT_BRANCH`, with a `pull_request` rule and no `bypass_actors`.
+6. Run the real WSL namespace constructor and hostile-fixture probes.
 
-start verifies deployment coherence, containment capability, runtime lock, credentials, branch protection, and dispatch cardinality before launching a process. Any failed check is an infrastructure block; no old execution path is selected.
+start verifies deployment coherence, runtime lock, containment capability, credentials, real ruleset protection, and dispatch cardinality before launching a process. Any failed check is an infrastructure block; no old execution path is selected.
 
 ## Ordinary controls
 
@@ -43,7 +44,9 @@ Never print or copy credential contents.
 REGENERATE: deployments, runtime locks, host task records, process state, logs,
 and fresh execution domains from the reviewed source and accepted registry.
 
-CONFIGURE REMOTELY: protect the default branch of every registered repository;
-require pull requests, deny automation bypass, allow automation to publish only
-derived issue branches, and keep human merge authority separate. Configure
-these settings before canary admission.
+CONFIGURE REMOTELY: protect the default branch of every registered repository
+with one active repository ruleset whose `conditions.ref_name.include` targets
+`~DEFAULT_BRANCH`, whose `rules` contains `{"type":"pull_request"}`, and whose
+`bypass_actors` is empty. The publication deploy key may push only derived issue
+branches; it has no Issues/PR API or merge authority. Configure these settings
+before canary admission and leave human merge as an explicit GitHub action.

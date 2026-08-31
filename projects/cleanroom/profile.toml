@@ -2,6 +2,7 @@ slug = "cleanroom"
 repository = "duck-lint/CLEANROOM"
 git_remote = "git@github-cleanroom:duck-lint/CLEANROOM.git"
 secret_reference = "github.token"
+trusted_dispatchers = ["duck-lint"]
 dispatch_labels = ["symphony:auto"]
 blocked_label = "symphony:human"
 dashboard_port = 4040

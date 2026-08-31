@@ -74,6 +74,10 @@ export CODEX_HOME="$TASK_CODEX_HOME"
 # external-sandbox routing do not provide the proven credential boundary the
 # project requires. Do not replace this with direct codex app-server or a
 # same-user fallback.
+"$PYTHON_BIN" "$SCRIPT_DIR/containment.py" --synthetic-fixture || {
+  echo "symphony-pilot: Codex execution blocked; authentication/containment capability is unproven" >&2
+  exit 78
+}
 "$PYTHON_BIN" "$SCRIPT_DIR/containment.py" || {
   echo "symphony-pilot: Codex execution blocked; authentication/containment capability is unproven" >&2
   exit 78
