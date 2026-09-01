@@ -238,7 +238,9 @@ python3 -c 'while True: pass'
 
 def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace: pathlib.Path,
                         home: pathlib.Path, inbox: pathlib.Path, outbox: pathlib.Path,
-                        fixture: pathlib.Path, host_pid: int, *, cpu_seconds: int | None = None) -> list[str]:
+                        fixture: pathlib.Path, host_pid: int, *, cpu_seconds: int | None = None,
+                        processes: int | None = None, address_space_bytes: int | None = None,
+                        file_size_bytes: int | None = None) -> list[str]:
     """Construct the reviewed task domain and expose only declared mounts.
 
     The caller supplies task-owned staging directories; no operator home,
@@ -248,8 +250,13 @@ def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace
     empty until a concrete runtime dependency is reviewed.
     """
     cpu_seconds = cpu_seconds if cpu_seconds is not None else DEFAULT_LIMITS["cpu_seconds"]
-    if not isinstance(cpu_seconds, int) or cpu_seconds < 1:
-        raise ContainmentError("task_domain_limits", "CPU limit must be a positive integer")
+    processes = processes if processes is not None else DEFAULT_LIMITS["processes"]
+    address_space_bytes = (address_space_bytes if address_space_bytes is not None
+                           else DEFAULT_LIMITS["address_space_bytes"])
+    file_size_bytes = file_size_bytes if file_size_bytes is not None else DEFAULT_LIMITS["file_size_bytes"]
+    if any(not isinstance(value, int) or value < 1
+           for value in (cpu_seconds, processes, address_space_bytes, file_size_bytes)):
+        raise ContainmentError("task_domain_limits", "task resource limits must be positive integers")
     setup = [
         "set -eu",
         f"mount -t tmpfs -o size=64m,nosuid,nodev tmpfs {shlex.quote(str(root))}",
@@ -274,7 +281,8 @@ def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace
         f"touch {shlex.quote(str(root / 'dev/null'))}",
         f"mount --bind /dev/null {shlex.quote(str(root / 'dev/null'))}",
         f"mount -t proc proc {shlex.quote(str(root / 'proc'))}",
-        f"prlimit --pid $$ --nproc=32 --as=2147483648 --cpu={cpu_seconds} --nofile=4096 --fsize=1048576",
+        f"prlimit --pid $$ --nproc={processes} --as={address_space_bytes} "
+        f"--cpu={cpu_seconds} --nofile={DEFAULT_LIMITS['open_files']} --fsize={file_size_bytes}",
         f"HOST_PID={host_pid} chroot {shlex.quote(str(root))} /bin/sh /fixture/hostile.sh",
     ]
     return [identity.executable, "--user", "--map-root-user", "--mount", "--pid",
@@ -302,7 +310,7 @@ def run_synthetic_hostile_fixture() -> dict[str, object]:
         fixture.write_text(_fixture_script(), encoding="utf-8")
         fixture.chmod(0o500)
         command = task_domain_command(identity, root, workspace, home, inbox, outbox,
-                                       fixture, os.getpid())
+                                       fixture, os.getpid(), processes=32)
         result = run_task_domain(command, wall_seconds=45)
         if result.timed_out:
             raise ContainmentError("synthetic_fixture", "normal task-domain fixture unexpectedly timed out")
@@ -327,7 +335,7 @@ def run_synthetic_hostile_fixture() -> dict[str, object]:
         teardown_fixture.chmod(0o500)
         teardown_command = task_domain_command(identity, teardown_root, teardown_workspace,
                                                 teardown_home, teardown_inbox, teardown_outbox,
-                                                teardown_fixture, os.getpid(), cpu_seconds=5)
+                                                teardown_fixture, os.getpid(), cpu_seconds=5, processes=32)
         sentinel = teardown_workspace / "descendant-sentinel"
         import time
         for _ in range(2):
@@ -351,7 +359,8 @@ def run_synthetic_hostile_fixture() -> dict[str, object]:
         cpu_fixture.write_text(_cpu_fixture_script(), encoding="utf-8")
         cpu_fixture.chmod(0o500)
         cpu_command = task_domain_command(identity, cpu_root, cpu_workspace, cpu_home,
-                                           cpu_inbox, cpu_outbox, cpu_fixture, os.getpid(), cpu_seconds=1)
+                                           cpu_inbox, cpu_outbox, cpu_fixture, os.getpid(),
+                                           cpu_seconds=1, processes=32)
         cpu = run_task_domain(cpu_command, wall_seconds=10)
         if cpu.timed_out or cpu.returncode == 0:
             raise ContainmentError("synthetic_fixture", "CPU limit did not bound the busy-loop fixture")
@@ -359,11 +368,13 @@ def run_synthetic_hostile_fixture() -> dict[str, object]:
             "workspace_writable": True, "inbox_read_only": True, "outbox_writable": True,
             "hostile_denials": "passed", "normal_completion": True,
             "wall_timeout": {"bound_seconds": 1, "supervisor_reaped": True, "descendant_stopped": True},
-            "cpu_bound": True, "resource_limits": {
-                "processes": 32, "address_space_bytes": 134217728, "cpu_seconds": 300,
-                "open_files": 4096, "file_size_bytes": 1048576,
-                "tmpfs_bytes": 8 * 1024 * 1024, "wall_seconds": DEFAULT_LIMITS["wall_seconds"],
-                "aggregate_workspace_disk_bytes": None,
+            "cpu_bound": {"production_seconds": DEFAULT_LIMITS["cpu_seconds"], "probe_seconds": 1},
+            "resource_limits": {
+                "fixture": {"processes": 32, "address_space_bytes": 134217728,
+                            "open_files": 4096, "file_size_bytes": 1048576,
+                            "tmpfs_bytes": 8 * 1024 * 1024,
+                            "wall_seconds": 1},
+                "production": {**resource_limits(), "aggregate_workspace_disk_bytes": None},
             }}
 
 
