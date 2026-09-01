@@ -62,43 +62,49 @@ def ingest_bundle(path: pathlib.Path) -> Iterator[pathlib.Path]:
     # O_NONBLOCK is material for the rejected FIFO case: validation must not
     # wait for a hostile writer before fstat can identify the object type.
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        source_fd = os.open(path, flags)
-    except OSError as exc:
-        raise PublicationError("fixed publication bundle cannot be opened without following a symlink") from exc
+    source_fd: int | None = None
     staged: pathlib.Path | None = None
     try:
-        before = os.fstat(source_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise PublicationError("fixed publication bundle is not a regular file")
-        if before.st_size > MAX_BUNDLE_BYTES:
-            raise PublicationError("publication bundle exceeds the host size bound")
-        with tempfile.NamedTemporaryFile(prefix="symphony-pilot-bundle-", delete=False) as target:
-            staged = pathlib.Path(target.name)
-            os.chmod(staged, 0o600)
-            remaining = before.st_size
-            while remaining:
-                chunk = os.read(source_fd, min(1024 * 1024, remaining))
-                if not chunk:
-                    raise PublicationError("publication bundle changed during bounded ingestion")
-                target.write(chunk)
-                remaining -= len(chunk)
-            target.flush()
-            os.fsync(target.fileno())
-        after = os.fstat(source_fd)
-        if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)):
-            raise PublicationError("publication bundle changed during bounded ingestion")
-    except PublicationError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise PublicationError("fixed publication bundle ingestion failed") from exc
-    finally:
-        os.close(source_fd)
-    try:
-        assert staged is not None
+        try:
+            source_fd = os.open(path, flags)
+        except OSError as exc:
+            raise PublicationError("fixed publication bundle cannot be opened without following a symlink") from exc
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise PublicationError("fixed publication bundle is not a regular file")
+            if before.st_size > MAX_BUNDLE_BYTES:
+                raise PublicationError("publication bundle exceeds the host size bound")
+            with tempfile.NamedTemporaryFile(prefix="symphony-pilot-bundle-", delete=False) as target:
+                staged = pathlib.Path(target.name)
+                os.chmod(staged, 0o600)
+                remaining = before.st_size
+                while remaining:
+                    chunk = os.read(source_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise PublicationError("publication bundle changed during bounded ingestion")
+                    target.write(chunk)
+                    remaining -= len(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            after = os.fstat(source_fd)
+            if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
+                    (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)):
+                raise PublicationError("publication bundle changed during bounded ingestion")
+        except PublicationError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise PublicationError("fixed publication bundle ingestion failed") from exc
+        finally:
+            if source_fd is not None:
+                fd, source_fd = source_fd, None
+                os.close(fd)
+        if staged is None:
+            raise PublicationError("fixed publication bundle staging failed")
         yield staged
     finally:
+        # This outer cleanup also covers failures after the host temp path is
+        # created but before the context manager reaches its yield point.
         if staged is not None:
             staged.unlink(missing_ok=True)
 
