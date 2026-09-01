@@ -82,6 +82,84 @@ class ControlDatabaseTests(unittest.TestCase):
         with self.assertRaises(control_db.SchemaError):
             control_db.open_database(partial_path)
 
+    def test_schema_validation_rejects_missing_foreign_key_and_index_semantics(self):
+        self.database.close()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("ALTER TABLE workpads RENAME TO workpads_original")
+            connection.execute(
+                "CREATE TABLE workpads (task_id TEXT PRIMARY KEY, body TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO workpads SELECT * FROM workpads_original")
+            connection.execute("DROP TABLE workpads_original")
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(control_db.SchemaError):
+            control_db.open_database(self.database_path)
+
+        # Recreate a valid disposable database, then remove a required index
+        # without changing user_version or schema_migrations.
+        self.database_path.unlink(missing_ok=True)
+        with control_db.open_database(self.database_path) as database:
+            database.connection.execute("DROP INDEX tasks_project_state_idx")
+        with self.assertRaises(control_db.SchemaError):
+            control_db.open_database(self.database_path)
+
+    def test_schema_validation_rejects_unexpected_trigger_and_corrupt_fk_data(self):
+        self.database.close()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER unexpected_persistent_trigger
+                AFTER INSERT ON tasks
+                BEGIN
+                    SELECT 1;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(control_db.SchemaError):
+            control_db.open_database(self.database_path)
+
+        self.database_path.unlink(missing_ok=True)
+        with control_db.open_database(self.database_path) as database:
+            database.close()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, 'orphan', 1, ?)",
+                ("99999999-9999-9999-9999-999999999999", self.BASE_TIME),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(control_db.SchemaError):
+            control_db.open_database(self.database_path)
+
+    def test_schema_validation_rejects_sqlite_integrity_corruption(self):
+        self.database.close()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            table_root = connection.execute(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+            ).fetchone()[0]
+            connection.execute("PRAGMA writable_schema = ON")
+            connection.execute(
+                "UPDATE sqlite_master SET rootpage = ? WHERE type = 'index' AND name = 'tasks_project_state_idx'",
+                (table_root,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(control_db.SchemaError):
+            control_db.open_database(self.database_path)
+
     def test_task_identifier_allocation_and_database_uniqueness(self):
         first = self.task(task_id="11111111-1111-1111-1111-111111111111")
         second = self.task(task_id="22222222-2222-2222-2222-222222222222")
@@ -176,6 +254,14 @@ class ControlDatabaseTests(unittest.TestCase):
     def test_blocker_and_optional_publication_lifecycle(self):
         task = self.task()
         self.assertIsNone(self.database.read_publication(task["id"]))
+        project_blocker = self.database.record_blocker(
+            task_id=task["id"], kind="project", body="Project decision is pending", created_at=self.BASE_TIME
+        )
+        self.assertEqual(project_blocker["kind"], "project")
+        self.assertNotIn(
+            "human_blocked",
+            [event["event_type"] for event in self.database.list_events(task["id"])],
+        )
         blocker = self.database.record_blocker(
             task_id=task["id"], kind="infrastructure", body="WSL capability unavailable", created_at=self.BASE_TIME
         )
@@ -191,17 +277,81 @@ class ControlDatabaseTests(unittest.TestCase):
         with self.assertRaises(control_db.StateConflict):
             self.database.resolve_blocker(blocker["id"])
 
+        self.database.update_heads(task["id"], current_head=self.BASE_SHA, updated_at=self.BASE_TIME)
         publication = self.database.record_publication(
             task_id=task["id"], publication_status="published", head_sha=self.BASE_SHA,
             remote_branch="codex/task", github_pr_number=7,
             published_at="2026-08-31T12:02:00+00:00",
         )
         self.assertEqual(publication["github_pr_number"], 7)
+        self.assertEqual(publication["head_sha"], self.BASE_SHA)
+        self.assertEqual(self.database.read_task(task["id"])["published_head"], self.BASE_SHA)
         with self.assertRaises(sqlite3.IntegrityError):
             self.database.connection.execute(
                 "INSERT INTO publications(task_id, publication_status) VALUES (?, 'started')",
                 ("99999999-9999-9999-9999-999999999999",),
             )
+
+    def test_publication_head_must_match_current_head_and_rolls_back(self):
+        task = self.task()
+        current_head = "b" * 40
+        unrelated_head = "c" * 40
+        self.database.update_heads(task["id"], current_head=current_head, updated_at=self.BASE_TIME)
+
+        with self.assertRaises(control_db.StateConflict):
+            self.database.record_publication(
+                task_id=task["id"], publication_status="published", head_sha=unrelated_head,
+                published_at="2026-08-31T12:01:00+00:00",
+            )
+        self.assertIsNone(self.database.read_publication(task["id"]))
+        self.assertIsNone(self.database.read_task(task["id"])["published_head"])
+        self.assertNotIn("publication_finished", [event["event_type"] for event in self.database.list_events(task["id"])])
+
+        self.database.connection.execute(
+            """
+            CREATE TRIGGER reject_publication_finished
+            BEFORE INSERT ON task_events
+            WHEN NEW.event_type = 'publication_finished'
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic publication failure');
+            END
+            """
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.database.record_publication(
+                task_id=task["id"], publication_status="published", head_sha=current_head,
+                published_at="2026-08-31T12:02:00+00:00",
+            )
+        self.assertIsNone(self.database.read_publication(task["id"]))
+        self.assertIsNone(self.database.read_task(task["id"])["published_head"])
+        self.assertNotIn("publication_finished", [event["event_type"] for event in self.database.list_events(task["id"])])
+
+    def test_head_updates_preserve_omitted_publication_projection_and_suppress_noop(self):
+        task = self.task()
+        first_head = "b" * 40
+        second_head = "c" * 40
+        self.database.update_heads(task["id"], current_head=first_head, updated_at=self.BASE_TIME)
+        self.database.record_publication(
+            task_id=task["id"], publication_status="published", head_sha=first_head,
+            published_at="2026-08-31T12:01:00+00:00",
+        )
+        event_count = len(self.database.list_events(task["id"]))
+        published_task = self.database.read_task(task["id"])
+        self.assertEqual(
+            self.database.update_heads(task["id"], current_head=second_head, updated_at="2026-08-31T12:02:00+00:00")["published_head"],
+            first_head,
+        )
+        changed = self.database.read_task(task["id"])
+        event_count = len(self.database.list_events(task["id"]))
+        self.assertEqual(
+            self.database.update_heads(task["id"], current_head=second_head, updated_at="2026-08-31T12:03:00+00:00"),
+            changed,
+        )
+        self.assertEqual(len(self.database.list_events(task["id"])), event_count)
+        self.assertEqual(changed["updated_at"], "2026-08-31T12:02:00+00:00")
+        self.assertNotEqual(published_task["updated_at"], changed["updated_at"])
+        with self.assertRaises(control_db.StateConflict):
+            self.database.update_heads(task["id"], current_head=second_head, published_head=None)
 
     def test_events_and_compare_and_set_transition_are_atomic(self):
         task = self.task()
@@ -264,12 +414,16 @@ class ControlDatabaseTests(unittest.TestCase):
         self.database.backup_to(backup_path)
         self.assertTrue(backup_path.is_file())
         self.assertEqual(control_db.inspect_schema_version(backup_path), 1)
+        backup_bytes = backup_path.read_bytes()
 
         self.task(task_id="33333333-3333-3333-3333-333333333333")
+        with self.assertRaises(control_db.ControlPlaneError):
+            control_db.ControlPlaneDatabase.restore_from(backup_path, self.database_path, replace=True)
         self.database.close()
         with self.assertRaises(FileExistsError):
             control_db.ControlPlaneDatabase.restore_from(backup_path, self.database_path)
         control_db.ControlPlaneDatabase.restore_from(backup_path, self.database_path, replace=True)
+        self.assertEqual(backup_path.read_bytes(), backup_bytes)
         with control_db.open_database(self.database_path) as restored:
             self.assertEqual([task["identifier"] for task in restored.list_tasks()], ["T-000001"])
             self.assertEqual(restored.read_workpad(first["id"])["body"], "durable workpad")

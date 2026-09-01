@@ -50,10 +50,10 @@ already been cut over.
 The schema is version `1`, stored in SQLite `PRAGMA user_version`, with the
 deterministic migration identity `control-plane-v1` in `schema_migrations`.
 An absent database is created and migrated transactionally. A newer version,
-partial migration, missing table/column, unexpected table, or invalid
+partial migration, missing table/column, unexpected persistent object, or invalid
 migration history fails closed. Reopening an accepted database is idempotent.
 
-Every connection explicitly enables:
+Every writable connection explicitly enables:
 
 ```text
 PRAGMA foreign_keys = ON
@@ -63,6 +63,16 @@ PRAGMA busy_timeout = 5000
 
 The database file is mode `0600` and its containing state directory is mode
 `0700` where the host filesystem supports those permissions.
+
+Schema validation is stronger than migration-history validation. On every open,
+backup validation, and restore validation, pilot checks the persistent object
+set, table columns, the deterministic physical-schema signature generated from
+the checked-in migration, expected index names/columns/uniqueness, foreign-key
+definitions (including paired composite provenance keys), migration rows, and
+foreign-key enforcement. It also runs SQLite `PRAGMA integrity_check` and
+`PRAGMA foreign_key_check`. Persistent views, triggers, indexes, or tables not
+in the v1 contract fail closed even if `user_version` and `schema_migrations`
+still claim v1.
 
 ## Relational domain
 
@@ -129,14 +139,55 @@ The intentionally small `ControlPlaneDatabase` API supports:
 the current relational projection. Agent stdout remains payload and is not
 event authority.
 
+### HEAD and publication authority
+
+`tasks.current_head` is the latest host-accepted task HEAD. `tasks.published_head`
+is the last successful publication HEAD and is a projection maintained by the
+successful `record_publication()` operation; it is not independently writable
+through `update_heads()`. `publications.head_sha` is the HEAD named by the
+current/last publication record. When a publication is marked `published`, its
+HEAD must equal `tasks.current_head`, and that publication row plus
+`tasks.published_head` plus `publication_finished` are committed in one
+transaction. An in-progress or failed publication may name a candidate HEAD
+without changing the last successful `published_head`.
+
+Changing `current_head` does not rewrite the last successful `published_head`.
+Omitting a HEAD argument preserves its current value; explicit `None` clears
+`current_head`, while `published_head` cannot be cleared or rewritten through
+`update_heads()` because publication is its authority. A genuine no-op does not
+change `updated_at` or append `head_changed`.
+
+The database prevents these cross-table contradictions at the persistence
+operation boundary. Authorization for whether a HEAD is ready to publish,
+whether review/adversary/final validation has been satisfied, and whether
+publication is permissible remains host/orchestrator policy.
+
+### Blocker event semantics
+
+`blockers.kind` preserves the three distinct values `human`, `project`, and
+`infrastructure`. v1 records `human_blocked` only for a human blocker and
+`infrastructure_blocked` only for an infrastructure blocker. A project blocker
+is persisted without a blocked task-state/event mapping because Step 2 does not
+license a `PROJECT_BLOCKED` scheduler state or a truthful existing event type.
+The later lifecycle step must define that mapping explicitly; project blockers
+must not be relabeled as human blockers.
+
 ## Backup and restore
 
 `ControlPlaneDatabase.backup_to()` uses SQLite's online backup API to make a
 coherent snapshot, validates the snapshot, and atomically publishes it to the
-requested destination. `restore_from()` validates the source, copies it with
-the same SQLite backup mechanism into a temporary sibling, validates the
-temporary database, and replaces the destination only when the caller passes
-the explicit `replace=True` flag. A live-file copy is not the backup contract.
+requested destination. `restore_from()` requires the destination to be offline:
+pilot tracks open control-plane handles and refuses replacement while any such
+handle is live. The caller must explicitly pass `replace=True`; after the
+offline precondition is met, restore opens the backup read-only, validates it,
+copies it with SQLite's backup API into a temporary sibling, validates the
+temporary database, and atomically replaces the destination. A live-file copy
+or an informal “remember to close it first” convention is not the contract.
+
+There was no durable non-test `~/.local/state/symphony-pilot/control.sqlite3`
+in the inspected WSL host state root when this correction was made. Therefore
+the physical-schema and authority corrections modify schema v1 in place; no
+compatibility migration was added for disposable pre-acceptance test state.
 
 ## Deferred boundaries
 

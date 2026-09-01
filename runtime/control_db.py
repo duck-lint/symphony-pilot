@@ -11,6 +11,8 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime as dt
+import functools
+import hashlib
 import json
 import os
 import pathlib
@@ -82,6 +84,8 @@ UUID_RE = re.compile(
 IDENTIFIER_RE = re.compile(r"^T-[0-9]{6}$")
 PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_UNSET = object()
+_OPEN_DATABASE_PATHS: dict[pathlib.Path, int] = {}
 
 
 class ControlPlaneError(RuntimeError):
@@ -409,6 +413,45 @@ EXPECTED_TABLE_COLUMNS = {
     "task_events": {"id", "task_id", "event_type", "role_run_id", "payload_json", "occurred_at"},
 }
 
+EXPECTED_INDEXES = {
+    "tasks_project_state_idx": ("tasks", False, ("project_slug", "state")),
+    "tasks_updated_idx": ("tasks", False, ("updated_at",)),
+    "role_runs_task_idx": ("role_runs", False, ("task_id", "role", "round")),
+    "findings_task_status_idx": ("findings", False, ("task_id", "status")),
+    "blockers_task_status_idx": ("blockers", False, ("task_id", "status")),
+    "task_events_task_time_idx": ("task_events", False, ("task_id", "occurred_at", "id")),
+    "task_events_type_idx": ("task_events", False, ("event_type",)),
+}
+
+EXPECTED_UNIQUE_INDEX_COLUMNS = {
+    # INTEGER PRIMARY KEY is rowid-backed and therefore has no index entry.
+    "schema_migrations": {("identity",)},
+    "tasks": {("id",), ("identifier",)},
+    "workpads": {("task_id",)},
+    "role_runs": {("id",), ("id", "task_id"), ("task_id", "role", "round")},
+    "findings": {("id",)},
+    "blockers": {("id",)},
+    "publications": {("task_id",)},
+    "task_events": {("id",)},
+}
+
+EXPECTED_FOREIGN_KEYS = {
+    "schema_migrations": set(),
+    "tasks": set(),
+    "workpads": {(('task_id',), "tasks", ("id",), "NO ACTION", "CASCADE", "NONE")},
+    "role_runs": {(('task_id',), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE")},
+    "findings": {
+        (("task_id",), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE"),
+        (("role_run_id", "task_id"), "role_runs", ("id", "task_id"), "NO ACTION", "RESTRICT", "NONE"),
+    },
+    "blockers": {(('task_id',), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE")},
+    "publications": {(('task_id',), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE")},
+    "task_events": {
+        (("task_id",), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE"),
+        (("role_run_id", "task_id"), "role_runs", ("id", "task_id"), "NO ACTION", "RESTRICT", "NONE"),
+    },
+}
+
 
 def _configure_connection(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = ON")
@@ -421,6 +464,62 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 
 def _schema_version(connection: sqlite3.Connection) -> int:
     return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _schema_signature(connection: sqlite3.Connection) -> str:
+    """Hash the persistent schema objects, excluding SQLite's internal objects."""
+    rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, sql
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """
+    ).fetchall()
+    canonical = json.dumps([tuple(row) for row in rows], separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@functools.lru_cache(maxsize=1)
+def _expected_schema_signature() -> str:
+    """Generate the expected physical schema from the checked-in migration."""
+    connection = sqlite3.connect(":memory:")
+    try:
+        for migration in MIGRATIONS:
+            for statement in migration.statements:
+                connection.execute(statement)
+        return _schema_signature(connection)
+    finally:
+        connection.close()
+
+
+def _foreign_key_signature(connection: sqlite3.Connection, table: str) -> set[tuple[tuple[str, ...], str, tuple[str, ...], str, str, str]]:
+    grouped: dict[int, list[sqlite3.Row | tuple]] = {}
+    for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+        grouped.setdefault(int(row[0]), []).append(row)
+    return {
+        (
+            tuple(str(row[3]) for row in sorted(rows, key=lambda value: int(value[1]))),
+            str(rows[0][2]),
+            tuple(str(row[4]) for row in sorted(rows, key=lambda value: int(value[1]))),
+            str(rows[0][5]),
+            str(rows[0][6]),
+            str(rows[0][7]),
+        )
+        for rows in grouped.values()
+    }
+
+
+def _index_signature(connection: sqlite3.Connection, index_name: str) -> tuple[str, bool, tuple[str, ...]]:
+    table = EXPECTED_INDEXES[index_name][0]
+    row = next((row for row in connection.execute(f"PRAGMA index_list({table})") if row[1] == index_name), None)
+    if row is None:
+        raise SchemaError(f"SQLite expected index is missing: {index_name}")
+    columns = tuple(
+        str(info[2])
+        for info in connection.execute("SELECT * FROM pragma_index_info(?) ORDER BY seqno", (index_name,))
+    )
+    return table, bool(row[2]), columns
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
@@ -438,12 +537,16 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
             "SELECT name, type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
         )
     }
-    unexpected_tables = {
-        name for name, object_type in objects.items()
-        if object_type == "table" and name not in EXPECTED_TABLE_COLUMNS
+    expected_objects = {
+        **{name: "table" for name in EXPECTED_TABLE_COLUMNS},
+        **{name: "index" for name in EXPECTED_INDEXES},
     }
-    if unexpected_tables:
-        raise SchemaError(f"SQLite contains unsupported tables: {sorted(unexpected_tables)}")
+    unexpected_objects = {
+        (name, object_type) for name, object_type in objects.items()
+        if expected_objects.get(name) != object_type
+    }
+    if unexpected_objects:
+        raise SchemaError(f"SQLite contains unsupported persistent objects: {sorted(unexpected_objects)}")
     for table in EXPECTED_TABLE_COLUMNS:
         if objects.get(table) != "table":
             raise SchemaError(f"SQLite schema object is missing or invalid: {table}")
@@ -461,6 +564,40 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     if foreign_keys != 1:
         raise SchemaError("SQLite foreign-key enforcement is disabled")
 
+    if _schema_signature(connection) != _expected_schema_signature():
+        raise SchemaError("SQLite physical schema does not match the checked-in migration contract")
+
+    for index_name, (table, unique, columns) in EXPECTED_INDEXES.items():
+        actual_table, actual_unique, actual_columns = _index_signature(connection, index_name)
+        if (actual_table, actual_unique, actual_columns) != (table, unique, columns):
+            raise SchemaError(f"SQLite index semantics are invalid: {index_name}")
+
+    for table, expected_unique in EXPECTED_UNIQUE_INDEX_COLUMNS.items():
+        actual_unique = {
+            tuple(
+                str(info[2])
+                for info in connection.execute(
+                    "SELECT * FROM pragma_index_info(?) ORDER BY seqno", (row[1],)
+                )
+            )
+            for row in connection.execute(f"PRAGMA index_list({table})")
+            if bool(row[2])
+        }
+        if actual_unique != expected_unique:
+            raise SchemaError(f"SQLite uniqueness semantics are invalid: {table}")
+
+    for table, expected_foreign_keys in EXPECTED_FOREIGN_KEYS.items():
+        if _foreign_key_signature(connection, table) != expected_foreign_keys:
+            raise SchemaError(f"SQLite foreign-key definitions are invalid: {table}")
+
+    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    integrity_errors = [str(row[0]) for row in integrity_rows if str(row[0]).lower() != "ok"]
+    if integrity_errors:
+        raise SchemaError(f"SQLite integrity_check failed: {integrity_errors}")
+    foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_errors:
+        raise SchemaError(f"SQLite foreign_key_check failed: {foreign_key_errors}")
+
 
 def _connect_raw(path: pathlib.Path) -> sqlite3.Connection:
     if path.exists() and path.is_symlink():
@@ -477,6 +614,26 @@ def _connect_raw(path: pathlib.Path) -> sqlite3.Connection:
     try:
         _configure_connection(connection)
         path.chmod(0o600)
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _connect_readonly(path: pathlib.Path) -> sqlite3.Connection:
+    """Open a database snapshot without changing its journal or permissions."""
+    if path.is_symlink() or not path.is_file():
+        raise ControlPlaneError("control database snapshot must be a regular file")
+    connection = sqlite3.connect(
+        path.as_uri() + "?mode=ro",
+        uri=True,
+        timeout=BUSY_TIMEOUT_MS / 1000,
+        isolation_level=None,
+    )
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        connection.row_factory = sqlite3.Row
         return connection
     except Exception:
         connection.close()
@@ -529,6 +686,7 @@ class ControlPlaneDatabase:
     def __init__(self, path: pathlib.Path, connection: sqlite3.Connection):
         self.path = path
         self.connection = connection
+        self._closed = False
 
     @classmethod
     def open(cls, path: pathlib.Path | str | None = None) -> "ControlPlaneDatabase":
@@ -536,13 +694,22 @@ class ControlPlaneDatabase:
         connection = _connect_raw(database_path)
         try:
             _migrate(connection)
-            return cls(database_path, connection)
+            database = cls(database_path, connection)
+            _OPEN_DATABASE_PATHS[database_path] = _OPEN_DATABASE_PATHS.get(database_path, 0) + 1
+            return database
         except Exception:
             connection.close()
             raise
 
     def close(self) -> None:
-        self.connection.close()
+        if not self._closed:
+            self.connection.close()
+            open_count = _OPEN_DATABASE_PATHS.get(self.path, 0)
+            if open_count <= 1:
+                _OPEN_DATABASE_PATHS.pop(self.path, None)
+            else:
+                _OPEN_DATABASE_PATHS[self.path] = open_count - 1
+            self._closed = True
 
     def __enter__(self) -> "ControlPlaneDatabase":
         return self
@@ -599,6 +766,10 @@ class ControlPlaneDatabase:
         base_sha = _sha(base_sha, "base_sha", required=True)
         current_head = _sha(current_head, "current_head")
         published_head = _sha(published_head, "published_head")
+        if published_head is not None:
+            raise StateConflict(
+                "published_head is managed by a successful publication and cannot be seeded directly"
+            )
         state = _state(state)
         if identifier is not None and not IDENTIFIER_RE.fullmatch(identifier):
             raise ValueError("identifier must match T-000042")
@@ -841,12 +1012,19 @@ class ControlPlaneDatabase:
                 """,
                 (blocker_id, task_id, kind, body, timestamp),
             )
-            self._insert_event(
-                task_id,
-                "infrastructure_blocked" if kind == "infrastructure" else "human_blocked",
-                {"blocker_id": blocker_id, "kind": kind},
-                occurred_at=timestamp,
-            )
+            # Step 2 persists project blockers without inventing a scheduler
+            # state or falsely recording them as human intervention.
+            event_type = {
+                "human": "human_blocked",
+                "infrastructure": "infrastructure_blocked",
+            }.get(kind)
+            if event_type is not None:
+                self._insert_event(
+                    task_id,
+                    event_type,
+                    {"blocker_id": blocker_id, "kind": kind},
+                    occurred_at=timestamp,
+                )
         return self.read_blocker(blocker_id)
 
     def read_blocker(self, blocker_id: str | uuid.UUID) -> dict[str, object]:
@@ -891,7 +1069,14 @@ class ControlPlaneDatabase:
             raise ValueError("published publication requires published_at")
         timestamp = _timestamp(published_at, "published_at") if published_at is not None else None
         with self._transaction():
-            self.read_task(task_id)
+            task = self.read_task(task_id)
+            if publication_status == "published":
+                if head_sha is None:
+                    raise ValueError("published publication requires head_sha")
+                if task["current_head"] != head_sha:
+                    raise StateConflict(
+                        "published publication head must equal the task current_head"
+                    )
             self.connection.execute(
                 """
                 INSERT INTO publications(
@@ -906,6 +1091,11 @@ class ControlPlaneDatabase:
                 """,
                 (task_id, head_sha, remote_branch, github_pr_number, publication_status, timestamp),
             )
+            if publication_status == "published":
+                self.connection.execute(
+                    "UPDATE tasks SET published_head = ?, updated_at = ? WHERE id = ?",
+                    (head_sha, timestamp, task_id),
+                )
             if publication_status in {"started", "published"}:
                 self._insert_event(
                     task_id,
@@ -922,28 +1112,37 @@ class ControlPlaneDatabase:
         self,
         task_id: str | uuid.UUID,
         *,
-        current_head: str | None,
-        published_head: str | None = None,
+        current_head: str | None | object = _UNSET,
+        published_head: str | None | object = _UNSET,
         updated_at: str | None = None,
     ) -> dict[str, object]:
         task_id = _uuid(task_id, "task_id")
-        current_head = _sha(current_head, "current_head")
-        published_head = _sha(published_head, "published_head")
-        timestamp = _timestamp(updated_at, "updated_at")
         with self._transaction():
             current = self.read_task(task_id)
+            if published_head is not _UNSET:
+                requested_published_head = _sha(published_head, "published_head")
+                if requested_published_head != current["published_head"]:
+                    raise StateConflict(
+                        "published_head is managed by a successful publication; "
+                        "update_heads cannot clear or rewrite it"
+                    )
+            next_current_head = (
+                current["current_head"] if current_head is _UNSET else _sha(current_head, "current_head")
+            )
+            next_published_head = current["published_head"]
+            if current["current_head"] == next_current_head and current["published_head"] == next_published_head:
+                return current
+            timestamp = _timestamp(updated_at, "updated_at")
             self.connection.execute(
                 "UPDATE tasks SET current_head = ?, published_head = ?, updated_at = ? WHERE id = ?",
-                (current_head, published_head, timestamp, task_id),
+                (next_current_head, next_published_head, timestamp, task_id),
             )
             self._insert_event(
                 task_id,
                 "head_changed",
-                {"current_head": current_head, "published_head": published_head},
+                {"current_head": next_current_head, "published_head": next_published_head},
                 occurred_at=timestamp,
             )
-            if current["current_head"] == current_head and current["published_head"] == published_head:
-                return current
         return self.read_task(task_id)
 
     def transition_task(
@@ -1098,6 +1297,8 @@ class ControlPlaneDatabase:
         destination = _absolute_path(destination)
         if backup == destination:
             raise ControlPlaneError("restore source and destination must differ")
+        if destination in _OPEN_DATABASE_PATHS:
+            raise ControlPlaneError("restore requires the destination control database to be offline")
         if not backup.is_file() or backup.is_symlink():
             raise ControlPlaneError("restore source is not a regular database file")
         if destination.is_symlink():
@@ -1109,7 +1310,7 @@ class ControlPlaneDatabase:
         fd, temporary_name = tempfile.mkstemp(prefix=".control-restore-", dir=destination.parent)
         os.close(fd)
         temporary = pathlib.Path(temporary_name)
-        source = _connect_raw(backup)
+        source = _connect_readonly(backup)
         try:
             _validate_schema(source)
             target = _connect_raw(temporary)
@@ -1136,7 +1337,7 @@ def inspect_schema_version(path: pathlib.Path | str) -> int:
     database_path = _absolute_path(path)
     if not database_path.exists():
         return 0
-    connection = _connect_raw(database_path)
+    connection = _connect_readonly(database_path)
     try:
         return _schema_version(connection)
     finally:
