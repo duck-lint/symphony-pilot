@@ -33,7 +33,7 @@ is live. Record the capability boundary in the workpad and use the existing
 infrastructure recovery/blocking path.
 
 This is a generic control-plane lifecycle policy, not a claim that the
-official Symphony state machine natively provides these named roles. The
+Symphony runtime state machine natively provides these named roles. The
 launcher supplies the role-policy artifacts to the Codex app-server where the
 installed Codex capability supports them; only a real canary may promote that
 from policy/deployment wiring to proven named-role execution.

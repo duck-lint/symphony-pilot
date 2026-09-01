@@ -1,8 +1,9 @@
 # symphony-pilot
 
-A host-side control plane for issue-driven OpenAI Symphony deployments. The
-canonical project registry is under projects/. Target repositories remain
-authoritative for project meaning, architecture, validation, and stop conditions.
+A trusted host-side control plane for issue-driven runs of the project-owned
+`symphony-runtime`. The canonical project registry is under `projects/`.
+Target repositories remain authoritative for project meaning, architecture,
+validation, and stop conditions.
 
 ## Architecture
 
@@ -39,7 +40,7 @@ same-user or prompt-only fallback.
 
 - Python 3
 - Git
-- official OpenAI Symphony
+- reviewed `symphony-runtime` executable
 - official Codex
 - Linux/WSL with unprivileged user, mount, PID, and network namespaces
 - reviewed runtime lock and protected default branch

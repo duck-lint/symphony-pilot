@@ -2,7 +2,7 @@
   "@context": "https://w3id.org/codemeta/3.1",
   "@type": "SoftwareSourceCode",
   "name": "symphony-pilot",
-  "description": "Host-side control plane for running OpenAI Symphony against issue-driven software projects with isolated workspaces, project profiles, deployment snapshots, credential boundaries, and operator lifecycle controls.",
+  "description": "Trusted host control plane for running the project-owned symphony-runtime against issue-driven software projects with isolated workspaces, project profiles, deployment snapshots, credential boundaries, and operator lifecycle controls.",
   "codeRepository": "https://github.com/duck-lint/symphony-pilot",
   "issueTracker": "https://github.com/duck-lint/symphony-pilot/issues",
   "license": "https://spdx.org/licenses/Apache-2.0",
@@ -22,7 +22,7 @@
     "Windows Subsystem for Linux (WSL)"
   ],
   "keywords": [
-    "OpenAI Symphony",
+    "symphony-runtime",
     "Codex",
     "agent orchestration",
     "developer tooling",
@@ -32,8 +32,8 @@
   "softwareRequirements": [
     {
       "@type": "SoftwareApplication",
-      "name": "OpenAI Symphony",
-      "codeRepository": "https://github.com/openai/symphony"
+      "name": "symphony-runtime",
+      "codeRepository": "https://github.com/duck-lint/symphony-runtime"
     },
     {
       "@type": "SoftwareApplication",

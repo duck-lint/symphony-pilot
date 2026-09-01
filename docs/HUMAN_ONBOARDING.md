@@ -23,7 +23,8 @@ It must contain a pull-request rule and no bypass actors. Do not configure
 this automatically from the pilot. Keep the human GitHub account as the merge
 authority; the pilot has no merge API.
 
-Run runtime pinning, deployment, profile validation, the hostile fixture, and
+Build the owned `symphony-runtime` repository and run runtime pinning,
+deployment, profile validation, the hostile fixture, and
 the full test suite before any canary. The fixture proves namespace teardown,
 CPU enforcement, and the empty `/etc` allowlist, but aggregate growth of the
 persistent task workspace remains unbounded. Along with the current auth

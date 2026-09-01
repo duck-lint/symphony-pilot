@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render an official Symphony WORKFLOW.md from a validated project profile."""
+"""Render an owned Symphony WORKFLOW.md from a validated project profile."""
 from __future__ import annotations
 import argparse
 import pathlib

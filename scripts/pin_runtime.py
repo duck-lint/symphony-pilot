@@ -16,7 +16,7 @@ from runtime_lock import build_lock, discover  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
-    parser.add_argument("--symphony", help="reviewed official Symphony executable")
+    parser.add_argument("--symphony", help="reviewed executable produced by symphony-runtime")
     parser.add_argument("--codex", help="reviewed Codex executable")
     args = parser.parse_args()
     try:

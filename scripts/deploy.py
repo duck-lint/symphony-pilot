@@ -63,7 +63,7 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         (stage / "workflow").mkdir()
         (stage / "workflow" / "agents").mkdir()
         (stage / "projects" / profile.slug).mkdir(parents=True)
-        # The official executable is shared host infrastructure.  It is
+        # The owned runtime executable is shared host infrastructure.  It is
         # intentionally absent from generated project deployments.
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
                      "host_integration.py", "process_identity.py", "launch_codex.sh",

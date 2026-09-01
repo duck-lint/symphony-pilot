@@ -1,8 +1,10 @@
 # Architecture
 
-symphony-pilot is a host control plane around the official OpenAI Symphony
-lifecycle. Target repositories remain authoritative for project meaning,
-validation, private inputs, and human stop conditions.
+symphony-pilot is a trusted host control plane around the project-owned
+`symphony-runtime` lifecycle implementation. Target repositories remain
+authoritative for project meaning, validation, private inputs, and human stop
+conditions. OpenAI Symphony is historical/reference material, not continuing
+lifecycle or architectural authority.
 
 ## Authority topology
 

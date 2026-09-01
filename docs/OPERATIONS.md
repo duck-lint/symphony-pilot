@@ -7,7 +7,7 @@ All physical lifecycle operations run in the WSL/Linux operator environment. Nat
 1. Validate the complete project registry, including `trusted_dispatchers`.
 2. Provision the API-only tracker token and derived publication deploy key.
 3. Deploy from a clean reviewed source checkout.
-4. Pin and review the official Symphony, Codex, and unshare executable identities with scripts/pin_runtime.py --project <slug>.
+4. Build the reviewed `symphony-runtime` repository, then pin and review the owned Symphony runtime, Codex, and unshare executable identities with `scripts/pin_runtime.py --project <slug>`.
 5. Configure one active GitHub repository ruleset targeting `~DEFAULT_BRANCH`, with a `pull_request` rule and no `bypass_actors`.
 6. Run the real WSL namespace constructor, supervisor-teardown/CPU probes, and hostile-fixture probes. Treat aggregate persistent-workspace disk growth as an unresolved resource boundary.
 

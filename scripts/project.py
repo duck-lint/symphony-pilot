@@ -106,7 +106,7 @@ def install_root(profile):
 
 
 def resolve_symphony_binary() -> str:
-    """Resolve the shared host executable without consulting any deployment."""
+    """Resolve the owned host runtime without consulting any deployment."""
     configured = os.environ.get("SYMPHONY_BIN")
     candidate = pathlib.Path(configured).expanduser() if configured else None
     if candidate:
@@ -116,7 +116,7 @@ def resolve_symphony_binary() -> str:
     found = shutil.which("symphony")
     if found:
         return found
-    raise FileNotFoundError("official Symphony executable was not found on PATH")
+    raise FileNotFoundError("owned Symphony runtime executable was not found on PATH")
 
 def pid_alive(pid):
     try:
