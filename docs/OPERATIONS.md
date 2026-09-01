@@ -9,7 +9,7 @@ All physical lifecycle operations run in the WSL/Linux operator environment. Nat
 3. Deploy from a clean reviewed source checkout.
 4. Pin and review the official Symphony, Codex, and unshare executable identities with scripts/pin_runtime.py --project <slug>.
 5. Configure one active GitHub repository ruleset targeting `~DEFAULT_BRANCH`, with a `pull_request` rule and no `bypass_actors`.
-6. Run the real WSL namespace constructor and hostile-fixture probes.
+6. Run the real WSL namespace constructor, supervisor-teardown/CPU probes, and hostile-fixture probes. Treat aggregate persistent-workspace disk growth as an unresolved resource boundary.
 
 start verifies deployment coherence, runtime lock, containment capability, credentials, real ruleset protection, and dispatch cardinality before launching a process. Any failed check is an infrastructure block; no old execution path is selected.
 

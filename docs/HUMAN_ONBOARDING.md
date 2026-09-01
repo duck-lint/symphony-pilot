@@ -24,5 +24,8 @@ this automatically from the pilot. Keep the human GitHub account as the merge
 authority; the pilot has no merge API.
 
 Run runtime pinning, deployment, profile validation, the hostile fixture, and
-the full test suite before any canary. The current auth blocker prevents real
-execution, so no canary or live cutover is authorized by this PR.
+the full test suite before any canary. The fixture proves namespace teardown,
+CPU enforcement, and the empty `/etc` allowlist, but aggregate growth of the
+persistent task workspace remains unbounded. Along with the current auth
+blocker, that means unattended execution is not activatable; no canary or
+live cutover is authorized by this PR.

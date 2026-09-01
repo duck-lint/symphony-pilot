@@ -2,16 +2,19 @@
 """Host-side publication validation.
 
 This module does not run task-owned Git configuration or trust a requested
-remote. It validates an outbox request against host task state before a future
-host publication clone is allowed to perform network mutation.
+remote. It validates an outbox request against host task state before the host
+publication clone performs network mutation.
 """
 from __future__ import annotations
 
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from typing import Iterator
 
 from outbox import read_request
 from prepare_workspace import publication_key_path
@@ -47,16 +50,61 @@ def _git(repository: pathlib.Path, *args: str, env: dict[str, str]) -> subproces
     )
 
 
-def _require_regular_bundle(path: pathlib.Path) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise PublicationError("fixed publication bundle is not a regular file")
-    if path.stat().st_size > MAX_BUNDLE_BYTES:
-        raise PublicationError("publication bundle exceeds the host size bound")
+@contextmanager
+def ingest_bundle(path: pathlib.Path) -> Iterator[pathlib.Path]:
+    """Copy one opened task artifact to host-owned storage before Git reads it.
+
+    The descriptor is opened without following a final symlink and is the only
+    reference to the task-controlled pathname. Git receives a separate file
+    under a host-owned temporary directory, so replacement of the task path
+    after this function returns cannot change the bytes being validated.
+    """
+    # O_NONBLOCK is material for the rejected FIFO case: validation must not
+    # wait for a hostile writer before fstat can identify the object type.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(path, flags)
+    except OSError as exc:
+        raise PublicationError("fixed publication bundle cannot be opened without following a symlink") from exc
+    staged: pathlib.Path | None = None
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise PublicationError("fixed publication bundle is not a regular file")
+        if before.st_size > MAX_BUNDLE_BYTES:
+            raise PublicationError("publication bundle exceeds the host size bound")
+        with tempfile.NamedTemporaryFile(prefix="symphony-pilot-bundle-", delete=False) as target:
+            staged = pathlib.Path(target.name)
+            os.chmod(staged, 0o600)
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(source_fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise PublicationError("publication bundle changed during bounded ingestion")
+                target.write(chunk)
+                remaining -= len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        after = os.fstat(source_fd)
+        if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)):
+            raise PublicationError("publication bundle changed during bounded ingestion")
+    except PublicationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PublicationError("fixed publication bundle ingestion failed") from exc
+    finally:
+        os.close(source_fd)
+    try:
+        assert staged is not None
+        yield staged
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
 
 
-def publish_bundle(profile, task: dict[str, object], bundle_path: pathlib.Path, head: str) -> str:
+def _publish_staged_bundle(profile, task: dict[str, object], staged_bundle: pathlib.Path, head: str) -> str:
     """Import and publish one exact task commit through a sterile bare repo."""
-    _require_regular_bundle(bundle_path)
     key = publication_key_path(profile)
     if key.is_symlink() or not key.is_file() or (key.stat().st_mode & 0o777) != 0o600:
         raise PublicationError("dedicated publication deploy key is unavailable or not mode 0600")
@@ -88,11 +136,11 @@ def publish_bundle(profile, task: dict[str, object], bundle_path: pathlib.Path, 
                 raise PublicationError("canonical published task head changed since admission")
         elif remote_branch.stdout.strip():
             raise PublicationError("unexpected pre-existing task branch has no licensed publication head")
-        bundle_check = subprocess.run(["git", "-C", str(bare), "bundle", "verify", str(bundle_path)],
+        bundle_check = subprocess.run(["git", "-C", str(bare), "bundle", "verify", str(staged_bundle)],
                                       env=env, capture_output=True, text=True, check=False)
         if bundle_check.returncode:
             raise PublicationError("publication bundle verification failed")
-        imported = _git(bare, "fetch", str(bundle_path), "HEAD:refs/quarantine/task", env=env)
+        imported = _git(bare, "fetch", str(staged_bundle), "HEAD:refs/quarantine/task", env=env)
         if imported.returncode:
             raise PublicationError("publication bundle import failed")
         fsck = _git(bare, "fsck", "--strict", "--full", env=env)
@@ -116,6 +164,12 @@ def publish_bundle(profile, task: dict[str, object], bundle_path: pathlib.Path, 
         if pushed.returncode:
             raise PublicationError("host publication push failed")
     return head
+
+
+def publish_bundle(profile, task: dict[str, object], bundle_path: pathlib.Path, head: str) -> str:
+    """Ingest the task bundle once, then publish only the host-owned copy."""
+    with ingest_bundle(bundle_path) as staged_bundle:
+        return _publish_staged_bundle(profile, task, staged_bundle, head)
 
 
 def validate_publication_request(outbox_path: pathlib.Path, task: dict[str, object]) -> dict[str, object]:

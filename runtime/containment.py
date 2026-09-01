@@ -26,6 +26,7 @@ CONSTRUCTOR_SCHEMA = "symphony-pilot-task-domain/v1"
 DEFAULT_LIMITS = {
     "processes": 128,
     "address_space_bytes": 2 * 1024 * 1024 * 1024,
+    "cpu_seconds": 300,
     "open_files": 4096,
     "file_size_bytes": 512 * 1024 * 1024,
     "wall_seconds": 30 * 60,
@@ -96,12 +97,12 @@ def probe_backend() -> BackendIdentity:
     probe = [
         executable,
         "--user", "--map-root-user",
-        "--mount", "--pid", "--fork", "--mount-proc", "--net",
+        "--mount", "--pid", "--fork", "--kill-child=SIGKILL", "--mount-proc", "--net",
         "/bin/sh", "-c",
         "set -eu; mkdir -p /tmp/symphony-pilot-probe; "
         "mount -t tmpfs tmpfs /tmp/symphony-pilot-probe; "
         "test -d /proc/1; test ! -s /proc/net/route; "
-        "prlimit --pid $$ --nproc=128 --as=2147483648 --nofile=4096 --fsize=536870912",
+        "prlimit --pid $$ --nproc=128 --as=2147483648 --cpu=300 --nofile=4096 --fsize=536870912",
     ]
     _run_probe(probe)
     return identity
@@ -135,8 +136,40 @@ def require_execution_capability() -> BackendIdentity:
 
 
 def resource_limits() -> dict[str, int]:
-    """Return the explicit current policy used by a future launcher wrapper."""
+    """Return the explicit limits inherited by the task-domain constructor."""
     return dict(DEFAULT_LIMITS)
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskDomainResult:
+    returncode: int
+    timed_out: bool
+    stdout: str
+    stderr: str
+
+
+def run_task_domain(command: Sequence[str], wall_seconds: float) -> TaskDomainResult:
+    """Run and reap one namespace supervisor, including timeout teardown.
+
+    ``task_domain_command`` includes util-linux ``--kill-child=SIGKILL``. On
+    timeout the host kills that supervisor, waits for it to be reaped, and
+    reports completion only after the supervisor is definitely gone. The
+    synthetic sentinel fixture verifies the delegated child tree is gone too.
+    """
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, close_fds=True)
+    except OSError as exc:
+        raise ContainmentError("task_domain_start", "task-domain supervisor could not start") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=wall_seconds)
+        return TaskDomainResult(process.returncode, False, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate(timeout=10)
+        if process.poll() is None:
+            raise ContainmentError("task_domain_teardown", "task-domain supervisor was not reaped after timeout")
+        return TaskDomainResult(process.returncode, True, stdout, stderr)
 
 
 def _mount_ro(source: str, target: str) -> str:
@@ -158,6 +191,7 @@ if test -e /operator-codex/auth.json; then fail operator_codex_visible; fi
 if test -e /sibling/GH-99/secret; then fail sibling_visible; fi
 if test -e /other-project/state/secret; then fail other_project_visible; fi
 if test -e /host-state/secret || test -e /host-logs/secret; then fail host_state_visible; fi
+if test -e /etc/passwd; then fail broad_etc_visible; fi
 if printf x > /symphony-inbox/should-not-write 2>/tmp/fixture.err; then fail inbox_writable; fi
 ln -s /outside /workspace/escape
 if test -e /workspace/escape/secret; then fail symlink_escape; fi
@@ -187,15 +221,35 @@ assert len(p) < 128
 '''
 
 
+def _teardown_fixture_script() -> str:
+    return r'''#!/bin/sh
+set -eu
+python3 -c 'import subprocess,time; grandchild=subprocess.Popen(["sh","-c","while :; do printf x >> /workspace/descendant-sentinel; sleep .05; done"]); time.sleep(30)' &
+wait
+'''
+
+
+def _cpu_fixture_script() -> str:
+    return r'''#!/bin/sh
+set -eu
+python3 -c 'while True: pass'
+'''
+
+
 def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace: pathlib.Path,
                         home: pathlib.Path, inbox: pathlib.Path, outbox: pathlib.Path,
-                        fixture: pathlib.Path, host_pid: int) -> list[str]:
+                        fixture: pathlib.Path, host_pid: int, *, cpu_seconds: int | None = None) -> list[str]:
     """Construct the reviewed task domain and expose only declared mounts.
 
     The caller supplies task-owned staging directories; no operator home,
     sibling project, task Git directory, socket, or host state is discovered
     here. The synthetic fixture and future Codex launcher share this seam.
+    No host ``/etc`` tree is mounted; the current allowlist is intentionally
+    empty until a concrete runtime dependency is reviewed.
     """
+    cpu_seconds = cpu_seconds if cpu_seconds is not None else DEFAULT_LIMITS["cpu_seconds"]
+    if not isinstance(cpu_seconds, int) or cpu_seconds < 1:
+        raise ContainmentError("task_domain_limits", "CPU limit must be a positive integer")
     setup = [
         "set -eu",
         f"mount -t tmpfs -o size=64m,nosuid,nodev tmpfs {shlex.quote(str(root))}",
@@ -215,17 +269,16 @@ def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace
         _mount_ro("/usr", str(root / "usr")),
         _mount_ro("/lib", str(root / "lib")),
         _mount_ro("/lib64", str(root / "lib64")),
-        _mount_ro("/etc", str(root / "etc")),
         f"mount -t tmpfs -o size=8m,nosuid,nodev,noexec tmpfs {shlex.quote(str(root / 'tmp'))}",
         f"mount -t tmpfs -o size=1m,nosuid,nodev,noexec tmpfs {shlex.quote(str(root / 'dev'))}",
         f"touch {shlex.quote(str(root / 'dev/null'))}",
         f"mount --bind /dev/null {shlex.quote(str(root / 'dev/null'))}",
         f"mount -t proc proc {shlex.quote(str(root / 'proc'))}",
-        "prlimit --pid $$ --nproc=32 --as=2147483648 --nofile=4096 --fsize=1048576",
+        f"prlimit --pid $$ --nproc=32 --as=2147483648 --cpu={cpu_seconds} --nofile=4096 --fsize=1048576",
         f"HOST_PID={host_pid} chroot {shlex.quote(str(root))} /bin/sh /fixture/hostile.sh",
     ]
     return [identity.executable, "--user", "--map-root-user", "--mount", "--pid",
-            "--fork", "--mount-proc", "--net", "/bin/sh", "-c", "\n".join(setup)]
+            "--fork", "--kill-child=SIGKILL", "--mount-proc", "--net", "/bin/sh", "-c", "\n".join(setup)]
 
 
 def run_synthetic_hostile_fixture() -> dict[str, object]:
@@ -250,10 +303,9 @@ def run_synthetic_hostile_fixture() -> dict[str, object]:
         fixture.chmod(0o500)
         command = task_domain_command(identity, root, workspace, home, inbox, outbox,
                                        fixture, os.getpid())
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=45, close_fds=True)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ContainmentError("synthetic_fixture", "task-domain hostile fixture did not complete") from exc
+        result = run_task_domain(command, wall_seconds=45)
+        if result.timed_out:
+            raise ContainmentError("synthetic_fixture", "normal task-domain fixture unexpectedly timed out")
         if result.returncode:
             detail = (result.stderr or result.stdout).strip().replace("\n", " ")
             raise ContainmentError("synthetic_fixture", f"task-domain hostile fixture failed: {detail[:300]}")
@@ -263,18 +315,55 @@ def run_synthetic_hostile_fixture() -> dict[str, object]:
             raise ContainmentError("synthetic_fixture", "task outbox was not writable")
         if (inbox / "should-not-write").exists():
             raise ContainmentError("synthetic_fixture", "task inbox was writable")
-        timed = subprocess.run([
-            "timeout", "1s", identity.executable, "--user", "--map-root-user", "--mount",
-            "--pid", "--fork", "--mount-proc", "--net", "/bin/sh", "-c", "sleep 10",
-        ], capture_output=True, text=True, check=False)
-        if timed.returncode != 124:
-            raise ContainmentError("synthetic_fixture", "task-domain wall-clock supervisor did not terminate the fixture")
+        teardown_workspace = base / "teardown-workspace"
+        teardown_home = base / "teardown-home"
+        teardown_inbox = base / "teardown-inbox"
+        teardown_outbox = base / "teardown-outbox"
+        teardown_root = base / "teardown-root"
+        teardown_fixture = base / "teardown.sh"
+        for path in (teardown_root, teardown_workspace, teardown_home, teardown_inbox, teardown_outbox):
+            path.mkdir()
+        teardown_fixture.write_text(_teardown_fixture_script(), encoding="utf-8")
+        teardown_fixture.chmod(0o500)
+        teardown_command = task_domain_command(identity, teardown_root, teardown_workspace,
+                                                teardown_home, teardown_inbox, teardown_outbox,
+                                                teardown_fixture, os.getpid(), cpu_seconds=5)
+        sentinel = teardown_workspace / "descendant-sentinel"
+        import time
+        for _ in range(2):
+            teardown = run_task_domain(teardown_command, wall_seconds=1)
+            if not teardown.timed_out or teardown.returncode == 0:
+                raise ContainmentError("synthetic_fixture", "task-domain wall timeout did not reap its supervisor")
+            first_size = sentinel.stat().st_size if sentinel.exists() else 0
+            time.sleep(.3)
+            second_size = sentinel.stat().st_size if sentinel.exists() else 0
+            if second_size != first_size:
+                raise ContainmentError("synthetic_fixture", "descendant survived task-domain teardown")
+
+        cpu_root = base / "cpu-root"
+        cpu_workspace = base / "cpu-workspace"
+        cpu_home = base / "cpu-home"
+        cpu_inbox = base / "cpu-inbox"
+        cpu_outbox = base / "cpu-outbox"
+        cpu_fixture = base / "cpu.sh"
+        for path in (cpu_root, cpu_workspace, cpu_home, cpu_inbox, cpu_outbox):
+            path.mkdir()
+        cpu_fixture.write_text(_cpu_fixture_script(), encoding="utf-8")
+        cpu_fixture.chmod(0o500)
+        cpu_command = task_domain_command(identity, cpu_root, cpu_workspace, cpu_home,
+                                           cpu_inbox, cpu_outbox, cpu_fixture, os.getpid(), cpu_seconds=1)
+        cpu = run_task_domain(cpu_command, wall_seconds=10)
+        if cpu.timed_out or cpu.returncode == 0:
+            raise ContainmentError("synthetic_fixture", "CPU limit did not bound the busy-loop fixture")
     return {"schema": CONSTRUCTOR_SCHEMA, "backend": dataclasses.asdict(identity),
             "workspace_writable": True, "inbox_read_only": True, "outbox_writable": True,
-            "hostile_denials": "passed", "resource_limits": {
-                "processes": 32, "address_space_bytes": 134217728,
+            "hostile_denials": "passed", "normal_completion": True,
+            "wall_timeout": {"bound_seconds": 1, "supervisor_reaped": True, "descendant_stopped": True},
+            "cpu_bound": True, "resource_limits": {
+                "processes": 32, "address_space_bytes": 134217728, "cpu_seconds": 300,
                 "open_files": 4096, "file_size_bytes": 1048576,
-                "tmpfs_bytes": 8 * 1024 * 1024, "wall_seconds": 1,
+                "tmpfs_bytes": 8 * 1024 * 1024, "wall_seconds": DEFAULT_LIMITS["wall_seconds"],
+                "aggregate_workspace_disk_bytes": None,
             }}
 
 

@@ -18,7 +18,7 @@ remote, credential, or process state.
 
 Codex policy is defense in depth. The one supported structural backend is the
 Linux/WSL unshare namespace contract with mount, PID, network, and resource
-limits. These are admission invariants, not a claim that an unblocked task is
+limits, CPU time, and child-tree teardown. These are admission invariants, not a claim that an unblocked task is
 currently running: the exact runtime remains stopped at the auth-boundary
 gate. Once activated, the task must have no tracker/publication credentials,
 operator CODEX_HOME, SSH agent, sibling workspace, host state, or arbitrary
@@ -29,10 +29,11 @@ tool network.
 Host-side admission, dispatch provenance, strict result brokering, sterile
 bundle publication, ruleset protection checks, runtime identity locks, and
 fail-closed containment gates are implemented and fixture-tested.
-Unattended execution is intentionally blocked: the exact current Codex App
-Server authentication path has no proven way to keep its credential out of
-hostile tool children, and external execution routing has an observed host-local
-fallback. Do not replace this blocker with a same-user or prompt-only fallback.
+Persistent task-workspace aggregate disk growth is explicitly unbounded in this
+cutover, and the exact current Codex App Server authentication path has no
+proven way to keep its credential out of hostile tool children. Unattended
+execution is therefore not activatable. Do not replace these limits with a
+same-user or prompt-only fallback.
 
 ## Requirements
 

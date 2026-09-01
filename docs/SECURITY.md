@@ -28,20 +28,30 @@ invented by the client parser.
 
 The host never uses task `origin`, `remote.*`, `core.hooksPath`,
 `credential.helper`, `include.path`, alternates, or SSH settings as publication
-authority. A fixed regular bundle is imported into a fresh bare repository,
-verified, checked for exact commit type and ancestry, and pushed with explicit
-host SSH identity.
+authority. The fixed bundle is opened once with no-follow descriptor semantics,
+bounded-copied to host-owned temporary storage, and closed; Git never reopens
+the task pathname. Only the staged regular file is imported into a fresh bare
+repository, verified, checked for exact commit type and ancestry, and pushed
+with explicit host SSH identity.
 
 ## Task domain
 
-The activated task contract exposes only the current workspace, fresh task
-home, read-only admission inbox, writable fixed outbox, minimal read-only
-runtime files, task `/proc`, minimal devices, and bounded temporary storage.
+The task-domain contract exposes only the current workspace, fresh task home,
+read-only admission inbox, writable fixed outbox, minimal read-only runtime
+files, task `/proc`, minimal devices, and bounded temporary storage. It does
+not expose host `/etc`; the explicit current `/etc` allowlist is empty.
 Operator homes, `.codex`, `.ssh`, host state/logs, deployments, sibling tasks,
 other projects, broad `/mnt/c`, agent sockets, and unrelated host processes are
 outside the domain. The synthetic hostile fixture has passed these denial
 checks, including network, symlink, proc, inherited-FD, and resource-limit
 attempts.
+
+The shared namespace runner applies a CPU-time limit and uses util-linux
+`--kill-child=SIGKILL`; timeout handling kills and reaps the namespace
+supervisor before reporting completion, and the fixture verifies that a
+grandchild can no longer modify a task-visible sentinel. Individual file size
+is bounded, but aggregate growth of the persistent task workspace is not: no
+total workspace disk quota is claimed or available in this cutover.
 
 This fixture proves the constructor, not live Codex behavior. The real launcher
 still fails closed because the accepted Codex App Server authentication path

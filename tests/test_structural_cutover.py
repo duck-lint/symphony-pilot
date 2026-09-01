@@ -146,6 +146,39 @@ class StructuralCutoverTests(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
+    @unittest.skipIf(os.name == "nt", "descriptor publication ingestion is a native Linux/WSL contract")
+    def test_publication_ingestion_rejects_symlink_fifo_and_oversize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            regular = root / "regular.bundle"
+            regular.write_bytes(b"bundle")
+            link = root / "publication.bundle"
+            link.symlink_to(regular)
+            with self.assertRaises(publication.PublicationError):
+                with publication.ingest_bundle(link):
+                    pass
+            fifo = root / "fifo.bundle"
+            os.mkfifo(fifo)
+            with self.assertRaises(publication.PublicationError):
+                with publication.ingest_bundle(fifo):
+                    pass
+            oversized = root / "oversized.bundle"
+            with oversized.open("wb") as stream:
+                stream.truncate(publication.MAX_BUNDLE_BYTES + 1)
+            with self.assertRaises(publication.PublicationError):
+                with publication.ingest_bundle(oversized):
+                    pass
+
+    @unittest.skipIf(os.name == "nt", "descriptor publication ingestion is a native Linux/WSL contract")
+    def test_publication_staging_survives_task_path_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            bundle = root / "publication.bundle"
+            bundle.write_bytes(b"original-bundle")
+            with publication.ingest_bundle(bundle) as staged:
+                bundle.unlink()
+                bundle.write_bytes(b"attacker-bundle")
+                self.assertEqual(staged.read_bytes(), b"original-bundle")
     def test_runtime_lock_is_strict(self):
         lock = {"schema": runtime_lock.LOCK_SCHEMA, **self.runtime_identity()}
         self.assertEqual(runtime_lock.validate_lock(lock), lock)
@@ -224,8 +257,18 @@ class StructuralCutoverTests(unittest.TestCase):
             key = root / "publication-ssh-key"
             key.write_text("synthetic-key", encoding="utf-8")
             key.chmod(0o600)
-            with mock.patch.object(publication, "publication_key_path", return_value=key):
+            original_git = publication._git
+            replaced = False
+            def replace_task_path(*args, **kwargs):
+                nonlocal replaced
+                if not replaced:
+                    bundle.write_bytes(b"attacker-replacement")
+                    replaced = True
+                return original_git(*args, **kwargs)
+            with mock.patch.object(publication, "publication_key_path", return_value=key), \
+                 mock.patch.object(publication, "_git", side_effect=replace_task_path):
                 self.assertEqual(publication.publish_bundle(profile, task, bundle, head), head)
+            self.assertTrue(replaced)
             self.assertEqual(self.git(remote, "rev-parse", task["issue_branch"]), head)
 
 

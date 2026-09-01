@@ -8,7 +8,9 @@ native role dispatch or read-only enforcement.
 
 Before any App Server start, the launcher runs the synthetic hostile task-domain
 fixture and then the exact execution-capability gate. The fixture proves the
-Linux/WSL namespace constructor. The second gate currently returns
+Linux/WSL namespace constructor, shared supervisor teardown, CPU bound, and
+explicitly empty `/etc` allowlist. It does not prove an aggregate quota for
+persistent workspace growth. The second gate currently returns
 `codex_auth_boundary`; no Codex process is started.
 
 Do not mount operator `auth.json`, pass `CODEX_HOME`, inject readable API keys,

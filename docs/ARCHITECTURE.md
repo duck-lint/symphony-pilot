@@ -48,8 +48,10 @@ exact optional `head`, `workpad_body`, `disposition`, and `summary`. The
 host updates the admitted workpad comment, maps dispositions to fixed label
 operations, and never accepts task-supplied endpoints or label names.
 
-For `ready_for_human_merge`, the host validates the result, imports the fixed
-bundle into a fresh bare repository, runs bundle verification and `git fsck`,
+For `ready_for_human_merge`, the host opens the fixed bundle once with
+descriptor/no-follow semantics, bounds and copies it into host-owned temporary
+storage, and closes the task descriptor. It then imports only that staged copy
+into a fresh bare repository, runs bundle verification and `git fsck`,
 requires the exact requested commit, checks ancestry from the licensed base or
 published head, and pushes only the derived branch with the dedicated deploy
 key. It then creates or retains exactly one matching draft PR and updates
@@ -61,7 +63,9 @@ deploys.
 | Boundary | State | Evidence |
 |---|---|---|
 | Linux user/mount/PID/network namespace primitive | PROVEN | real WSL `unshare` probe |
-| Synthetic task filesystem constructor | PROVEN | hostile fixture |
+| Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
+| Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
+| Aggregate persistent-workspace disk quota | UNBOUNDED | no generic quota authority in this cutover |
 | Host admission and dispatch provenance | PROVEN BY FIXTURES | strict parser and pagination fixtures |
 | Host broker and publication transfer | PROVEN BY FIXTURES | lifecycle and sterile bundle fixture |
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
@@ -75,6 +79,12 @@ The selected backend is rootless Linux/WSL `unshare`. The constructor creates a
 fresh tmpfs root, mounts only the current workspace, task home, read-only
 admission inbox, writable fixed outbox, bounded tmpfs, minimal devices, and
 read-only runtime libraries, then mounts a task PID namespace and restricted
-network namespace. Resource limits are applied to the fixture domain. The
-constructor is exercised independently of Codex; the auth blocker still stops
-the real launcher before App Server start.
+network namespace. It does not mount host `/etc`; the current explicit
+allowlist is empty. The shared runner uses util-linux `--kill-child=SIGKILL`,
+reaps the supervisor after timeout, and the fixture verifies a child and
+grandchild stop modifying a task sentinel. CPU time, process count, address
+space, open files, individual file size, task tmpfs, and wall clock are
+bounded. Aggregate writes to the persistent task workspace are not quota
+bounded, so unattended activation remains blocked. The constructor is
+exercised independently of Codex; the auth blocker still stops the real
+launcher before App Server start.
