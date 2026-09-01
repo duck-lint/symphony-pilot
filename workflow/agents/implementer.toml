@@ -1,6 +1,5 @@
 name = "implementer"
 description = "Mutating worker for one architect-authorized implementation seam."
-sandbox_mode = "workspace-write"
 developer_instructions = """
 You are the IMPLEMENTER for one narrow, architect-authorized seam. Read the
 issue, authority packet, plan, and verification contract before editing.

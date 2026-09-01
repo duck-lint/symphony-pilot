@@ -33,6 +33,9 @@ from prepare_workspace import (
     state_namespace_for_slug,
 )
 from deployment_contract import contract_digest, deployment_identity
+from containment import ContainmentError, backend_identity, require_execution_capability
+from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
+from rulesets import RulesetError, fetch_all_rulesets, fetch_ruleset_details, require_default_branch_ruleset
 from project_registry import resolve_project
 
 
@@ -297,23 +300,24 @@ def active_issues(profile, token):
                     urllib.parse.quote(",".join(profile.dispatch_labels)) + "&per_page=100")
     return issues if isinstance(issues, list) else []
 
+
+def branch_protection_preflight(profile, token):
+    """Require the one supported real GitHub repository-ruleset contract."""
+    repository = github(profile, token, "GET", "")
+    default = repository.get("default_branch") if isinstance(repository, dict) else None
+    if not isinstance(default, str) or not default:
+        raise RulesetError("GitHub did not report the protected default branch")
+    summaries = fetch_all_rulesets(lambda page: github(
+        profile, token, "GET", f"/rulesets?includes_parents=true&per_page=100&page={page}"))
+    rulesets = fetch_ruleset_details(summaries, lambda ruleset_id: github(
+        profile, token, "GET", f"/rulesets/{ruleset_id}?includes_parents=true"))
+    return require_default_branch_ruleset(rulesets, default)
+
 def project_name(profile):
     return profile.display_name or profile.slug
 
 def start(profile):
     pid_path, log_path = state_paths(profile)
-    if pid_path.exists():
-        identity = read(pid_path)
-        identity = identity.get("identity") if identity else None
-        if identity and _identity_alive(identity):
-            try:
-                establish_awake_guard(profile)
-            except (RuntimeError, PreparationError) as exc:
-                print(f"Cannot keep {project_name(profile)} awake: {exc}")
-                return 1
-            print("Symphony is already running.")
-            return 0
-        pid_path.unlink(missing_ok=True)
     try:
         verification = verify_deployment(profile)
     except (OSError, ValueError, TypeError, PreparationError) as exc:
@@ -327,10 +331,48 @@ def start(profile):
         print(f"Cannot start Symphony: {exc}")
         return 1
     try:
+        binary = resolve_symphony_binary()
+        codex = shutil.which("codex")
+        if not codex:
+            raise RuntimeLockError("official Codex executable was not found on PATH")
+        containment = backend_identity()
+        lock_path = require_physical_namespace(profile.state_root) / "runtime-lock.json"
+        lock = validate_lock(json.loads(lock_path.read_text(encoding="utf-8")))
+        verify_entry(lock["symphony"], identify(binary), "Symphony")
+        verify_entry(lock["codex"], identify(codex), "Codex")
+        verify_entry(lock["containment"], {
+            "executable": containment.executable,
+            "version": containment.version,
+            "sha256": containment.sha256,
+        }, "containment")
+    except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError, ContainmentError) as exc:
+        print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
+        return 78
+    # This gate runs before tracker credential acquisition or process launch.
+    # It is intentionally not a fallback to the old same-user architecture.
+    try:
+        require_execution_capability()
+    except ContainmentError as exc:
+        print(f"Cannot start Symphony: containment capability blocker: {exc}")
+        return 78
+    if pid_path.exists():
+        identity = read(pid_path)
+        identity = identity.get("identity") if identity else None
+        if identity and _identity_alive(identity):
+            print("Cannot start Symphony: a pre-existing managed process must be stopped before cutover")
+            return 78
+        print("Cannot start Symphony: stale process state requires explicit recovery before cutover")
+        return 78
+    try:
         token = read_secret(profile)
     except PreparationError as exc:
         print(f"Cannot start Symphony: {exc}")
         return 1
+    try:
+        branch_protection_preflight(profile, token)
+    except (RulesetError, PreparationError) as exc:
+        print(f"Cannot start Symphony: protected default-branch preflight failed: {exc}")
+        return 78
     try:
         issues = active_issues(profile, token)
     except Exception as exc:
@@ -350,12 +392,6 @@ def start(profile):
     env["SYMPHONY_WORKFLOW"] = str(workflow)
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
-    try:
-        binary = resolve_symphony_binary()
-    except FileNotFoundError as exc:
-        release_awake_guard(profile)
-        print(f"Cannot start Symphony: {exc}. Install the shared host executable or set SYMPHONY_BIN.")
-        return 1
     log = log_path.open("ab")
     command = [binary, "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
                "--logs-root", str(profile.log_root)]
@@ -609,11 +645,19 @@ REQUIRED_DEPLOYMENT_FILES = (
     "profile.toml",
     "runtime/prepare_workspace.py",
     "runtime/after_run.py",
+    "runtime/broker.py",
     "runtime/before_remove.py",
     "runtime/host_integration.py",
     "runtime/process_identity.py",
     "runtime/launch_codex.sh",
     "runtime/deployment_contract.py",
+    "runtime/containment.py",
+    "runtime/task_admission.py",
+    "runtime/admit_task.py",
+    "runtime/outbox.py",
+    "runtime/rulesets.py",
+    "runtime/publication.py",
+    "runtime/runtime_lock.py",
     "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",
     "workflow/agents/project-manager.toml",

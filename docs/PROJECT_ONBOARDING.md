@@ -2,7 +2,7 @@
 
 The canonical registry is the tracked `projects/` directory. A registered project is exactly one `projects/<slug>/profile.toml` whose `slug` matches its directory name and whose non-secret fields pass profile validation.
 
-Create a profile with repository, Git remote, secret reference, dispatch and blocked labels, an allocated dashboard port, execution limits, Codex settings, toolchain hint, and optional notification/sleep preferences. Do not add host paths or service names: deployment, workspace, state, logs, credentials, process state, locks, workflow location, and service identity are derived from the slug.
+Create a profile with repository, Git remote, tracker secret reference, non-empty trusted dispatcher logins, dispatch and blocked labels, an allocated dashboard port, execution limits, Codex settings, toolchain hint, and optional notification/sleep preferences. Do not add host paths, publication-key paths, or service names: deployment, workspace, state, logs, credentials, process state, locks, workflow location, publication-key location, and service identity are derived from the slug.
 
 ```bash
 mkdir -p projects/example-four
@@ -11,6 +11,7 @@ $EDITOR projects/example-four/profile.toml
 python3 scripts/validate_profile.py
 python3 scripts/list_projects.py
 python3 scripts/provision_secret.py --project example-four
+python3 scripts/provision_publication_key.py --project example-four < publication-key.pem
 python3 scripts/deploy.py --project example-four --dry-run
 python3 scripts/deploy.py --project example-four
 python3 scripts/project.py --project example-four test

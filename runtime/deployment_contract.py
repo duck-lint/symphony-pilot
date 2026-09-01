@@ -17,6 +17,7 @@ CONTRACT_FILES = (
     "scripts/deploy.py",
     "scripts/project.py",
     "runtime/after_run.py",
+    "runtime/broker.py",
     "runtime/before_remove.py",
     "runtime/host_integration.py",
     "runtime/prepare_workspace.py",
@@ -24,6 +25,14 @@ CONTRACT_FILES = (
     "runtime/render_workflow.py",
     "runtime/project_registry.py",
     "runtime/deployment_contract.py",
+    "runtime/containment.py",
+    "runtime/task_admission.py",
+    "runtime/dispatch_provenance.py",
+    "runtime/admit_task.py",
+    "runtime/outbox.py",
+    "runtime/rulesets.py",
+    "runtime/publication.py",
+    "runtime/runtime_lock.py",
 )
 
 
