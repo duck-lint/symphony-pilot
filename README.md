@@ -82,5 +82,8 @@ identities are pinned, and hostile-boundary probes pass.
 
 See docs/ARCHITECTURE.md, docs/SECURITY.md, docs/OPERATIONS.md,
 docs/HUMAN_ONBOARDING.md, docs/CODEX_ONBOARDING.md, and docs/RECOVERY.md.
-The host-owned SQLite contract is documented in docs/SQLITE_CONTRACT.md; it is
-not yet consumed by the runtime or scheduler.
+The host-owned SQLite contract is documented in docs/SQLITE_CONTRACT.md.
+Runtime implements the production SQLite tracker adapter. Pilot has not yet
+configured the managed scheduler to use it; scheduler cutover remains Step 5.
+The Step-4 local operator surface is documented in docs/HOST_API.md and open or
+deferred security decisions are preserved in docs/SECURITY_FINDINGS.md.

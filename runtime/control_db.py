@@ -590,7 +590,12 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
         if _foreign_key_signature(connection, table) != expected_foreign_keys:
             raise SchemaError(f"SQLite foreign-key definitions are invalid: {table}")
 
-    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    try:
+        integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.DatabaseError as exc:
+        # Some SQLite builds report corruption by raising here rather than by
+        # returning a non-"ok" row. Preserve the public fail-closed contract.
+        raise SchemaError("SQLite integrity_check could not read the database") from exc
     integrity_errors = [str(row[0]) for row in integrity_rows if str(row[0]).lower() != "ok"]
     if integrity_errors:
         raise SchemaError(f"SQLite integrity_check failed: {integrity_errors}")
