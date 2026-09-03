@@ -4,6 +4,7 @@ import http.client
 import json
 import pathlib
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -62,6 +63,17 @@ class HostApiTests(unittest.TestCase):
         payload = response.read()
         return response, payload
 
+    def raw_request_status(self, header_lines):
+        request = (
+            "GET / HTTP/1.1\r\n"
+            + "".join(f"{name}: {value}\r\n" for name, value in header_lines)
+            + "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=5) as connection:
+            connection.sendall(request)
+            response = connection.recv(4096)
+        return int(response.split(b"\r\n", 1)[0].split()[1])
+
     def test_literal_loopback_only_binding(self):
         self.assertEqual(host_api.validate_loopback_bind("127.0.0.1"), "127.0.0.1")
         self.assertEqual(host_api.validate_loopback_bind("::1"), "::1")
@@ -87,6 +99,23 @@ class HostApiTests(unittest.TestCase):
                     self.assertNotIn(b'"projects"', body)
         response, _ = self.request("POST", "/api/v1/action", "{}", {"Host": "attacker.example:1"})
         self.assertEqual(response.status, 421)
+
+    def test_host_field_cardinality_is_validated_from_raw_http(self):
+        valid = self.server.trusted_host
+        cases = (
+            ("one canonical Host", (("Host", valid),), 200),
+            ("no Host", (), 421),
+            ("duplicate canonical Host", (("Host", valid), ("Host", valid)), 421),
+            ("canonical then hostile", (("Host", valid), ("Host", f"attacker.example:{self.server.server_port}")), 421),
+            ("hostile then canonical", (("Host", f"attacker.example:{self.server.server_port}"), ("Host", valid)), 421),
+            ("case-varied duplicate canonical Host", (("Host", valid), ("hOsT", valid)), 421),
+            ("localhost", (("Host", f"localhost:{self.server.server_port}"),), 421),
+            ("wrong port", (("Host", "127.0.0.1:1"),), 421),
+            ("comma-combined Host", (("Host", f"{valid}, {valid}"),), 421),
+        )
+        for name, headers, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(self.raw_request_status(headers), expected)
 
     def test_ipv6_canonical_host_where_available(self):
         self.stop_server()

@@ -183,7 +183,8 @@ class HostControlHandler(http.server.BaseHTTPRequestHandler):
         """Reject DNS-rebinding Host values before dispatching any method."""
         if not super().parse_request():
             return False
-        if self.headers.get("Host") != self.server.trusted_host:
+        host_values = self.headers.get_all("Host") or []
+        if len(host_values) != 1 or host_values[0] != self.server.trusted_host:
             self.send_error(421, "HTTP Host does not name this loopback listener")
             return False
         return True
