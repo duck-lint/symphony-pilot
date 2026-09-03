@@ -14,9 +14,12 @@ import hashlib
 import os
 import pathlib
 import shlex
+import signal
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from typing import Sequence
 
 
@@ -31,6 +34,7 @@ DEFAULT_LIMITS = {
     "file_size_bytes": 512 * 1024 * 1024,
     "wall_seconds": 30 * 60,
 }
+MAX_DOMAIN_OUTPUT_BYTES = 4 * 1024 * 1024
 
 
 class ContainmentError(RuntimeError):
@@ -158,19 +162,78 @@ def run_task_domain(command: Sequence[str], wall_seconds: float) -> TaskDomainRe
     """
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   stdin=subprocess.DEVNULL, text=True, close_fds=True,
+                                   stdin=subprocess.DEVNULL, text=False, close_fds=True,
                                    start_new_session=True)
     except OSError as exc:
         raise ContainmentError("task_domain_start", "task-domain supervisor could not start") from exc
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    output_limit = threading.Event()
+    reader_error = threading.Event()
+
+    def drain(stream: object, buffer: bytearray) -> None:
+        try:
+            while True:
+                chunk = stream.read(8192)  # type: ignore[union-attr]
+                if not chunk:
+                    return
+                remaining = MAX_DOMAIN_OUTPUT_BYTES - len(buffer)
+                if remaining <= 0:
+                    output_limit.set()
+                    return
+                buffer.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    output_limit.set()
+                    return
+        except (OSError, ValueError):
+            reader_error.set()
+
+    stdout_thread = threading.Thread(target=drain, args=(process.stdout, stdout_buffer), daemon=True)
+    stderr_thread = threading.Thread(target=drain, args=(process.stderr, stderr_buffer), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    termination = "completed"
+    deadline = time.monotonic() + wall_seconds
+    while process.poll() is None:
+        if reader_error.is_set():
+            termination = "output_error"
+            break
+        if output_limit.is_set():
+            termination = "output_limit"
+            break
+        if time.monotonic() >= deadline:
+            termination = "timeout"
+            break
+        time.sleep(0.01)
+
+    if termination != "completed":
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            raise ContainmentError("task_domain_teardown", "task-domain supervisor was not reaped after timeout") from exc
+    else:
+        process.wait()
+    stdout_thread.join(timeout=10)
+    stderr_thread.join(timeout=10)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        raise ContainmentError("task_domain_teardown", "task-domain output readers were not reaped")
+    if reader_error.is_set():
+        raise ContainmentError("task_domain_output", "task-domain output could not be read safely")
+    if output_limit.is_set():
+        raise ContainmentError("task_domain_output", "task-domain output exceeded its bounded limit")
     try:
-        stdout, stderr = process.communicate(timeout=wall_seconds)
-        return TaskDomainResult(process.returncode, False, stdout, stderr)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate(timeout=10)
-        if process.poll() is None:
-            raise ContainmentError("task_domain_teardown", "task-domain supervisor was not reaped after timeout")
-        return TaskDomainResult(process.returncode, True, stdout, stderr)
+        stdout = bytes(stdout_buffer).decode("utf-8")
+        stderr = bytes(stderr_buffer).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContainmentError("malformed_output", "task-domain output was not valid UTF-8") from exc
+    return TaskDomainResult(process.returncode, termination == "timeout", stdout, stderr)
 
 
 def _mount_ro(source: str, target: str) -> str:
@@ -284,7 +347,7 @@ def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace
         f"mount -t proc proc {shlex.quote(str(root / 'proc'))}",
         f"prlimit --pid $$ --nproc={processes} --as={address_space_bytes} "
         f"--cpu={cpu_seconds} --nofile={DEFAULT_LIMITS['open_files']} --fsize={file_size_bytes}",
-        f"HOST_PID={host_pid} exec chroot {shlex.quote(str(root))} /bin/sh /fixture/hostile.sh",
+        f"HOST_PID={host_pid} exec /usr/sbin/chroot {shlex.quote(str(root))} /bin/sh /fixture/hostile.sh",
     ]
     return [identity.executable, "--user", "--map-root-user", "--mount", "--pid",
             "--fork", "--kill-child=SIGKILL", "--mount-proc", "--net", "/bin/sh", "-c", "\n".join(setup)]
@@ -353,7 +416,7 @@ def acceptance_domain_command(
     toolchain_data_target = root / "home/duck-lint/.local/share/mise"
     shell_command = f"cd {shlex.quote(cwd)} && exec {shlex.join(tuple(command))}"
     system_mounts = [
-        _acceptance_mount_ro(pathlib.Path(source), root / source.lstrip("/"))
+        _mount_ro(source, str(root / source.lstrip("/")))
         for source in ("/bin", "/usr", "/lib", "/lib64")
         if pathlib.Path(source).exists()
     ]
@@ -383,7 +446,7 @@ def acceptance_domain_command(
         f"mount -t proc proc {shlex.quote(str(root / 'proc'))}",
         f"prlimit --pid $$ --nproc={processes} --as={address_space_bytes} "
         f"--cpu={DEFAULT_LIMITS['cpu_seconds']} --nofile={DEFAULT_LIMITS['open_files']} --fsize={file_size_bytes}",
-        f"exec chroot {shlex.quote(str(root))} /usr/bin/env -i "
+        f"exec /usr/sbin/chroot {shlex.quote(str(root))} /usr/bin/env -i "
         "HOME=/home/duck-lint USER=duck-lint LOGNAME=duck-lint "
         "PATH=/home/duck-lint/.local/bin:/usr/local/bin:/usr/bin:/bin "
         "LANG=C.UTF-8 LC_ALL=C.UTF-8 "

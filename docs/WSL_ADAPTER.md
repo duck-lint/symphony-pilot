@@ -24,7 +24,8 @@ project and executes the requested argv inside the existing rootless
 `linux-unshare` containment boundary. That boundary uses a private mount/PID/
 network namespace, a chroot, `--kill-child=SIGKILL`, resource limits, and
 explicit mounts. Project and Pilot-control source are read-only; only the
-declared build/cache root and runtime release output directories are writable.
+disposable per-run build/cache root and runtime release output directories are
+writable.
 The contained HOME exposes only the reviewed mise binary/data paths, not the
 operator home, `.codex`, `.ssh`, or Pilot secrets. `/proc` is the contained
 namespace and no host descriptors are inherited. The Windows environment is

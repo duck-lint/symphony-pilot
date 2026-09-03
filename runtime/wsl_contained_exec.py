@@ -38,6 +38,8 @@ def _project_root(project: str) -> pathlib.Path:
         raise ContainmentError("project", "approved project root cannot be resolved") from exc
     if resolved != root:
         raise ContainmentError("project", "approved project root resolves through an unexpected alias")
+    if os.path.ismount(resolved):
+        raise ContainmentError("project", "approved project root is itself a mountpoint")
     return resolved
 
 
@@ -70,6 +72,14 @@ def _directory(path: pathlib.Path, kind: str, *, create: bool = False) -> pathli
     return resolved
 
 
+def _reject_mountpoint(path: pathlib.Path, kind: str) -> pathlib.Path:
+    """Reject a writable source that is a bind/mount alias, not just a symlink."""
+    resolved = _directory(path, kind)
+    if os.path.ismount(resolved):
+        raise ContainmentError(kind, f"{kind} directory is a mountpoint and cannot be rebound writable")
+    return resolved
+
+
 def _writable_outputs(project: str, root: pathlib.Path) -> list[tuple[pathlib.Path, str]]:
     if project != "symphony-runtime":
         return []
@@ -83,39 +93,46 @@ def _writable_outputs(project: str, root: pathlib.Path) -> list[tuple[pathlib.Pa
             raise ContainmentError("outputs", f"runtime output directory {name} cannot be prepared") from exc
         if path.is_symlink() or not resolved.is_dir():
             raise ContainmentError("outputs", f"runtime output directory {name} is not a plain directory")
+        if os.path.ismount(resolved):
+            raise ContainmentError("outputs", f"runtime output directory {name} is a mountpoint")
         outputs.append((resolved, f"/project/{name}"))
     return outputs
 
 
-def run(project: str, cwd: str, command: list[str]) -> int:
+def run(project: str, cwd: str, command: list[str], wall_seconds: float) -> int:
     if os.name == "nt":
         raise ContainmentError("host_platform", "contained WSL execution requires Linux")
+    if not isinstance(wall_seconds, (int, float)) or not 0 < wall_seconds <= 30 * 60:
+        raise ContainmentError("timeout", "contained WSL wall-time limit is outside its bound")
     project_root = _project_root(project)
     contained_cwd = _contained_cwd(project_root, cwd)
     home = pathlib.Path.home().resolve()
     toolchain_bin = _directory(home / ".local/bin", "toolchain")
     toolchain_data = _directory(home / ".local/share/mise", "toolchain")
-    build_root = _directory(home / ".local/state/symphony-pilot/wsl-build" / project, "build", create=True)
     control_source = pathlib.Path(__file__).resolve().parents[1]
     control_source = _directory(control_source, "pilot-control")
     identity = require_backend()
 
-    with tempfile.TemporaryDirectory(prefix="symphony-pilot-wsl-domain-", dir="/tmp") as directory:
-        root = pathlib.Path(directory) / "root"
-        root.mkdir()
-        domain = acceptance_domain_command(
-            identity,
-            root,
-            control_source,
-            project_root,
-            build_root,
-            toolchain_bin,
-            toolchain_data,
-            contained_cwd,
-            command,
-            _writable_outputs(project, project_root),
-        )
-        result = run_task_domain(domain, wall_seconds=30 * 60)
+    # Build/cache state is disposable by design.  A later hostile command must
+    # not inherit data left by an earlier acceptance command.
+    with tempfile.TemporaryDirectory(prefix="symphony-pilot-wsl-build-", dir="/tmp") as build_directory:
+        build_root = _reject_mountpoint(pathlib.Path(build_directory), "build")
+        with tempfile.TemporaryDirectory(prefix="symphony-pilot-wsl-domain-", dir="/tmp") as directory:
+            root = pathlib.Path(directory) / "root"
+            root.mkdir()
+            domain = acceptance_domain_command(
+                identity,
+                root,
+                control_source,
+                project_root,
+                build_root,
+                toolchain_bin,
+                toolchain_data,
+                contained_cwd,
+                command,
+                _writable_outputs(project, project_root),
+            )
+            result = run_task_domain(domain, wall_seconds=wall_seconds)
     if result.stdout:
         sys.stdout.write(result.stdout)
     if result.stderr:
@@ -129,13 +146,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--cwd", required=True)
+    parser.add_argument("--wall-seconds", type=float, default=30 * 60)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
         if not command:
             raise ContainmentError("command", "contained command is required")
-        return run(args.project, args.cwd, command)
+        return run(args.project, args.cwd, command, args.wall_seconds)
     except ContainmentError as exc:
         print(f"symphony-pilot contained WSL execution blocked: {exc.kind}: {exc}", file=sys.stderr)
         return 78

@@ -5,11 +5,22 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
 import containment
+import wsl_contained_exec
+
+
+class SupervisorValidationTests(unittest.TestCase):
+    def test_writable_mountpoint_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory)
+            with mock.patch.object(wsl_contained_exec.os.path, "ismount", return_value=True):
+                with self.assertRaisesRegex(containment.ContainmentError, "mountpoint"):
+                    wsl_contained_exec._reject_mountpoint(path, "build")
 
 
 @unittest.skipIf(os.name == "nt", "requires native Linux/WSL namespace capability")

@@ -206,6 +206,7 @@ def _bounded_process(
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
     output_limit = threading.Event()
+    reader_error = threading.Event()
 
     try:
         process = subprocess.Popen(
@@ -235,7 +236,7 @@ def _bounded_process(
                     output_limit.set()
                     return
         except (OSError, ValueError):
-            return
+            reader_error.set()
 
     stdout_thread = threading.Thread(target=drain, args=(process.stdout, stdout_buffer), daemon=True)
     stderr_thread = threading.Thread(target=drain, args=(process.stderr, stderr_buffer), daemon=True)
@@ -245,6 +246,10 @@ def _bounded_process(
     termination = "completed"
     deadline = time.monotonic() + timeout_seconds
     while process.poll() is None:
+        if reader_error.is_set():
+            termination = "output_error"
+            process.kill()
+            break
         if output_limit.is_set():
             termination = "output_limit"
             process.kill()
@@ -263,6 +268,8 @@ def _bounded_process(
     stderr_thread.join(timeout=10)
     if stdout_thread.is_alive() or stderr_thread.is_alive():
         raise WslAdapterError("termination_failed", "WSL output reader did not terminate")
+    if reader_error.is_set():
+        raise WslAdapterError("output_read", "WSL output could not be read safely")
     if output_limit.is_set() and termination == "completed":
         termination = "output_limit"
 

@@ -32,6 +32,17 @@ class FakeProcess:
         return self.returncode
 
 
+class FailingStream:
+    def read(self, _size):
+        raise OSError("synthetic stream failure")
+
+
+class StreamErrorProcess(FakeProcess):
+    def __init__(self):
+        super().__init__(returncode=0)
+        self.stdout = FailingStream()
+
+
 class WslAdapterTests(unittest.TestCase):
     def test_fixed_distribution_and_user_are_structured(self):
         command = wsl_adapter._raw_command(pathlib.Path("C:/Windows/System32/wsl.exe"), ["/usr/bin/id"], "/mnt/f/PROJECT-REPOS/symphony-runtime")
@@ -116,7 +127,7 @@ class WslAdapterTests(unittest.TestCase):
         setup = command[-1]
         self.assertIn("mount --make-rprivate /", setup)
         self.assertIn("mount -o remount,ro,bind", setup)
-        self.assertIn("exec chroot", setup)
+        self.assertIn("exec /usr/sbin/chroot", setup)
         self.assertIn("/project", setup)
         self.assertIn("pilot-control", setup)
         self.assertIn("--kill-child=SIGKILL", command)
@@ -173,6 +184,16 @@ class WslAdapterTests(unittest.TestCase):
         self.assertEqual(result.termination, "output_limit")
         self.assertTrue(result.stdout_truncated)
         self.assertTrue(noisy.killed)
+
+    def test_output_reader_failure_fails_closed(self):
+        process = StreamErrorProcess()
+        with mock.patch.object(wsl_adapter.subprocess, "Popen", return_value=process), \
+             mock.patch.object(wsl_adapter, "_sterile_windows_environment", return_value={}):
+            with self.assertRaisesRegex(wsl_adapter.WslAdapterError, "output could not be read safely") as raised:
+                wsl_adapter._bounded_process(
+                    ["wsl.exe"], 1, cwd="/", metadata=("stream", "symphony-runtime", wsl_adapter.FIXED_DISTRO)
+                )
+        self.assertEqual(raised.exception.kind, "output_read")
 
     def test_malformed_output_fails_closed(self):
         with self.assertRaises(wsl_adapter.WslAdapterError) as raised:
