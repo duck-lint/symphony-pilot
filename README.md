@@ -50,6 +50,13 @@ Physical lifecycle operations run under WSL/Linux. Native Windows checks may
 validate profiles and dry-run deployment but must not fabricate WSL paths or
 mutate Linux state.
 
+The bounded Windows-host bridge in `scripts/wsl_adapter.py` is the only
+approved Windows-to-Linux transition for diagnostic or acceptance work. It
+targets only Ubuntu-24.04 as `duck-lint`, admits only approved Pilot/runtime
+roots, passes structured argv with a sterile environment, and fails closed on
+WSL, path, command, timeout, or output-boundary errors. See
+`docs/WSL_ADAPTER.md` for its contract and safe invocation form.
+
 ## Validation
 
     python3 -m unittest discover -s tests -v
