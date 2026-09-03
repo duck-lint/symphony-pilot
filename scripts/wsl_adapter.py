@@ -37,28 +37,11 @@ PROJECT_ROOTS = {
     "symphony-pilot": "/mnt/f/PROJECT-REPOS/symphony-pilot",
     "symphony-runtime": "/mnt/f/PROJECT-REPOS/symphony-runtime",
 }
-
-# These are host-owned locations already used by Pilot.  They are admitted as
-# cwd roots only for the owning project; the project-repository roots above are
-# the normal path for source and acceptance work.
-PROJECT_SHARED_ROOTS = {
-    "symphony-pilot": (
-        "/home/duck-lint/.config/symphony-pilot",
-        "/home/duck-lint/.local/share/symphony-pilot",
-        "/home/duck-lint/.local/state/symphony-pilot",
-    ),
-    "symphony-runtime": (),
-}
+CONTAINED_ENTRYPOINT = "/mnt/f/PROJECT-REPOS/symphony-pilot/runtime/wsl_contained_exec.py"
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 _WINDOWS_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
-_WINDOWS_COMMAND = re.compile(r"(?i)\b(?:cmd|powershell|pwsh|wsl|docker)(?:\.exe)?\b")
-_SECRET_CHANNEL = re.compile(
-    r"(?i)(?:CODEX_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|SSH_AUTH_SOCK|"
-    r"/\.codex(?:/|\Z)|/\.ssh(?:/|\Z)|/secrets(?:/|\Z)|/etc/shadow|"
-    r"/mnt/(?!f(?:/|\Z)))"
-)
-_PRIVILEGE_ESCALATION = re.compile(r"(?i)(?:\bsudo\b|\bsu\b|USER=root|--user[= ]+root)")
+_WINDOWS_EXECUTABLE = re.compile(r"(?i)^(?:cmd|powershell|pwsh|wsl|docker)(?:\.exe)?$")
 
 
 class WslAdapterError(RuntimeError):
@@ -162,7 +145,7 @@ def _lexical_cwd(project: str, cwd: str) -> str:
 
 
 def _allowed_roots(project: str) -> tuple[str, ...]:
-    return (PROJECT_ROOTS[project], *PROJECT_SHARED_ROOTS[project])
+    return (PROJECT_ROOTS[project],)
 
 
 def _within(path: str, roots: Sequence[str]) -> bool:
@@ -180,14 +163,9 @@ def _validate_command(command: Sequence[str]) -> tuple[str, ...]:
         raise WslAdapterError("invalid_command", "Linux argv contains a malformed argument")
     if sum(len(argument.encode("utf-8")) for argument in command) > MAX_ARGUMENT_BYTES:
         raise WslAdapterError("invalid_command", "Linux argv exceeds the adapter argument bound")
-    if any(_WINDOWS_PATH.search(argument) or _WINDOWS_COMMAND.search(argument) for argument in command):
-        raise WslAdapterError("windows_command_boundary", "Windows command or path content is not accepted")
-    if any(_SECRET_CHANNEL.search(argument) for argument in command):
-        raise WslAdapterError("secret_boundary", "credential or secret-path content is not accepted")
-    if any(_PRIVILEGE_ESCALATION.search(argument) for argument in command):
-        raise WslAdapterError("privilege_boundary", "root or privilege escalation is not accepted")
-
     executable = pathlib.PurePosixPath(command[0]).name
+    if _WINDOWS_EXECUTABLE.fullmatch(executable):
+        raise WslAdapterError("windows_command_boundary", "a Windows executable cannot be selected as the Linux command")
     if executable == "bash":
         if len(command) != 3 or command[1] != "-lc" or not command[2]:
             raise WslAdapterError("shell_boundary", "only one explicit bash -lc boundary is supported")
@@ -309,7 +287,11 @@ def _bounded_process(
 
 def _raise_if_wsl_transport_failed(result: WslExecutionResult) -> None:
     """Keep WSL service failures distinct from an ordinary Linux command error."""
-    service_output = f"{result.stdout}\n{result.stderr}"
+    # Some Windows WSL failures arrive as UTF-16 bytes without a BOM.  The
+    # normal decoder preserves those NULs so malformed output remains visible;
+    # service classification may safely remove them because it never returns
+    # or logs this diagnostic text.
+    service_output = f"{result.stdout}\n{result.stderr}".replace("\x00", "")
     if result.returncode in (-1, 0xFFFFFFFF) and re.search(
         r"(?i)(?:wsl/|access\s+is\s+denied|createinstance|enumeratedistros)", service_output
     ):
@@ -365,21 +347,15 @@ def execute(
     validated_command = _validate_command(command)
     wsl = _host_wsl_executable()
     resolved_cwd = _canonicalize_cwd(project, cwd, wsl, request_id)
-    command = _raw_command(
-        wsl,
-        [
-            "/usr/bin/env",
-            "-i",
-            "HOME=/home/duck-lint",
-            "USER=duck-lint",
-            "LOGNAME=duck-lint",
-            "PATH=/home/duck-lint/.local/bin:/usr/local/bin:/usr/bin:/bin",
-            "LANG=C.UTF-8",
-            "LC_ALL=C.UTF-8",
-            *validated_command,
-        ],
-        resolved_cwd,
-    )
+    command = _raw_command(wsl, [
+        "/usr/bin/env", "-i",
+        "HOME=/home/duck-lint", "USER=duck-lint", "LOGNAME=duck-lint",
+        "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
+        "/usr/bin/python3", CONTAINED_ENTRYPOINT,
+        "--project", project, "--cwd", resolved_cwd,
+        "--wall-seconds", str(max(1.0, float(timeout_seconds) - 5.0)), "--",
+        *validated_command,
+    ], "/")
     return _bounded_process(
         command,
         float(timeout_seconds),

@@ -12,17 +12,26 @@ Windows host -> Ubuntu-24.04 -> duck-lint
 
 It does not accept a distro argument. Project selection is limited to the
 registered `symphony-pilot` and `symphony-runtime` source roots under
-`/mnt/f/PROJECT-REPOS`. Pilot-owned state roots are admitted only for the
-Pilot project. The requested cwd is normalized lexically, canonicalized with
-Ubuntu's `/usr/bin/readlink -e`, checked for a symlink escape, and verified as a
+`/mnt/f/PROJECT-REPOS`. No Pilot state or secret root is an adapter cwd. The
+requested cwd is normalized lexically, canonicalized with Ubuntu's
+`/usr/bin/readlink -e`, checked for a symlink escape, and verified as a
 directory before the requested command runs.
 
-Invocation is structured `wsl.exe` argv with `shell=False`. An explicit
-`bash -lc` command is allowed only as the Linux shell boundary; it is passed as
-one argument and runs with `--noprofile --norc`. The Windows environment is
-reduced to `SystemRoot` and `WINDIR`; the Linux command receives a sterile
-allowlisted environment as `duck-lint`. Windows executable/path forms,
-credential channels, secret paths, `sudo`, and root requests are rejected.
+Invocation is structured `wsl.exe` argv with `shell=False`. The adapter does
+not attempt to parse shell, Python, Elixir, or Make source. It selects the
+trusted Linux supervisor `runtime/wsl_contained_exec.py`, which revalidates the
+project and executes the requested argv inside the existing rootless
+`linux-unshare` containment boundary. That boundary uses a private mount/PID/
+network namespace, a chroot, `--kill-child=SIGKILL`, resource limits, and
+explicit mounts. Project and Pilot-control source are read-only; only the
+declared build/cache root and runtime release output directories are writable.
+The contained HOME exposes only the reviewed mise binary/data paths, not the
+operator home, `.codex`, `.ssh`, or Pilot secrets. `/proc` is the contained
+namespace and no host descriptors are inherited. The Windows environment is
+reduced to `SystemRoot` and `WINDIR` before the supervisor starts, and the
+contained command receives a sterile allowlisted environment as `duck-lint`.
+The selected top-level executable cannot be a Windows command; this is defense
+in depth, not the filesystem security boundary.
 
 Each process has a bounded timeout and 4 MiB per-stream output cap. Results
 include the fixed distro, canonical cwd, exit code, output, timeout/termination
@@ -40,4 +49,6 @@ python scripts/wsl_adapter.py `
 ```
 
 The adapter never falls back to another distro, Windows shell, Windows Git,
-Docker, or same-user execution when WSL is unavailable.
+Docker, or unconstrained same-user execution when containment or WSL is
+unavailable. The trusted Linux supervisor itself is a setup process; the
+requested command does not run until its containment domain is established.

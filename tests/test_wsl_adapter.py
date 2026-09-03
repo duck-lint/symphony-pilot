@@ -9,6 +9,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "runtime"))
 
 import wsl_adapter
 
@@ -75,19 +76,53 @@ class WslAdapterTests(unittest.TestCase):
         command = wsl_adapter._validate_command(["/usr/bin/printf", "safe; echo not-a-second-command"])
         self.assertEqual(command[1], "safe; echo not-a-second-command")
         self.assertEqual(wsl_adapter._validate_command(["/usr/bin/printf", "safe\nnot-a-command"])[1], "safe\nnot-a-command")
-        with self.assertRaises(wsl_adapter.WslAdapterError):
-            wsl_adapter._validate_command(["bash", "-lc", "echo ok; powershell.exe -c whoami"])
+        self.assertEqual(
+            wsl_adapter._validate_command(["bash", "-lc", "echo ok; powershell.exe -c whoami"])[-1],
+            "echo ok; powershell.exe -c whoami",
+        )
 
-    def test_windows_commands_secrets_and_privilege_escalation_are_rejected(self):
-        for command in (
-            ["powershell.exe", "-NoProfile"],
-            ["/usr/bin/cat", "/home/duck-lint/.ssh/id_rsa"],
-            ["/usr/bin/sudo", "id"],
-            ["/usr/bin/printf", "C:\\Users\\madis"],
-        ):
+    def test_only_top_level_windows_executable_selection_is_rejected(self):
+        for command in (["powershell.exe", "-NoProfile"], ["cmd.exe", "/c", "whoami"]):
             with self.subTest(command=command):
                 with self.assertRaises(wsl_adapter.WslAdapterError):
                     wsl_adapter._validate_command(command)
+
+        # Secret-looking paths and privilege words are deliberately allowed as
+        # data.  The Linux namespace, not a blacklist, must deny their effects.
+        self.assertEqual(
+            wsl_adapter._validate_command(["/usr/bin/cat", "/home/duck-lint/.ssh/id_rsa"])[1],
+            "/home/duck-lint/.ssh/id_rsa",
+        )
+        self.assertEqual(
+            wsl_adapter._validate_command(["bash", "-lc", "cat secrets/token; sudo id"])[-1],
+            "cat secrets/token; sudo id",
+        )
+
+    def test_containment_domain_uses_allowlisted_mounts_and_chroot(self):
+        import containment
+
+        command = containment.acceptance_domain_command(
+            containment.BackendIdentity("schema", "linux-unshare", "/usr/bin/unshare", "v", "a" * 64),
+            pathlib.Path("/tmp/domain-root"),
+            pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-pilot"),
+            pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime"),
+            pathlib.Path("/home/duck-lint/.local/state/symphony-pilot/wsl-build/runtime"),
+            pathlib.Path("/home/duck-lint/.local/bin"),
+            pathlib.Path("/home/duck-lint/.local/share/mise"),
+            "/project/elixir",
+            ["bash", "-lc", "cat /home/duck-lint/.ssh/id_rsa"],
+            [(pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime/bin"), "/project/bin")],
+        )
+        setup = command[-1]
+        self.assertIn("mount --make-rprivate /", setup)
+        self.assertIn("mount -o remount,ro,bind", setup)
+        self.assertIn("exec chroot", setup)
+        self.assertIn("/project", setup)
+        self.assertIn("pilot-control", setup)
+        self.assertIn("--kill-child=SIGKILL", command)
+        self.assertIn("--net", command)
+        self.assertNotIn("/home/duck-lint/.config/symphony-pilot/secrets", setup)
+        self.assertNotIn("/home/duck-lint/.codex", setup)
 
     def test_execution_uses_sterile_environment_and_returns_structured_result(self):
         process = FakeProcess(stdout=b"ok\n", stderr=b"", returncode=7)
@@ -112,6 +147,8 @@ class WslAdapterTests(unittest.TestCase):
         self.assertEqual(invocation.kwargs["env"], {"SystemRoot": r"C:\Windows", "WINDIR": r"C:\Windows"})
         self.assertNotIn("GITHUB_TOKEN", invocation.kwargs["env"])
         self.assertIn("safe;still-one-arg", invocation.args[0])
+        self.assertIn(wsl_adapter.CONTAINED_ENTRYPOINT, invocation.args[0])
+        self.assertIn("--project", invocation.args[0])
         audit = result.audit_record()
         self.assertNotIn("safe;still-one-arg", audit)
         self.assertNotIn("ok\n", audit)
@@ -168,6 +205,19 @@ class WslAdapterTests(unittest.TestCase):
                 wsl_adapter._canonicalize_cwd(
                     "symphony-runtime", "/mnt/f/PROJECT-REPOS/symphony-runtime", pathlib.Path("wsl.exe"), "test"
                 )
+        self.assertEqual(raised.exception.kind, "wsl_unavailable")
+
+    def test_nul_padded_wsl_service_failure_is_classified(self):
+        unavailable = wsl_adapter.WslExecutionResult(
+            request_id="test", project="symphony-runtime", distro=wsl_adapter.FIXED_DISTRO,
+            cwd="/", returncode=0xFFFFFFFF,
+            stdout="A\x00c\x00c\x00e\x00s\x00s\x00 \x00i\x00s\x00 \x00d\x00e\x00n\x00i\x00e\x00d\x00.\x00\n"
+            "\x00E\x00r\x00r\x00o\x00r\x00 \x00c\x00o\x00d\x00e\x00:\x00 \x00W\x00s\x00l\x00/\x00S\x00e\x00r\x00v\x00i\x00c\x00e\x00/\x00E\x00_\x00A\x00C\x00C\x00E\x00S\x00S\x00D\x00E\x00N\x00I\x00E\x00D\x00\n\x00",
+            stderr="", timed_out=False, termination="completed", stdout_truncated=False,
+            stderr_truncated=False, started_at="now", finished_at="now",
+        )
+        with self.assertRaises(wsl_adapter.WslAdapterError) as raised:
+            wsl_adapter._raise_if_wsl_transport_failed(unavailable)
         self.assertEqual(raised.exception.kind, "wsl_unavailable")
 
 

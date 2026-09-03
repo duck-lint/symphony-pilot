@@ -158,7 +158,8 @@ def run_task_domain(command: Sequence[str], wall_seconds: float) -> TaskDomainRe
     """
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, close_fds=True)
+                                   stdin=subprocess.DEVNULL, text=True, close_fds=True,
+                                   start_new_session=True)
     except OSError as exc:
         raise ContainmentError("task_domain_start", "task-domain supervisor could not start") from exc
     try:
@@ -283,7 +284,114 @@ def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace
         f"mount -t proc proc {shlex.quote(str(root / 'proc'))}",
         f"prlimit --pid $$ --nproc={processes} --as={address_space_bytes} "
         f"--cpu={cpu_seconds} --nofile={DEFAULT_LIMITS['open_files']} --fsize={file_size_bytes}",
-        f"HOST_PID={host_pid} chroot {shlex.quote(str(root))} /bin/sh /fixture/hostile.sh",
+        f"HOST_PID={host_pid} exec chroot {shlex.quote(str(root))} /bin/sh /fixture/hostile.sh",
+    ]
+    return [identity.executable, "--user", "--map-root-user", "--mount", "--pid",
+            "--fork", "--kill-child=SIGKILL", "--mount-proc", "--net", "/bin/sh", "-c", "\n".join(setup)]
+
+
+def _acceptance_mount_ro(source: pathlib.Path, target: pathlib.Path) -> str:
+    """Bind one reviewed host path read-only without importing nested mounts."""
+    return (f"mkdir -p {shlex.quote(str(target))}; "
+            f"mount --bind {shlex.quote(str(source))} {shlex.quote(str(target))}; "
+            f"mount -o remount,ro,bind {shlex.quote(str(target))}")
+
+
+def _acceptance_mount_rw(source: pathlib.Path, target: pathlib.Path) -> str:
+    """Bind one explicitly writable output/cache path into the domain."""
+    return (f"mkdir -p {shlex.quote(str(target))}; "
+            f"mount --bind {shlex.quote(str(source))} {shlex.quote(str(target))}; "
+            f"mount -o remount,rw,bind {shlex.quote(str(target))}")
+
+
+def acceptance_domain_command(
+    identity: BackendIdentity,
+    root: pathlib.Path,
+    control_source: pathlib.Path,
+    project_source: pathlib.Path,
+    build_root: pathlib.Path,
+    toolchain_bin: pathlib.Path,
+    toolchain_data: pathlib.Path,
+    cwd: str,
+    command: Sequence[str],
+    writable_outputs: Sequence[tuple[pathlib.Path, str]] = (),
+    *,
+    processes: int | None = None,
+    address_space_bytes: int | None = None,
+    file_size_bytes: int | None = None,
+) -> list[str]:
+    """Construct a bounded host acceptance/build domain.
+
+    This is the same rootless user, mount, PID, network, prlimit, chroot, and
+    child-teardown boundary as the task domain.  Its mount allowlist differs:
+    source and control trees are read-only; only declared build/cache roots and
+    release output directories are writable.  The requested command is not
+    language-parsed here.  It runs after chroot, where the mount namespace—not
+    an argv blacklist—limits what shells and interpreters can reach.
+    """
+    processes = processes if processes is not None else DEFAULT_LIMITS["processes"]
+    address_space_bytes = address_space_bytes if address_space_bytes is not None else DEFAULT_LIMITS["address_space_bytes"]
+    file_size_bytes = file_size_bytes if file_size_bytes is not None else DEFAULT_LIMITS["file_size_bytes"]
+    values = (processes, address_space_bytes, file_size_bytes)
+    if any(not isinstance(value, int) or value < 1 for value in values):
+        raise ContainmentError("task_domain_limits", "task resource limits must be positive integers")
+    if not command or any(not isinstance(argument, str) or "\x00" in argument for argument in command):
+        raise ContainmentError("task_domain_command", "contained command must be a non-empty argv")
+    if not cwd.startswith("/project") or (len(cwd) > len("/project") and not cwd.startswith("/project/")):
+        raise ContainmentError("task_domain_cwd", "contained cwd must remain under /project")
+
+    root = root.resolve()
+    control_source = control_source.resolve()
+    project_source = project_source.resolve()
+    build_root = build_root.resolve()
+    toolchain_bin = toolchain_bin.resolve()
+    toolchain_data = toolchain_data.resolve()
+    project_target = root / "project"
+    control_target = root / "pilot-control"
+    build_target = root / "build"
+    toolchain_bin_target = root / "home/duck-lint/.local/bin"
+    toolchain_data_target = root / "home/duck-lint/.local/share/mise"
+    shell_command = f"cd {shlex.quote(cwd)} && exec {shlex.join(tuple(command))}"
+    system_mounts = [
+        _acceptance_mount_ro(pathlib.Path(source), root / source.lstrip("/"))
+        for source in ("/bin", "/usr", "/lib", "/lib64")
+        if pathlib.Path(source).exists()
+    ]
+    setup = [
+        "set -eu",
+        "mount --make-rprivate /",
+        f"mount -t tmpfs -o size=128m,nosuid,nodev tmpfs {shlex.quote(str(root))}",
+        f"mkdir -p {shlex.quote(str(root / 'project'))} {shlex.quote(str(root / 'pilot-control'))} "
+        f"{shlex.quote(str(root / 'build'))} {shlex.quote(str(root / 'home/duck-lint/.local/bin'))} "
+        f"{shlex.quote(str(root / 'home/duck-lint/.local/share/mise'))} "
+        f"{shlex.quote(str(root / 'proc'))} {shlex.quote(str(root / 'dev'))} "
+        f"{shlex.quote(str(root / 'tmp'))}",
+        _acceptance_mount_ro(control_source, control_target),
+        _acceptance_mount_ro(project_source, project_target),
+        _acceptance_mount_rw(build_root, build_target),
+        _acceptance_mount_ro(toolchain_bin, toolchain_bin_target),
+        _acceptance_mount_ro(toolchain_data, toolchain_data_target),
+        *(_acceptance_mount_rw(source, root / target.lstrip("/")) for source, target in writable_outputs),
+        *system_mounts,
+        f"mount -t tmpfs -o size=32m,nosuid,nodev tmpfs {shlex.quote(str(root / 'tmp'))}",
+        f"mount -t tmpfs -o size=2m,nosuid,nodev tmpfs {shlex.quote(str(root / 'dev'))}",
+        f"touch {shlex.quote(str(root / 'dev/null'))} {shlex.quote(str(root / 'dev/zero'))} "
+        f"{shlex.quote(str(root / 'dev/urandom'))}",
+        f"mount --bind /dev/null {shlex.quote(str(root / 'dev/null'))}",
+        f"mount --bind /dev/zero {shlex.quote(str(root / 'dev/zero'))}",
+        f"mount --bind /dev/urandom {shlex.quote(str(root / 'dev/urandom'))}",
+        f"mount -t proc proc {shlex.quote(str(root / 'proc'))}",
+        f"prlimit --pid $$ --nproc={processes} --as={address_space_bytes} "
+        f"--cpu={DEFAULT_LIMITS['cpu_seconds']} --nofile={DEFAULT_LIMITS['open_files']} --fsize={file_size_bytes}",
+        f"exec chroot {shlex.quote(str(root))} /usr/bin/env -i "
+        "HOME=/home/duck-lint USER=duck-lint LOGNAME=duck-lint "
+        "PATH=/home/duck-lint/.local/bin:/usr/local/bin:/usr/bin:/bin "
+        "LANG=C.UTF-8 LC_ALL=C.UTF-8 "
+        "MIX_HOME=/build/mix-home HEX_HOME=/build/hex-home "
+        "MIX_BUILD_ROOT=/build/mix/linux/_build "
+        "ZIG_LOCAL_CACHE_DIR=/build/zig/local ZIG_GLOBAL_CACHE_DIR=/build/zig/global "
+        "SYMPHONY_INSTALL_DIR=/build/burrito-install "
+        f"/bin/sh -c {shlex.quote(shell_command)}",
     ]
     return [identity.executable, "--user", "--map-root-user", "--mount", "--pid",
             "--fork", "--kill-child=SIGKILL", "--mount-proc", "--net", "/bin/sh", "-c", "\n".join(setup)]

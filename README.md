@@ -53,8 +53,10 @@ mutate Linux state.
 The bounded Windows-host bridge in `scripts/wsl_adapter.py` is the only
 approved Windows-to-Linux transition for diagnostic or acceptance work. It
 targets only Ubuntu-24.04 as `duck-lint`, admits only approved Pilot/runtime
-roots, passes structured argv with a sterile environment, and fails closed on
-WSL, path, command, timeout, or output-boundary errors. See
+roots, and passes structured argv to the existing Linux `linux-unshare`
+containment boundary. Source/control trees are read-only there; only explicit
+build/cache and release-output roots are writable. It fails closed on WSL,
+path, command, timeout, or output-boundary errors. See
 `docs/WSL_ADAPTER.md` for its contract and safe invocation form.
 
 ## Validation
