@@ -590,7 +590,12 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
         if _foreign_key_signature(connection, table) != expected_foreign_keys:
             raise SchemaError(f"SQLite foreign-key definitions are invalid: {table}")
 
-    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    try:
+        integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.DatabaseError as exc:
+        # Some SQLite builds report corruption by raising here rather than by
+        # returning a non-"ok" row. Preserve the public fail-closed contract.
+        raise SchemaError("SQLite integrity_check could not read the database") from exc
     integrity_errors = [str(row[0]) for row in integrity_rows if str(row[0]).lower() != "ok"]
     if integrity_errors:
         raise SchemaError(f"SQLite integrity_check failed: {integrity_errors}")
@@ -695,6 +700,37 @@ class ControlPlaneDatabase:
         try:
             _migrate(connection)
             database = cls(database_path, connection)
+            _OPEN_DATABASE_PATHS[database_path] = _OPEN_DATABASE_PATHS.get(database_path, 0) + 1
+            return database
+        except Exception:
+            connection.close()
+            raise
+
+    @classmethod
+    def open_readonly(cls, path: pathlib.Path | str | None = None) -> "ControlPlaneDatabase":
+        """Open current authoritative state without creating or preparing it.
+
+        This path performs no migration, permission change, or journal
+        configuration. SQLite ``mode=ro`` mechanically denies writes, while
+        full schema validation prevents reinterpretation of stale state.
+        """
+        database_path = _absolute_path(path) if path is not None else default_database_path()
+        connection = _connect_readonly(database_path)
+        try:
+            current = _schema_version(connection)
+            if current > CURRENT_SCHEMA_VERSION:
+                raise UnsupportedSchemaVersion(
+                    f"SQLite schema version {current} is newer than supported version "
+                    f"{CURRENT_SCHEMA_VERSION}"
+                )
+            if current != CURRENT_SCHEMA_VERSION:
+                raise SchemaError(
+                    f"read-only open requires schema version {CURRENT_SCHEMA_VERSION}; found {current}"
+                )
+            _validate_schema(connection)
+            database = cls(database_path, connection)
+            # Restore requires the authority to be offline. Read handles must
+            # therefore participate in the same accounting as write handles.
             _OPEN_DATABASE_PATHS[database_path] = _OPEN_DATABASE_PATHS.get(database_path, 0) + 1
             return database
         except Exception:
@@ -1330,6 +1366,11 @@ class ControlPlaneDatabase:
 def open_database(path: pathlib.Path | str | None = None) -> ControlPlaneDatabase:
     """Open or create the host control database at the accepted schema."""
     return ControlPlaneDatabase.open(path)
+
+
+def open_database_readonly(path: pathlib.Path | str | None = None) -> ControlPlaneDatabase:
+    """Open an existing current database through SQLite's read-only mode."""
+    return ControlPlaneDatabase.open_readonly(path)
 
 
 def inspect_schema_version(path: pathlib.Path | str) -> int:
