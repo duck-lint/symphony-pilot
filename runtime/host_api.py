@@ -7,19 +7,17 @@ host-owned state on every request; none can be overridden by request JSON.
 """
 from __future__ import annotations
 
-import http.cookies
 import http.server
 import ipaddress
 import json
 import pathlib
 import re
-import secrets
 import socket
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
-from control_db import ControlPlaneDatabase, ControlPlaneError, StateConflict
+from control_db import ControlPlaneDatabase, ControlPlaneError
 from prepare_workspace import deployment_path, project_namespaces
 from process_identity import matches
 from project_registry import resolve_project, validate_registry
@@ -32,9 +30,6 @@ SECRET_PATTERNS = (
     re.compile(r"(?:github_pat|gh[pousr]|sk)-?[A-Za-z0-9_\-]{12,}", re.I),
     re.compile(r"\bBearer\s+[^\s]+", re.I),
 )
-MAX_REQUEST_BYTES = 4096
-MAX_SESSIONS = 256
-SESSION_COOKIE = "symphony_host_session"
 STATIC_ROOT = pathlib.Path(__file__).resolve().parents[1] / "web"
 
 
@@ -86,7 +81,7 @@ class HostControlApplication:
     def projects(self) -> list[dict[str, Any]]:
         projects = []
         for profile in validate_registry(self.registry_root):
-            with self._database() as database:
+            with self._read_database() as database:
                 tasks = database.list_tasks(project_slug=profile.slug)
             projects.append({
                 "slug": profile.slug,
@@ -103,38 +98,20 @@ class HostControlApplication:
 
     def tasks(self, slug: str) -> list[dict[str, object]]:
         self._profile(slug)
-        with self._database() as database:
+        with self._read_database() as database:
             return redact(database.list_tasks(project_slug=slug))  # type: ignore[return-value]
 
     def task(self, slug: str, task_id: str) -> dict[str, object]:
         self._profile(slug)
         self._validate_task_id(task_id)
-        with self._database() as database:
+        with self._read_database() as database:
             projection = database.read_projection(task_id)
         if projection["task"]["project_slug"] != slug:  # type: ignore[index]
             raise ApiError(404, "unknown_task", "task is not registered to this project")
         return redact(projection)  # type: ignore[return-value]
 
-    def queue_task(self, slug: str, task_id: str) -> dict[str, object]:
-        """Invoke the one Step-4 command: atomically queue a prepared task."""
-        self._profile(slug)
-        self._validate_task_id(task_id)
-        try:
-            with self._database() as database:
-                task = database.read_task(task_id)
-                if task["project_slug"] != slug:
-                    raise ApiError(404, "unknown_task", "task is not registered to this project")
-                result = database.transition_task(
-                    task_id, expected_state="PREPARED", new_state="QUEUED",
-                    event_type="queued", payload={"source": "host_api"},
-                )
-                events = database.list_events(task_id)
-        except StateConflict as exc:
-            raise ApiError(409, "state_conflict", str(exc)) from exc
-        return {"task": result, "event": events[-1]}
-
-    def _database(self) -> ControlPlaneDatabase:
-        return ControlPlaneDatabase.open(self.database_path)
+    def _read_database(self) -> ControlPlaneDatabase:
+        return ControlPlaneDatabase.open_readonly(self.database_path)
 
     def _profile(self, slug: str):
         try:
@@ -175,9 +152,11 @@ class HostControlApplication:
         try:
             lock = validate_lock(value)
         except RuntimeLockError:
-            return {"state": "not_accepted", "lock_path": str(path)}
+            return {"state": "missing_or_invalid", "lock_path": str(path),
+                    "live_verification": "not_performed"}
         summary = {
-            "state": "accepted", "lock_path": str(path),
+            "state": "recorded", "lock_valid": True, "lock_path": str(path),
+            "live_verification": "not_performed",
         }
         for name in ("symphony", "codex", "containment"):
             summary[name] = {
@@ -192,22 +171,29 @@ class HostControlServer(http.server.ThreadingHTTPServer):
     def __init__(self, address, application: HostControlApplication):
         super().__init__(address, HostControlHandler)
         self.application = application
-        self.sessions: dict[str, str] = {}
         host, port = self.server_address[:2]
         bracketed = f"[{host}]" if ":" in host else host
-        self.trusted_origin = f"http://{bracketed}:{port}"
+        self.trusted_host = f"{bracketed}:{port}"
 
 
 class HostControlHandler(http.server.BaseHTTPRequestHandler):
     server: HostControlServer
 
+    def parse_request(self) -> bool:
+        """Reject DNS-rebinding Host values before dispatching any method."""
+        if not super().parse_request():
+            return False
+        if self.headers.get("Host") != self.server.trusted_host:
+            self.send_error(421, "HTTP Host does not name this loopback listener")
+            return False
+        return True
+
     def do_GET(self) -> None:
         try:
             path = urllib.parse.urlsplit(self.path).path
             if path == "/":
-                session, csrf = self._new_session()
-                body = (STATIC_ROOT / "index.html").read_text(encoding="utf-8").replace("{{CSRF_TOKEN}}", csrf)
-                self._send(200, body.encode(), "text/html; charset=utf-8", cookie=session)
+                body = (STATIC_ROOT / "index.html").read_bytes()
+                self._send(200, body, "text/html; charset=utf-8")
             elif path in {"/app.js", "/style.css"}:
                 content_type = "text/javascript; charset=utf-8" if path.endswith(".js") else "text/css; charset=utf-8"
                 self._send(200, (STATIC_ROOT / path[1:]).read_bytes(), content_type)
@@ -226,61 +212,10 @@ class HostControlHandler(http.server.BaseHTTPRequestHandler):
         except (ControlPlaneError, ValueError) as exc:
             self._json(400, {"error": "invalid_request", "message": str(exc)})
 
-    def do_POST(self) -> None:
-        try:
-            self._require_browser_boundary()
-            path = urllib.parse.urlsplit(self.path).path
-            match = re.fullmatch(r"/api/v1/projects/([^/]+)/tasks/([^/]+)/queue", path)
-            if not match:
-                raise ApiError(404, "not_found", "route does not exist")
-            body = self._request_json()
-            if body != {}:
-                raise ApiError(400, "unexpected_fields", "queue command accepts no authority fields")
-            slug, task_id = match.groups()
-            self._json(200, self.server.application.queue_task(slug, task_id))
-        except ApiError as exc:
-            self._json(exc.status, {"error": exc.code, "message": str(exc)})
-        except (ControlPlaneError, ValueError) as exc:
-            self._json(400, {"error": "invalid_request", "message": str(exc)})
-
-    def _new_session(self) -> tuple[str, str]:
-        session_id, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        # Cross-origin GETs cannot read the response, but they can still reach
-        # loopback. Bound their ability to grow host memory indefinitely.
-        while len(self.server.sessions) >= MAX_SESSIONS:
-            self.server.sessions.pop(next(iter(self.server.sessions)))
-        self.server.sessions[session_id] = csrf
-        cookie = f"{SESSION_COOKIE}={session_id}; HttpOnly; SameSite=Strict; Path=/"
-        return cookie, csrf
-
-    def _require_browser_boundary(self) -> None:
-        if self.headers.get("Origin") != self.server.trusted_origin:
-            raise ApiError(403, "untrusted_origin", "mutation origin is not trusted")
-        if self.headers.get_content_type() != "application/json":
-            raise ApiError(415, "content_type", "mutations require application/json")
-        cookies = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        morsel = cookies.get(SESSION_COOKIE)
-        expected = self.server.sessions.get(morsel.value) if morsel else None
-        supplied = self.headers.get("X-Symphony-CSRF")
-        if not expected or not supplied or not secrets.compare_digest(expected, supplied):
-            raise ApiError(403, "csrf", "valid session-bound CSRF proof is required")
-
-    def _request_json(self) -> object:
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError as exc:
-            raise ApiError(400, "content_length", "valid Content-Length is required") from exc
-        if length < 0 or length > MAX_REQUEST_BYTES:
-            raise ApiError(413, "request_too_large", "request body exceeds fixed limit")
-        try:
-            return json.loads(self.rfile.read(length))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ApiError(400, "invalid_json", "request body must be JSON") from exc
-
     def _json(self, status: int, value: object) -> None:
         self._send(status, json.dumps(value, sort_keys=True).encode(), "application/json")
 
-    def _send(self, status: int, body: bytes, content_type: str, cookie: str | None = None) -> None:
+    def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -288,8 +223,6 @@ class HostControlHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; frame-ancestors 'none'")
-        if cookie:
-            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 

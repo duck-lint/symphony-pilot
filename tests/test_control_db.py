@@ -61,6 +61,22 @@ class ControlDatabaseTests(unittest.TestCase):
             self.assertEqual(reopened.schema_version, 1)
             self.assertEqual(reopened.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
 
+    def test_readonly_open_denies_writes_and_blocks_restore_until_closed(self):
+        task = self.task()
+        readonly = control_db.open_database_readonly(self.database_path)
+        try:
+            self.assertEqual(readonly.read_task(task["id"])["id"], task["id"])
+            with self.assertRaises(sqlite3.OperationalError):
+                readonly.connection.execute("UPDATE tasks SET title = 'changed'")
+            with self.assertRaises(control_db.ControlPlaneError):
+                control_db.ControlPlaneDatabase.restore_from(
+                    self.database_path.with_name("unused.sqlite3"), self.database_path,
+                    replace=True,
+                )
+        finally:
+            readonly.close()
+        self.assertEqual(self.database.read_task(task["id"])["title"], "A local task")
+
     def test_newer_and_partial_schemas_fail_closed(self):
         self.database.close()
         newer_path = pathlib.Path(self.temporary.name) / "newer.sqlite3"

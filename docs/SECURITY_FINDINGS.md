@@ -21,9 +21,10 @@ block this read-mostly control surface.
 
 ## Step 4 boundary
 
-The local API adds no credential or execution path. Its sole mutation queues an
-already registered, already persisted `PREPARED` task through the existing
-compare-and-set lifecycle function. It does not start Runtime or Codex, publish,
-merge, change heads, accept repository/path input, or alter scheduler
-configuration. Findings above retain their status until their named phase
-provides mechanical evidence sufficient to close them.
+The local API is read-only and adds no credential or execution path. It does not
+queue or dispatch tasks, start Runtime or Codex, publish, merge, change heads,
+accept repository/path input, or alter scheduler configuration. Strict outbox
+and output redaction are defense in depth, not credential DLP; credential
+isolation must be structural before activation. Findings above retain their
+status until their named phase provides mechanical evidence sufficient to
+close them.
