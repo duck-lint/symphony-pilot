@@ -20,7 +20,7 @@ def main() -> int:
     args = parser.parse_args()
     application = HostControlApplication(ROOT / "projects", default_database_path())
     server = create_server(args.host, args.port, application)
-    print(f"Pilot control UI: {server.trusted_origin}")
+    print(f"Pilot control UI: http://{server.trusted_host}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
