@@ -54,10 +54,17 @@ The bounded Windows-host bridge in `scripts/wsl_adapter.py` is the only
 approved Windows-to-Linux transition for diagnostic or acceptance work. It
 targets only Ubuntu-24.04 as `duck-lint`, admits only approved Pilot/runtime
 roots, and passes structured argv to the existing Linux `linux-unshare`
-containment boundary. Source/control trees are read-only there; only explicit
-build/cache and release-output roots are writable. It fails closed on WSL,
-path, command, timeout, or output-boundary errors. See
-`docs/WSL_ADAPTER.md` for its contract and safe invocation form.
+containment boundary. The pre-containment supervisor is loaded only from the
+host-owned `symphony-canary` control deployment under
+`/home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary`; its
+manifest must verify the supervisor and containment files before containment
+is built.
+The contained domain mounts only the selected project read-only, the reviewed
+`mise` executable and data root read-only, and explicit build/cache and
+release-output roots writable. It does not mount the Pilot source checkout.
+It fails closed on WSL, deployment identity, path, command, timeout, or
+output-boundary errors. See `docs/WSL_ADAPTER.md` for its contract and safe
+invocation form.
 
 ## Validation
 

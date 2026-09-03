@@ -54,7 +54,7 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
                           "source_commit": source_commit,
                           "source_clean": not bool(source_status),
                           "role_policies": sorted(role_names),
-                          "files": 18 + len(ROLE_POLICY_FILES)}, sort_keys=True))
+                          "files": 19 + len(ROLE_POLICY_FILES)}, sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
@@ -63,11 +63,13 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         (stage / "workflow").mkdir()
         (stage / "workflow" / "agents").mkdir()
         (stage / "projects" / profile.slug).mkdir(parents=True)
-        # The owned runtime executable is shared host infrastructure.  It is
-        # intentionally absent from generated project deployments.
+        # The WSL supervisor is host control code.  It is deployed with the
+        # same atomic, manifest-covered snapshot as the other control hooks;
+        # the Windows adapter never executes its mutable source copy.
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
                      "host_integration.py", "process_identity.py", "launch_codex.sh",
-                     "deployment_contract.py", "containment.py", "task_admission.py", "broker.py",
+                     "deployment_contract.py", "containment.py", "wsl_contained_exec.py",
+                     "task_admission.py", "broker.py",
                      "dispatch_provenance.py",
                      "admit_task.py", "outbox.py", "rulesets.py", "publication.py",
                      "runtime_lock.py"):

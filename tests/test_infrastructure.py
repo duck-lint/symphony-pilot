@@ -273,6 +273,23 @@ class InfrastructureTests(unittest.TestCase):
                                 text=True, capture_output=True, check=True)
         self.assertIn('"profile": "cleanroom"', result.stdout)
 
+    def test_deployment_stages_manifest_covered_wsl_supervisor(self):
+        import deploy
+
+        def clean_git_result(args, **kwargs):
+            stdout = "a" * 40 + "\n" if args[1:3] == ["rev-parse", "HEAD"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(deploy.subprocess, "run", side_effect=clean_git_result):
+            target = deploy.deploy(ROOT / "projects/symphony-canary/profile.toml",
+                                   pathlib.Path(directory) / "deployment", False)
+            supervisor = target / "runtime/wsl_contained_exec.py"
+            manifest = json.loads((target / "DEPLOYMENT.json").read_text(encoding="utf-8"))
+            self.assertTrue(supervisor.is_file())
+            self.assertIn("runtime/wsl_contained_exec.py", manifest["files"])
+            self.assertIn("runtime/containment.py", manifest["files"])
+
     def test_python_and_shell_contracts_compile(self):
         result = subprocess.run([sys.executable, "-m", "compileall", "-q", "runtime", "scripts", "tests"],
                                 cwd=ROOT, capture_output=True, text=True)

@@ -360,6 +360,14 @@ def _acceptance_mount_ro(source: pathlib.Path, target: pathlib.Path) -> str:
             f"mount -o remount,ro,bind {shlex.quote(str(target))}")
 
 
+def _acceptance_mount_file_ro(source: pathlib.Path, target: pathlib.Path) -> str:
+    """Bind one reviewed executable without exposing its containing directory."""
+    return (f"mkdir -p {shlex.quote(str(target.parent))}; "
+            f"touch {shlex.quote(str(target))}; "
+            f"mount --bind {shlex.quote(str(source))} {shlex.quote(str(target))}; "
+            f"mount -o remount,ro,bind {shlex.quote(str(target))}")
+
+
 def _acceptance_mount_rw(source: pathlib.Path, target: pathlib.Path) -> str:
     """Bind one explicitly writable output/cache path into the domain."""
     return (f"mkdir -p {shlex.quote(str(target))}; "
@@ -370,10 +378,9 @@ def _acceptance_mount_rw(source: pathlib.Path, target: pathlib.Path) -> str:
 def acceptance_domain_command(
     identity: BackendIdentity,
     root: pathlib.Path,
-    control_source: pathlib.Path,
     project_source: pathlib.Path,
     build_root: pathlib.Path,
-    toolchain_bin: pathlib.Path,
+    toolchain_executable: pathlib.Path,
     toolchain_data: pathlib.Path,
     cwd: str,
     command: Sequence[str],
@@ -387,10 +394,12 @@ def acceptance_domain_command(
 
     This is the same rootless user, mount, PID, network, prlimit, chroot, and
     child-teardown boundary as the task domain.  Its mount allowlist differs:
-    source and control trees are read-only; only declared build/cache roots and
-    release output directories are writable.  The requested command is not
+    the project tree is read-only; only declared build/cache roots and release
+    output directories are writable.  The requested command is not
     language-parsed here.  It runs after chroot, where the mount namespace—not
-    an argv blacklist—limits what shells and interpreters can reach.
+    an argv blacklist—limits what shells and interpreters can reach.  Only the
+    reviewed ``mise`` executable is exposed from the operator toolchain bin
+    directory; its data root remains a separate explicit read-only mount.
     """
     processes = processes if processes is not None else DEFAULT_LIMITS["processes"]
     address_space_bytes = address_space_bytes if address_space_bytes is not None else DEFAULT_LIMITS["address_space_bytes"]
@@ -404,15 +413,13 @@ def acceptance_domain_command(
         raise ContainmentError("task_domain_cwd", "contained cwd must remain under /project")
 
     root = root.resolve()
-    control_source = control_source.resolve()
     project_source = project_source.resolve()
     build_root = build_root.resolve()
-    toolchain_bin = toolchain_bin.resolve()
+    toolchain_executable = toolchain_executable.resolve()
     toolchain_data = toolchain_data.resolve()
     project_target = root / "project"
-    control_target = root / "pilot-control"
     build_target = root / "build"
-    toolchain_bin_target = root / "home/duck-lint/.local/bin"
+    toolchain_target = root / "home/duck-lint/.local/bin/mise"
     toolchain_data_target = root / "home/duck-lint/.local/share/mise"
     shell_command = f"cd {shlex.quote(cwd)} && exec {shlex.join(tuple(command))}"
     system_mounts = [
@@ -424,15 +431,14 @@ def acceptance_domain_command(
         "set -eu",
         "mount --make-rprivate /",
         f"mount -t tmpfs -o size=128m,nosuid,nodev tmpfs {shlex.quote(str(root))}",
-        f"mkdir -p {shlex.quote(str(root / 'project'))} {shlex.quote(str(root / 'pilot-control'))} "
+        f"mkdir -p {shlex.quote(str(root / 'project'))} "
         f"{shlex.quote(str(root / 'build'))} {shlex.quote(str(root / 'home/duck-lint/.local/bin'))} "
         f"{shlex.quote(str(root / 'home/duck-lint/.local/share/mise'))} "
         f"{shlex.quote(str(root / 'proc'))} {shlex.quote(str(root / 'dev'))} "
         f"{shlex.quote(str(root / 'tmp'))}",
-        _acceptance_mount_ro(control_source, control_target),
         _acceptance_mount_ro(project_source, project_target),
         _acceptance_mount_rw(build_root, build_target),
-        _acceptance_mount_ro(toolchain_bin, toolchain_bin_target),
+        _acceptance_mount_file_ro(toolchain_executable, toolchain_target),
         _acceptance_mount_ro(toolchain_data, toolchain_data_target),
         *(_acceptance_mount_rw(source, root / target.lstrip("/")) for source, target in writable_outputs),
         *system_mounts,

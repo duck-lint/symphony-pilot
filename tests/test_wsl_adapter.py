@@ -115,10 +115,9 @@ class WslAdapterTests(unittest.TestCase):
         command = containment.acceptance_domain_command(
             containment.BackendIdentity("schema", "linux-unshare", "/usr/bin/unshare", "v", "a" * 64),
             pathlib.Path("/tmp/domain-root"),
-            pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-pilot"),
             pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime"),
             pathlib.Path("/home/duck-lint/.local/state/symphony-pilot/wsl-build/runtime"),
-            pathlib.Path("/home/duck-lint/.local/bin"),
+            pathlib.Path("/home/duck-lint/.local/bin/mise"),
             pathlib.Path("/home/duck-lint/.local/share/mise"),
             "/project/elixir",
             ["bash", "-lc", "cat /home/duck-lint/.ssh/id_rsa"],
@@ -129,7 +128,8 @@ class WslAdapterTests(unittest.TestCase):
         self.assertIn("mount -o remount,ro,bind", setup)
         self.assertIn("exec /usr/sbin/chroot", setup)
         self.assertIn("/project", setup)
-        self.assertIn("pilot-control", setup)
+        self.assertIn("mise", setup)
+        self.assertNotIn("pilot-control", setup)
         self.assertIn("--kill-child=SIGKILL", command)
         self.assertIn("--net", command)
         self.assertNotIn("/home/duck-lint/.config/symphony-pilot/secrets", setup)
@@ -159,6 +159,7 @@ class WslAdapterTests(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", invocation.kwargs["env"])
         self.assertIn("safe;still-one-arg", invocation.args[0])
         self.assertIn(wsl_adapter.CONTAINED_ENTRYPOINT, invocation.args[0])
+        self.assertNotIn("/mnt/f/PROJECT-REPOS/symphony-pilot/runtime/wsl_contained_exec.py", invocation.args[0])
         self.assertIn("--project", invocation.args[0])
         audit = result.audit_record()
         self.assertNotIn("safe;still-one-arg", audit)

@@ -37,7 +37,15 @@ PROJECT_ROOTS = {
     "symphony-pilot": "/mnt/f/PROJECT-REPOS/symphony-pilot",
     "symphony-runtime": "/mnt/f/PROJECT-REPOS/symphony-runtime",
 }
-CONTAINED_ENTRYPOINT = "/mnt/f/PROJECT-REPOS/symphony-pilot/runtime/wsl_contained_exec.py"
+CONTROL_DEPLOYMENT_PROFILE = "symphony-canary"
+CONTROL_DEPLOYMENT_ROOT = (
+    "/home/duck-lint/.local/share/symphony-pilot/deployments/"
+    + CONTROL_DEPLOYMENT_PROFILE
+)
+CONTAINED_ENTRYPOINT = (
+    CONTROL_DEPLOYMENT_ROOT + "/"
+    "runtime/wsl_contained_exec.py"
+)
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 _WINDOWS_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
