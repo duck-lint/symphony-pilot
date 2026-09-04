@@ -61,15 +61,10 @@ code. Step 5 does not activate them: the rendered `after_run` hook fails
 closed with an explicit Step-6 boundary, so no local `T-N` task is mapped to a
 GitHub issue or publication record here.
 
-For `ready_for_human_merge`, the host opens the fixed bundle once with
-descriptor/no-follow semantics, bounds and copies it into host-owned temporary
-storage, and closes the task descriptor. It then imports only that staged copy
-into a fresh bare repository, runs bundle verification and `git fsck`,
-requires the exact requested commit, checks ancestry from the licensed base or
-published head, and pushes only the derived branch with the dedicated deploy
-key. It then creates or retains exactly one matching draft PR and updates
-`task.json` only after publication succeeds. It never merges, closes, or
-deploys.
+The prior ready_for_human_merge bundle/publication path remains a deferred
+Step-6/Step-7 seam. Step 5 does not persist full lifecycle state, publish
+branches, create draft PRs, or map local tasks to GitHub records. The rendered
+after_run hook fails closed pending that later work.
 
 ## Execution truth states
 

@@ -343,7 +343,8 @@ def local_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[LocalTa
 
 
 def verify_repository(profile: Profile, workspace: pathlib.Path) -> None:
-    git_dir = pathlib.Path(git(workspace, "rev-parse", "--git-dir")).resolve()
+    git_dir = pathlib.Path(git(workspace, "rev-parse", "--git-dir"))
+    git_dir = (workspace / git_dir).resolve() if not git_dir.is_absolute() else git_dir.resolve()
     try:
         git_dir.relative_to(workspace / ".git")
     except ValueError as exc:
@@ -456,20 +457,39 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
             if process_owns_workspace(workspace):
                 raise PreparationError("workspace_in_use", "another process currently owns the task workspace")
             facts, record = local_task_facts(profile, workspace)
-            fetch_ref = facts.branch if facts.current_head or facts.published_head else facts.base_ref
+            continuation = facts.current_head or facts.published_head
+            fetch_ref = facts.branch if continuation else facts.base_ref
             fetch = subprocess.run(["git", "fetch", profile.git_remote, fetch_ref],
                                    cwd=workspace, text=True, capture_output=True)
             if fetch.returncode:
                 raise PreparationError("git_fetch", "licensed starting ref fetch failed")
             fetched_sha = git(workspace, "rev-parse", "FETCH_HEAD")
-            expected_sha = facts.selected_head
-            if fetched_sha != expected_sha:
-                raise PreparationError("server_ref_changed",
-                                       "server-fetched starting ref does not match the local task row")
-            if facts.base_sha and subprocess.run(
-                    ["git", "merge-base", "--is-ancestor", facts.base_sha, facts.selected_head],
-                    cwd=workspace, check=False).returncode:
-                raise PreparationError("ancestry", "local task continuation is not based on the required base")
+            if continuation:
+                if fetched_sha != facts.selected_head:
+                    raise PreparationError(
+                        "server_ref_changed",
+                        "server-fetched continuation ref does not match the local task row",
+                    )
+                if facts.base_sha and subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", facts.base_sha, facts.selected_head],
+                        cwd=workspace, check=False).returncode:
+                    raise PreparationError("ancestry", "local task continuation is not based on the required base")
+            else:
+                # The recorded base remains the task's starting identity. A
+                # normal default-branch fast-forward must not move it.
+                if subprocess.run(
+                        ["git", "cat-file", "-e", facts.base_sha + "^{commit}"],
+                        cwd=workspace, text=True, capture_output=True, check=False,
+                ).returncode:
+                    raise PreparationError("base_history_rewritten", "recorded task base commit is unavailable")
+                if subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", facts.base_sha, fetched_sha],
+                        cwd=workspace, check=False,
+                ).returncode:
+                    raise PreparationError(
+                        "base_history_rewritten",
+                        "recorded task base is not an ancestor of the registered base ref",
+                    )
             status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
             if status:
                 record_blocker(profile, workspace, facts, "dirty_task_workspace",

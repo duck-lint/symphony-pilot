@@ -1,6 +1,6 @@
 # symphony-pilot
 
-A trusted host-side control plane for issue-driven runs of the project-owned
+A trusted host-side control plane for local-task runs of the project-owned
 `symphony-runtime`. The canonical project registry is under `projects/`.
 Target repositories remain authoritative for project meaning, architecture,
 validation, and stop conditions.
@@ -9,12 +9,13 @@ validation, and stop conditions.
 
 The trusted host owns project admission, server-derived Git identity, runtime
 locks, process state, credentials, logs, recovery, branch-protection preflight,
-and publication. A GH-N task receives only its current source checkout and a
+and publication. A T-N task receives only its current source checkout and a
 fresh task-local Codex policy home. Task output is an untrusted strict outbox.
 
-Task branches are host-derived as codex/gh-<issue>-<task-id-prefix>. Base ref and
-base SHA come from trusted GitHub metadata and are stored in a strict host task
-record. Issue and workpad prose never controls checkout, branch, ref, SHA,
+Task branches are host-derived as
+codex/t-<identifier>-<task-id-prefix>. The registered Git remote supplies the
+default ref and exact base SHA; both are stored in a strict host task record.
+GitHub Issue and workpad prose never controls checkout, branch, ref, SHA,
 remote, credential, or process state.
 
 Codex policy is defense in depth. The one supported structural backend is the
@@ -27,9 +28,10 @@ tool network.
 
 ## Current status
 
-Host-side admission, dispatch provenance, strict result brokering, sterile
-bundle publication, ruleset protection checks, runtime identity locks, and
-fail-closed containment gates are implemented and fixture-tested.
+Host-side local-task intake, SQLite scheduler configuration, local workspace
+preparation, ruleset protection checks, runtime identity locks, and fail-closed
+containment gates are implemented and fixture-tested. Full lifecycle
+persistence and publication narrowing remain deferred to Steps 6 and 7.
 Persistent task-workspace aggregate disk growth is explicitly unbounded in this
 cutover, and the exact current Codex App Server authentication path has no
 proven way to keep its credential out of hostile tool children. Unattended
@@ -83,7 +85,8 @@ identities are pinned, and hostile-boundary probes pass.
 See docs/ARCHITECTURE.md, docs/SECURITY.md, docs/OPERATIONS.md,
 docs/HUMAN_ONBOARDING.md, docs/CODEX_ONBOARDING.md, and docs/RECOVERY.md.
 The host-owned SQLite contract is documented in docs/SQLITE_CONTRACT.md.
-Runtime implements the production SQLite tracker adapter. Pilot has not yet
-configured the managed scheduler to use it; scheduler cutover remains Step 5.
+Runtime implements the production SQLite tracker adapter, and the managed
+scheduler is configured to use it. Create a PREPARED task and explicitly queue
+it with scripts/task.py; no GitHub Issue or dispatch label is scheduler input.
 The Step-4 local operator surface is documented in docs/HOST_API.md and open or
 deferred security decisions are preserved in docs/SECURITY_FINDINGS.md.

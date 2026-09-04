@@ -18,7 +18,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
-from control_db import ControlPlaneDatabase, StateConflict, default_database_path  # noqa: E402
+from control_db import (ControlPlaneDatabase, ControlPlaneError,
+                        default_database_path)  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
 
 
@@ -142,7 +143,7 @@ def list_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="task.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -166,10 +167,10 @@ def main() -> int:
     list_parser.add_argument("--project", required=True)
     list_parser.set_defaults(handler=list_tasks)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (TaskCommandError, StateConflict, OSError, ValueError) as exc:
+    except (TaskCommandError, ControlPlaneError, OSError, ValueError) as exc:
         print(f"symphony-pilot task command stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 78
 

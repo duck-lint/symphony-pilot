@@ -14,7 +14,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 from prepare_workspace import Profile, PreparationError, deployment_path, load_profile
-from deployment_contract import contract_digest, deployment_identity
+from deployment_contract import DEPLOYED_RUNTIME_FILES, contract_digest, deployment_identity
 from project_registry import resolve_project
 from render_workflow import render
 
@@ -54,7 +54,8 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
                           "source_commit": source_commit,
                           "source_clean": not bool(source_status),
                           "role_policies": sorted(role_names),
-                          "files": 19 + len(ROLE_POLICY_FILES)}, sort_keys=True))
+                          "files": (len(DEPLOYED_RUNTIME_FILES) + len(ROLE_POLICY_FILES) + 3)},
+                         sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
@@ -66,11 +67,8 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         # The WSL supervisor is host control code.  It is deployed with the
         # same atomic, manifest-covered snapshot as the other control hooks;
         # the Windows adapter never executes its mutable source copy.
-        for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
-                     "host_integration.py", "process_identity.py", "launch_codex.sh",
-                     "deployment_contract.py", "containment.py", "wsl_contained_exec.py",
-                     "control_db.py", "runtime_lock.py"):
-            shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
+        for relative in DEPLOYED_RUNTIME_FILES:
+            shutil.copy2(ROOT / relative, stage / relative)
         shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
         for policy in ROLE_POLICY_FILES:
             shutil.copy2(policy, stage / "workflow" / "agents" / policy.name)

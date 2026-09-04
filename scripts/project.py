@@ -31,7 +31,7 @@ from prepare_workspace import (
     require_physical_namespace,
     state_namespace_for_slug,
 )
-from deployment_contract import contract_digest, deployment_identity
+from deployment_contract import DEPLOYED_RUNTIME_FILES, contract_digest, deployment_identity
 from containment import ContainmentError, backend_identity, require_execution_capability
 from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
 from rulesets import RulesetError, fetch_all_rulesets, fetch_ruleset_details, require_default_branch_ruleset
@@ -309,6 +309,17 @@ def branch_protection_preflight(profile, token):
 def project_name(profile):
     return profile.display_name or profile.slug
 
+
+def runtime_environment(root: pathlib.Path, workflow: pathlib.Path) -> dict[str, str]:
+    """Build Runtime's environment without retired tracker credentials."""
+    env = os.environ.copy()
+    env["SYMPHONY_PROFILE"] = str(root / "profile.toml")
+    env["SYMPHONY_WORKFLOW"] = str(workflow)
+    for name in ("SYMPHONY_PILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        env.pop(name, None)
+    return env
+
+
 def start(profile):
     pid_path, log_path = state_paths(profile)
     try:
@@ -374,11 +385,7 @@ def start(profile):
     except (RuntimeError, PreparationError) as exc:
         print(f"Cannot start {project_name(profile)}: {exc}")
         return 1
-    env = os.environ.copy()
-    env["SYMPHONY_PROFILE"] = str(root / "profile.toml")
-    env["SYMPHONY_WORKFLOW"] = str(workflow)
-    env.pop("GITHUB_TOKEN", None)
-    env.pop("GH_TOKEN", None)
+    env = runtime_environment(root, workflow)
     log = log_path.open("ab")
     command = [binary, "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
                "--logs-root", str(profile.log_root)]
@@ -630,17 +637,7 @@ def verify_manifest(root, manifest_path, manifest):
 
 REQUIRED_DEPLOYMENT_FILES = (
     "profile.toml",
-    "runtime/prepare_workspace.py",
-    "runtime/after_run.py",
-    "runtime/broker.py",
-    "runtime/before_remove.py",
-    "runtime/host_integration.py",
-    "runtime/process_identity.py",
-    "runtime/launch_codex.sh",
-    "runtime/deployment_contract.py",
-    "runtime/containment.py",
-    "runtime/control_db.py",
-    "runtime/runtime_lock.py",
+    *DEPLOYED_RUNTIME_FILES,
     "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",
     "workflow/agents/project-manager.toml",
