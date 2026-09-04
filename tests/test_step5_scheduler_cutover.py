@@ -206,6 +206,25 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
             after = deployment_contract.contract_digest(ROOT)
         self.assertNotEqual(before, after)
 
+        def clean_git_result(args, **kwargs):
+            stdout = "a" * 40 + "\n" if args[1:3] == ["rev-parse", "HEAD"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                deploy.subprocess, "run", side_effect=clean_git_result):
+            target = deploy.deploy(
+                ROOT / "projects/symphony-canary/profile.toml",
+                pathlib.Path(directory) / "deployment",
+                False,
+            )
+            profile = pw.load_profile(ROOT / "projects/symphony-canary/profile.toml")
+            with mock.patch.object(project, "install_root", return_value=target):
+                project.verify_deployment(profile)
+                with mock.patch.object(pathlib.Path, "read_bytes", changed_task_bytes):
+                    with self.assertRaises(pw.PreparationError) as raised:
+                        project.verify_deployment(profile)
+        self.assertIn("operator/runtime contract differs", str(raised.exception))
+
     def test_runtime_environment_scrubs_all_retired_tracker_credentials(self):
         seeded = {
             "SYMPHONY_PILOT_GITHUB_TOKEN": "pilot",
