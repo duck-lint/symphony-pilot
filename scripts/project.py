@@ -14,7 +14,6 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
@@ -32,7 +31,7 @@ from prepare_workspace import (
     require_physical_namespace,
     state_namespace_for_slug,
 )
-from deployment_contract import contract_digest, deployment_identity
+from deployment_contract import DEPLOYED_RUNTIME_FILES, contract_digest, deployment_identity
 from containment import ContainmentError, backend_identity, require_execution_capability
 from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
 from rulesets import RulesetError, fetch_all_rulesets, fetch_ruleset_details, require_default_branch_ruleset
@@ -295,12 +294,6 @@ def runtime_state(profile):
     endpoint = _dashboard_url(profile)
     return runtime_state_at(endpoint) if endpoint is not None else None
 
-def active_issues(profile, token):
-    issues = github(profile, token, "GET", "/issues?state=open&labels=" +
-                    urllib.parse.quote(",".join(profile.dispatch_labels)) + "&per_page=100")
-    return issues if isinstance(issues, list) else []
-
-
 def branch_protection_preflight(profile, token):
     """Require the one supported real GitHub repository-ruleset contract."""
     repository = github(profile, token, "GET", "")
@@ -315,6 +308,17 @@ def branch_protection_preflight(profile, token):
 
 def project_name(profile):
     return profile.display_name or profile.slug
+
+
+def runtime_environment(root: pathlib.Path, workflow: pathlib.Path) -> dict[str, str]:
+    """Build Runtime's environment without retired tracker credentials."""
+    env = os.environ.copy()
+    env["SYMPHONY_PROFILE"] = str(root / "profile.toml")
+    env["SYMPHONY_WORKFLOW"] = str(workflow)
+    for name in ("SYMPHONY_PILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        env.pop(name, None)
+    return env
+
 
 def start(profile):
     pid_path, log_path = state_paths(profile)
@@ -363,10 +367,13 @@ def start(profile):
             return 78
         print("Cannot start Symphony: stale process state requires explicit recovery before cutover")
         return 78
+    # This credential is used only for the host-side branch-protection
+    # preflight. It is not tracker configuration and never enters Runtime's
+    # scheduler environment.
     try:
         token = read_secret(profile)
     except PreparationError as exc:
-        print(f"Cannot start Symphony: {exc}")
+        print(f"Cannot verify protected default branch: {exc}")
         return 1
     try:
         branch_protection_preflight(profile, token)
@@ -374,24 +381,11 @@ def start(profile):
         print(f"Cannot start Symphony: protected default-branch preflight failed: {exc}")
         return 78
     try:
-        issues = active_issues(profile, token)
-    except Exception as exc:
-        print(f"Cannot verify GitHub dispatch state: {type(exc).__name__}. No process was started.")
-        return 1
-    if len(issues) > profile.max_concurrent_agents:
-        print(f"Refusing to start: {len(issues)} dispatchable issues exceed the one-issue pilot limit.")
-        return 1
-    try:
         establish_awake_guard(profile)
     except (RuntimeError, PreparationError) as exc:
         print(f"Cannot start {project_name(profile)}: {exc}")
         return 1
-    env = os.environ.copy()
-    env["SYMPHONY_PILOT_GITHUB_TOKEN"] = token
-    env["SYMPHONY_PROFILE"] = str(root / "profile.toml")
-    env["SYMPHONY_WORKFLOW"] = str(workflow)
-    env.pop("GITHUB_TOKEN", None)
-    env.pop("GH_TOKEN", None)
+    env = runtime_environment(root, workflow)
     log = log_path.open("ab")
     command = [binary, "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
                "--logs-root", str(profile.log_root)]
@@ -643,21 +637,7 @@ def verify_manifest(root, manifest_path, manifest):
 
 REQUIRED_DEPLOYMENT_FILES = (
     "profile.toml",
-    "runtime/prepare_workspace.py",
-    "runtime/after_run.py",
-    "runtime/broker.py",
-    "runtime/before_remove.py",
-    "runtime/host_integration.py",
-    "runtime/process_identity.py",
-    "runtime/launch_codex.sh",
-    "runtime/deployment_contract.py",
-    "runtime/containment.py",
-    "runtime/task_admission.py",
-    "runtime/admit_task.py",
-    "runtime/outbox.py",
-    "runtime/rulesets.py",
-    "runtime/publication.py",
-    "runtime/runtime_lock.py",
+    *DEPLOYED_RUNTIME_FILES,
     "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",
     "workflow/agents/project-manager.toml",

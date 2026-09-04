@@ -8,30 +8,42 @@ lifecycle or architectural authority.
 
 ## Authority topology
 
-The host owns the canonical registry, tracker credential, publication deploy
-key, server-derived task admission, runtime locks, process state, workpad
-identity, lifecycle labels, draft-PR identity, and publication. Issue prose,
-workpad prose, task Git metadata, task output, and task filesystem state are
-untrusted payload.
+The host owns the canonical registry, SQLite task rows, local task identity,
+publication deploy key, runtime locks, process state, and publication. Issue
+prose, workpad prose, task Git metadata, task output, and task filesystem state
+are untrusted payload. GitHub remains a deferred publication/lifecycle
+integration, not scheduler authority.
 
-The profile supplies only project onboarding data: repository, clone remote,
-dispatch labels, trusted dispatcher logins, blocked label, model settings, and
+The profile supplies project onboarding data: repository, clone remote, any
+currently retained host-secret/publication settings, model settings, and
 resource preferences. Host paths and publication-key paths are derived from
-the project slug.
+the project slug. Legacy dispatch fields are not Runtime scheduler input.
 
-## Admission
+## Local task intake and scheduler authority
 
-Before a workpad or task record exists, the host reads the open issue, confirms
-all required labels are present, fetches the complete paginated issue-event
-history, and proves that the latest transition for every required label is a
-`labeled` event performed by a configured trusted dispatcher. The record stores
-`dispatch_provenance` entries containing label, actor, event id, and timestamp.
-No issue author, comment author, marker, branch, ref, or SHA is accepted as a
-substitute.
+The trusted operator CLI creates local tasks in the host-wide
+`control.sqlite3`. It accepts only a registered project slug, title, and
+objective. Pilot resolves the registered Git remote's symbolic `HEAD` and
+exact commit with `git ls-remote --symref <remote> HEAD`; ambiguity fails
+closed. The database transaction derives the UUID, next unique `T-000001`
+identifier, and `codex/t-000001-<12-hex-character-UUID-prefix>` branch.
 
-The host then reads the server default branch and exact HEAD, creates exactly
-one workpad comment, and writes `symphony-pilot-task/v1` outside the workspace.
-The task branch is derived as `codex/gh-<issue>-<task-id-prefix>`.
+Creation produces `PREPARED`. A separate `task.py queue` command performs the
+accepted compare-and-set transition `PREPARED -> QUEUED` and appends the
+`queued` event in the same transaction. Runtime reads SQLite in read-only mode,
+scoped to the rendered project slug, and dispatches only unblocked `QUEUED`
+rows. No GitHub issue, issue number, dispatch label, or `GH-N` identity is
+required or accepted in this causal chain.
+
+The workspace sequence is:
+
+```text
+PREPARED
+   ↓ explicit host queue
+QUEUED
+   ↓ Runtime SQLite scheduler
+T-000001 workspace
+```
 
 ## Protection and publication
 
@@ -44,21 +56,20 @@ Publication uses the deterministic host secret
 `~/.config/symphony-pilot/secrets/<slug>/publication-ssh-key`, mode 0600. It is
 separate from the Issues/PR tracker token, human account, and task domain.
 
-The task writes only `/symphony-outbox/result.json` and the fixed
-`/symphony-outbox/publication.bundle`. The strict result contains `task_id`,
-exact optional `head`, `workpad_body`, `disposition`, and `summary`. The
-host updates the admitted workpad comment, maps dispositions to fixed label
-operations, and never accepts task-supplied endpoints or label names.
+The prior task outbox and broker remain deferred lifecycle/publication source
+code. Step 5 does not activate them: the rendered `after_run` script returns
+78 and performs no legacy GitHub lifecycle mapping, so no local `T-N` task is
+mapped to a GitHub issue or publication record here. Frozen Runtime treats
+after_run hook failures as best-effort; this return code is not an activation
+barrier.
 
-For `ready_for_human_merge`, the host opens the fixed bundle once with
-descriptor/no-follow semantics, bounds and copies it into host-owned temporary
-storage, and closes the task descriptor. It then imports only that staged copy
-into a fresh bare repository, runs bundle verification and `git fsck`,
-requires the exact requested commit, checks ancestry from the licensed base or
-published head, and pushes only the derived branch with the dedicated deploy
-key. It then creates or retains exactly one matching draft PR and updates
-`task.json` only after publication succeeds. It never merges, closes, or
-deploys.
+The prior ready_for_human_merge bundle/publication path remains a deferred
+Step-6/Step-7 seam. Step 5 does not persist full lifecycle state, publish
+branches, create draft PRs, or map local tasks to GitHub records. The rendered
+after_run script only signals that reconciliation is unavailable. Actual
+Step-5 safety depends on the existing execution-capability gate. Step 6 must
+establish lifecycle reconciliation before Step 8 may authorize unattended
+execution.
 
 ## Execution truth states
 
@@ -68,10 +79,12 @@ deploys.
 | Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
 | Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
 | Aggregate persistent-workspace disk quota | UNBOUNDED | no generic quota authority in this cutover |
-| Host admission and dispatch provenance | PROVEN BY FIXTURES | strict parser and pagination fixtures |
-| Host broker and publication transfer | PROVEN BY FIXTURES | lifecycle and sterile bundle fixture |
+| Local SQLite task intake / queue authority | TARGETED / FIXTURE-VERIFIED | trusted task CLI, transactionally allocated identity, and PREPARED-to-QUEUED CAS tests |
+| Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
+| Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
+| Host broker and publication transfer | DEFERRED / NOT ACTIVE | source-only lifecycle/publication seam reserved for Steps 6 and 7 |
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
-| Codex App Server activation | BLOCKED | auth boundary remains unproven |
+| Codex App Server activation | BLOCKED | existing execution-capability gate and launch boundary remain fail-closed |
 | Live Codex task containment | NOT YET PROVEN | no Codex task was started |
 | Multi-role canary and live cutover | NOT RUN | explicitly prohibited for this PR |
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare one disposable issue workspace before an architect attempt.
+"""Prepare one disposable local-task workspace before an architect attempt.
 
 This module owns execution state only. Project semantics remain in the target
 repository and are never inferred here.
@@ -15,7 +15,6 @@ try:
 except ImportError:  # host-side validation may run under Windows Python
     fcntl = None
     import msvcrt
-import hashlib
 import json
 import os
 import pathlib
@@ -27,9 +26,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-
-from task_admission import read_task, task_state_path
-
 
 class PreparationError(RuntimeError):
     def __init__(self, kind: str, message: str, persisted: bool = False):
@@ -66,17 +62,17 @@ class Profile:
     source_profile_path: pathlib.Path | None = None
 
 
-@dataclasses.dataclass
-class IssueFacts:
-    issue: int
+@dataclasses.dataclass(frozen=True)
+class LocalTaskFacts:
+    task_uuid: str
+    identifier: str
     branch: str
-    target_sha: str
-    default_ref: str
+    selected_head: str
+    base_ref: str
     base_sha: str
     mode: str
-    remote_sha: str | None
-    pr_number: int | None
-    comments: list[dict]
+    current_head: str | None
+    published_head: str | None
 
 
 def configured_path(value: str) -> pathlib.Path:
@@ -150,6 +146,17 @@ def project_namespaces(profile: Profile) -> dict[str, pathlib.PurePath]:
         "workflow": data / "projects" / profile.slug / "WORKFLOW.md",
         "credentials": home / ".config" / "symphony-pilot" / "secrets" / profile.slug,
     }
+
+
+def control_database_path(profile: Profile) -> pathlib.PurePath:
+    """Return the one host-wide database shared by registered projects."""
+    raw = str(profile.state_root)
+    # Windows Python may represent a configured WSL path as ``\home\...``.
+    # Preserve the deployment's Linux spelling instead of emitting a Windows
+    # path into the Runtime workflow.
+    if raw.startswith("\\") and not re.match(r"^[A-Za-z]:", raw):
+        return pathlib.PurePosixPath(raw.replace("\\", "/")).parent / "control.sqlite3"
+    return pathlib.PurePath(profile.state_root).parent / "control.sqlite3"
 
 
 def deployment_path(profile: Profile) -> pathlib.Path | pathlib.PurePosixPath:
@@ -309,32 +316,35 @@ def github(profile: Profile, token: str, method: str, path: str, body: object | 
         raise PreparationError("github_transport", f"GitHub transport failure: {exc}") from exc
 
 
-def admitted_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[IssueFacts, dict[str, object]]:
-    match = re.fullmatch(r"GH-(\d+)", workspace.name)
+def local_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[LocalTaskFacts, dict[str, object]]:
+    match = re.fullmatch(r"T-(\d{6})", workspace.name)
     if not match:
-        raise PreparationError("workspace_identity", "workspace name is not GH-N")
-    issue = int(match.group(1))
+        raise PreparationError("workspace_identity", "workspace name is not T-N")
     try:
-        record = read_task(task_state_path(require_physical_namespace(profile.state_root), issue))
+        from control_db import ControlPlaneDatabase
+
+        with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+            record = database.read_task_by_identifier(match.group(0), project_slug=profile.slug)
     except Exception as exc:
-        raise PreparationError("task_admission", str(exc)) from exc
-    if record["repository"] != profile.repository or record["project_slug"] != profile.slug:
-        raise PreparationError("task_admission", "host task record does not belong to this project")
-    branch = str(record["issue_branch"])
+        raise PreparationError("task_lookup", str(exc)) from exc
+    branch = str(record["branch"])
     base_sha = str(record["base_sha"])
-    # The task-local origin and its refs are not authority. The host record is
-    # the only continuation identity; prepare() fetches the exact recorded
-    # commit from the profile remote below.
-    remote_sha = record["published_head"]
-    target_sha = remote_sha or base_sha
-    facts = IssueFacts(issue, branch, target_sha, str(record["default_ref"]), base_sha,
-                       "continuation" if remote_sha else "initial", remote_sha,
-                       ((record["draft_pr"] or {}).get("number") if record["draft_pr"] else None), [])
+    current_head = record["current_head"]
+    published_head = record["published_head"]
+    selected_head = current_head or published_head or base_sha
+    facts = LocalTaskFacts(
+        task_uuid=str(record["id"]), identifier=str(record["identifier"]), branch=branch,
+        selected_head=str(selected_head), base_ref=str(record["base_ref"]), base_sha=base_sha,
+        mode="continuation" if current_head or published_head else "initial",
+        current_head=str(current_head) if current_head else None,
+        published_head=str(published_head) if published_head else None,
+    )
     return facts, record
 
 
 def verify_repository(profile: Profile, workspace: pathlib.Path) -> None:
-    git_dir = pathlib.Path(git(workspace, "rev-parse", "--git-dir")).resolve()
+    git_dir = pathlib.Path(git(workspace, "rev-parse", "--git-dir"))
+    git_dir = (workspace / git_dir).resolve() if not git_dir.is_absolute() else git_dir.resolve()
     try:
         git_dir.relative_to(workspace / ".git")
     except ValueError as exc:
@@ -373,7 +383,7 @@ def find_tool(name: str) -> str | None:
     return "/mnt/" + path[0].lower() + "/" + path[3:].replace("\\", "/") if re.match(r"^[A-Za-z]:\\", path) else path
 
 
-def prepare_toolchain(profile: Profile, workspace: pathlib.Path, issue: int) -> dict:
+def prepare_toolchain(profile: Profile, workspace: pathlib.Path, identifier: str) -> dict:
     if profile.toolchain != "rust":
         return {"kind": profile.toolchain, "commands": {}, "target_directory": None}
     found = {name: find_tool(name) for name in ("cargo", "rustc", "rustfmt", "rustdoc")}
@@ -384,7 +394,7 @@ def prepare_toolchain(profile: Profile, workspace: pathlib.Path, issue: int) -> 
     windows_temp = result.stdout.strip()
     target = None
     if re.match(r"^[A-Za-z]:\\", windows_temp):
-        target = windows_temp.rstrip("\\/") + "\\symphony-pilot-cargo\\" + profile.slug + "\\GH-" + str(issue)
+        target = windows_temp.rstrip("\\/") + "\\symphony-pilot-cargo\\" + profile.slug + "\\" + identifier
     env_file = workspace / ".git/symphony-toolchain.env"
     env_file.write_text("# generated by host preparation; do not commit\n" +
                         f'export PATH="{pathlib.PurePosixPath(found["cargo"]).parent}:$PATH"\n' +
@@ -392,11 +402,12 @@ def prepare_toolchain(profile: Profile, workspace: pathlib.Path, issue: int) -> 
     return {"kind": "rust", "commands": found, "target_directory": target}
 
 
-def marker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, tools: dict) -> None:
-    data = {"schema": "symphony-pilot-preparation/v2", "profile": profile.slug,
-            "repo": profile.repository, "issue": facts.issue, "task_branch": facts.branch,
-            "task_head": facts.target_sha, "published_head": facts.remote_sha,
-            "default_ref": facts.default_ref, "base_sha": facts.base_sha,
+def marker(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts, tools: dict) -> None:
+    data = {"schema": "symphony-pilot-preparation/v3", "project": profile.slug,
+            "task_uuid": facts.task_uuid, "identifier": facts.identifier,
+            "task_branch": facts.branch, "selected_head": facts.selected_head,
+            "current_head": facts.current_head, "published_head": facts.published_head,
+            "base_ref": facts.base_ref, "base_sha": facts.base_sha,
             "mode": facts.mode, "clean_status": True,
             "prepared_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "run_id": uuid.uuid4().hex, "toolchain": tools,
@@ -407,28 +418,16 @@ def marker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts, tools: 
     os.replace(temporary, path)
 
 
-def blocker_fingerprint(profile: Profile, workspace: pathlib.Path, facts: IssueFacts,
-                        kind: str, detail: str) -> str:
-    status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False)
-    value = "\0".join((profile.slug, str(facts.issue), facts.branch, facts.target_sha, kind, detail, status))
-    return hashlib.sha256(value.encode()).hexdigest()[:24]
-
-
-def record_blocker(profile: Profile, workspace: pathlib.Path, facts: IssueFacts,
+def record_blocker(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts,
                    kind: str, detail: str) -> None:
-    digest = blocker_fingerprint(profile, workspace, facts, kind, detail)
-    path = require_physical_namespace(profile.state_root) / "blockers" / f"GH-{facts.issue}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    old = json.loads(path.read_text()) if path.exists() else {}
-    repeated = old.get("fingerprint") == digest
-    path.write_text(json.dumps({"schema": "symphony-pilot-blocker/v1",
-                                "fingerprint": digest, "kind": kind,
-                                "issue": facts.issue, "detail": detail,
-                                "status": "active"}, indent=2) + "\n")
-    if repeated:
-        return
-    # A blocker record is host audit state. Workpad discovery and mutation are
-    # intentionally absent: only the comment id in task.json is authoritative.
+    # Blockers are now rows in the same host authority the Runtime adapter
+    # reads. A repeated preparation failure is intentionally not deduplicated
+    # here; Step 6 owns richer lifecycle reconciliation.
+    from control_db import ControlPlaneDatabase
+
+    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+        database.record_blocker(task_id=facts.task_uuid, kind=kind if kind in {"human", "project", "infrastructure"} else "infrastructure",
+                                body=f"{kind}: {detail}")
 
 
 def prepare(profile: Profile, workspace: pathlib.Path) -> None:
@@ -441,7 +440,7 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
         verify_repository(profile, workspace)
     except PreparationError:
         raise PreparationError("repository_identity", "task workspace origin is not the registered repository")
-    lock_path = require_physical_namespace(profile.state_root) / "locks" / f"{profile.slug}-GH-{workspace.name.removeprefix('GH-')}.lock"
+    lock_path = require_physical_namespace(profile.state_root) / "locks" / f"{profile.slug}-{workspace.name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w", encoding="utf-8") as lock:
         try:
@@ -452,38 +451,59 @@ def prepare(profile: Profile, workspace: pathlib.Path) -> None:
                 lock.flush()
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except (BlockingIOError, OSError) as exc:
-            raise PreparationError("workspace_locked", "issue workspace is already in use") from exc
+            raise PreparationError("workspace_locked", "task workspace is already in use") from exc
         facts = None
         try:
             if process_owns_workspace(workspace):
-                raise PreparationError("workspace_in_use", "another process currently owns the issue workspace")
-            facts, record = admitted_task_facts(profile, workspace)
-            fetch_ref = facts.branch if facts.remote_sha else facts.default_ref
+                raise PreparationError("workspace_in_use", "another process currently owns the task workspace")
+            facts, record = local_task_facts(profile, workspace)
+            continuation = facts.current_head or facts.published_head
+            fetch_ref = facts.branch if continuation else facts.base_ref
             fetch = subprocess.run(["git", "fetch", profile.git_remote, fetch_ref],
                                    cwd=workspace, text=True, capture_output=True)
             if fetch.returncode:
                 raise PreparationError("git_fetch", "licensed starting ref fetch failed")
             fetched_sha = git(workspace, "rev-parse", "FETCH_HEAD")
-            expected_sha = facts.target_sha if facts.remote_sha else facts.base_sha
-            if fetched_sha != expected_sha:
-                raise PreparationError("server_ref_changed",
-                                       "server-fetched starting ref does not match host admission")
-            if facts.base_sha and subprocess.run(
-                    ["git", "merge-base", "--is-ancestor", facts.base_sha, facts.target_sha],
-                    cwd=workspace, check=False).returncode:
-                raise PreparationError("ancestry", "issue continuation is not based on the required base")
+            if continuation:
+                if fetched_sha != facts.selected_head:
+                    raise PreparationError(
+                        "server_ref_changed",
+                        "server-fetched continuation ref does not match the local task row",
+                    )
+                if facts.base_sha and subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", facts.base_sha, facts.selected_head],
+                        cwd=workspace, check=False).returncode:
+                    raise PreparationError("ancestry", "local task continuation is not based on the required base")
+            else:
+                # The recorded base remains the task's starting identity. A
+                # normal default-branch fast-forward must not move it.
+                if subprocess.run(
+                        ["git", "cat-file", "-e", facts.base_sha + "^{commit}"],
+                        cwd=workspace, text=True, capture_output=True, check=False,
+                ).returncode:
+                    raise PreparationError("base_history_rewritten", "recorded task base commit is unavailable")
+                if subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", facts.base_sha, fetched_sha],
+                        cwd=workspace, check=False,
+                ).returncode:
+                    raise PreparationError(
+                        "base_history_rewritten",
+                        "recorded task base is not an ancestor of the registered base ref",
+                    )
             status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
             if status:
                 record_blocker(profile, workspace, facts, "dirty_task_workspace",
                                "task workspace is not a fresh clean checkout; no legacy recovery import is attempted")
                 raise PreparationError("dirty_task_workspace", "task workspace must be clean for straight-cutover admission", persisted=True)
-            git(workspace, "switch", "-C", facts.branch, facts.target_sha)
+            git(workspace, "switch", "-C", facts.branch, facts.selected_head)
             if git(workspace, "status", "--porcelain"):
                 raise PreparationError("clean_verification", "workspace remained dirty")
-            tools = prepare_toolchain(profile, workspace, facts.issue)
+            tools = prepare_toolchain(profile, workspace, facts.identifier)
             marker(profile, workspace, facts, tools)
-            print(json.dumps({"profile": profile.slug, "issue": facts.issue, "branch": facts.branch,
-                              "head": facts.target_sha, "mode": facts.mode, "marker": ".git/symphony-preparation.json"}, sort_keys=True))
+            print(json.dumps({"project": profile.slug, "identifier": facts.identifier,
+                              "task_uuid": facts.task_uuid, "branch": facts.branch,
+                              "head": facts.selected_head, "mode": facts.mode,
+                              "marker": ".git/symphony-preparation.json"}, sort_keys=True))
         except PreparationError as exc:
             if facts is not None and not exc.persisted:
                 try:

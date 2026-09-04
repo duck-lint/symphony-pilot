@@ -3,19 +3,23 @@
 The model, task processes, issue/workpad payload, task filesystem, task Git
 metadata, task result, and publication bundle are hostile inputs.
 
-Trusted host state consists of the canonical registry, server-derived issue
-and Git facts, tracker credential, dedicated publication deploy key, strict
-task records, runtime locks, process state, and host audit state. Secrets are
-never stored in Git, profiles, workpads, task homes, logs, or result payloads.
+Trusted host state consists of the canonical registry, host-derived Git facts,
+SQLite task rows, dedicated publication deploy key, runtime locks, process
+state, and host audit state. Any retained publication credential is read only
+by its host operation. Secrets are never stored in Git, profiles, workpads,
+task homes, logs, or result payloads.
 
-## Dispatch trust
+## Local dispatch trust
 
-Current label presence is necessary but insufficient. Admission requires the
-issue to be open and each required dispatch label's latest applicable server
-event to be a trusted `labeled` event. The actor login must be in that
-project's non-secret `trusted_dispatchers` profile set. Missing, ambiguous,
-malformed, or incomplete event history blocks admission before workpad or task
-state creation.
+The trusted operator is the authority for local task creation and the explicit
+`PREPARED -> QUEUED` transition. SQLite CAS plus its atomic `queued` event
+prevents repeated or conflicting queue requests from silently overwriting
+state. Runtime receives no tracker credential and reads only the project-scoped
+SQLite projection.
+
+GitHub issue labels and event history are not scheduler trust inputs after Step
+5. They survive only in deferred legacy/publication code and cannot create a
+local task or authorize a workspace.
 
 ## GitHub trust
 

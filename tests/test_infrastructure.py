@@ -272,6 +272,12 @@ class InfrastructureTests(unittest.TestCase):
                                  "--project", "cleanroom", "--dry-run"],
                                 text=True, capture_output=True, check=True)
         self.assertIn('"profile": "cleanroom"', result.stdout)
+        import deploy
+        summary = json.loads(result.stdout)
+        self.assertEqual(
+            summary["files"],
+            len(deploy.DEPLOYED_RUNTIME_FILES) + len(deploy.ROLE_POLICY_FILES) + 3,
+        )
 
     def test_deployment_stages_manifest_covered_wsl_supervisor(self):
         import deploy

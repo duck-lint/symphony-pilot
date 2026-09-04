@@ -3,8 +3,8 @@
 
 This module defines persistence authority only. Project registration remains in
 ``projects/<slug>/profile.toml``; SQLite stores the task and lifecycle state
-that refers to that externally registered slug. The runtime and browser do not
-open this database in Step 2.
+that refers to that externally registered slug. The runtime and browser open
+the database read-only; trusted host code is its writer.
 """
 from __future__ import annotations
 
@@ -82,6 +82,8 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 IDENTIFIER_RE = re.compile(r"^T-[0-9]{6}$")
+TASK_BRANCH_PREFIX = "codex/"
+TASK_ID_PREFIX_LENGTH = 12
 PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _UNSET = object()
@@ -139,6 +141,21 @@ def _project_slug(value: str) -> str:
     if not isinstance(value, str) or not PROJECT_SLUG_RE.fullmatch(value):
         raise ValueError("project_slug is invalid")
     return value
+
+
+def derive_task_branch(identifier: str, task_id: str | uuid.UUID) -> str:
+    """Derive the host-owned branch from the allocated local task identity.
+
+    The identifier makes the branch operator-readable and the UUID prefix
+    preserves the collision-resistance of the former host-derived branch
+    mechanism. Neither title/objective prose nor an operator-supplied branch
+    participates in this identity.
+    """
+    if not isinstance(identifier, str) or not IDENTIFIER_RE.fullmatch(identifier):
+        raise ValueError("identifier must match T-000042")
+    canonical_task_id = _uuid(task_id, "task_id")
+    task_id_prefix = canonical_task_id.replace("-", "")[:TASK_ID_PREFIX_LENGTH]
+    return f"{TASK_BRANCH_PREFIX}{identifier.lower()}-{task_id_prefix}"
 
 
 def _state(value: str) -> str:
@@ -785,7 +802,6 @@ class ControlPlaneDatabase:
         objective: str,
         base_ref: str,
         base_sha: str,
-        branch: str,
         task_id: str | uuid.UUID | None = None,
         identifier: str | None = None,
         state: str = "PREPARED",
@@ -798,7 +814,6 @@ class ControlPlaneDatabase:
         title = _text(title, "title")
         objective = _text(objective, "objective")
         base_ref = _text(base_ref, "base_ref")
-        branch = _text(branch, "branch")
         base_sha = _sha(base_sha, "base_sha", required=True)
         current_head = _sha(current_head, "current_head")
         published_head = _sha(published_head, "published_head")
@@ -812,6 +827,7 @@ class ControlPlaneDatabase:
         timestamp = _timestamp(created_at, "created_at")
         with self._transaction():
             identifier = identifier or self._allocate_identifier()
+            branch = derive_task_branch(identifier, task_id)
             self.connection.execute(
                 """
                 INSERT INTO tasks(
@@ -837,6 +853,24 @@ class ControlPlaneDatabase:
         value = _row(self.connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
         if value is None:
             raise ControlPlaneError(f"task does not exist: {task_id}")
+        return value
+
+    def read_task_by_identifier(self, identifier: str, *, project_slug: str | None = None) -> dict[str, object]:
+        """Read one local task identity, optionally enforcing project ownership."""
+        if not isinstance(identifier, str) or not IDENTIFIER_RE.fullmatch(identifier):
+            raise ValueError("identifier must match T-000042")
+        if project_slug is not None:
+            project_slug = _project_slug(project_slug)
+            value = _row(self.connection.execute(
+                "SELECT * FROM tasks WHERE identifier = ? AND project_slug = ?",
+                (identifier, project_slug),
+            ).fetchone())
+        else:
+            value = _row(self.connection.execute(
+                "SELECT * FROM tasks WHERE identifier = ?", (identifier,)
+            ).fetchone())
+        if value is None:
+            raise ControlPlaneError(f"task does not exist: {identifier}")
         return value
 
     def list_tasks(

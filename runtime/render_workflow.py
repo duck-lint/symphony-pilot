@@ -6,18 +6,19 @@ import pathlib
 import shlex
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from prepare_workspace import Profile, load_profile
+from prepare_workspace import Profile, control_database_path, load_profile
 
 def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -> str:
     runtime = install_root / "runtime"
     profile_path = install_root / "profile.toml"
     shell = lambda value: shlex.quote(str(value))
+    database_path = control_database_path(profile)
     lines = [
-        "---", "tracker:", "  kind: github",
-        "  provider:", f"    repo: {profile.repository}",
-        "    token: $SYMPHONY_PILOT_GITHUB_TOKEN",
-        "  required_labels:", *[f"    - {label}" for label in profile.dispatch_labels],
-        "  active_states:", "    - open", "  terminal_states:", "    - closed",
+        "---", "tracker:", "  kind: sqlite",
+        f"  database_path: {shell(database_path)}",
+        f"  project_slug: {profile.slug}",
+        "  active_states:", "    - QUEUED", "  terminal_states:",
+        "    - READY_FOR_HUMAN_MERGE",
         "polling:", f"  interval_ms: {profile.poll_interval_ms}",
         f"  max_retry_backoff_ms: {profile.max_retry_backoff_ms}",
         # Symphony still needs the host workspace allocator. The Codex task
@@ -25,7 +26,6 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "workspace:", f"  root: {profile.workspace_root}",
         "hooks:",
         "  after_create: |", f"    git clone --no-single-branch {shell(profile.git_remote)} .",
-        f"    exec python3 {shell(runtime / 'admit_task.py')} --profile {shell(profile_path)} --workspace \"$PWD\" --runtime-lock {shell(profile.state_root / 'runtime-lock.json')}",
         "  before_run: |", "    set -eu",
         f"    exec python3 {shell(runtime / 'prepare_workspace.py')} --profile {shell(profile_path)} --workspace \"$PWD\"",
         "  after_run: |", "    set -eu",

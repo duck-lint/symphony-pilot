@@ -32,7 +32,6 @@ class ControlDatabaseTests(unittest.TestCase):
             objective="Prove the host persistence contract",
             base_ref="main",
             base_sha=self.BASE_SHA,
-            branch="codex/gh-10-aaaaaaaaaaaa",
             task_id=task_id,
             identifier=identifier,
             state=state,
@@ -209,7 +208,7 @@ class ControlDatabaseTests(unittest.TestCase):
             with control_db.open_database(self.database_path) as database:
                 task = database.create_task(
                     project_slug="demo", title=f"Task {index}", objective="Concurrent allocation",
-                    base_ref="main", base_sha=self.BASE_SHA, branch=f"codex/task-{index}",
+                    base_ref="main", base_sha=self.BASE_SHA,
                     task_id=f"{index:08x}-1111-1111-1111-111111111111",
                 )
                 return str(task["identifier"])
@@ -457,14 +456,14 @@ class ControlDatabaseTests(unittest.TestCase):
         with control_db.open_database(target_path) as target:
             target.create_task(
                 project_slug="demo", title="Keep this", objective="The failed restore must not replace me",
-                base_ref="main", base_sha=self.BASE_SHA, branch="codex/keep",
+                base_ref="main", base_sha=self.BASE_SHA,
             )
         with self.assertRaises(control_db.UnsupportedSchemaVersion):
             control_db.ControlPlaneDatabase.restore_from(backup_path, target_path, replace=True)
         with control_db.open_database(target_path) as target:
             self.assertEqual([task["title"] for task in target.list_tasks()], ["Keep this"])
 
-    def test_rendered_containment_workflow_does_not_expose_control_database(self):
+    def test_rendered_workflow_points_runtime_at_host_control_database(self):
         from render_workflow import render
         from prepare_workspace import Profile
 
@@ -484,8 +483,11 @@ class ControlDatabaseTests(unittest.TestCase):
             policy = pathlib.Path(directory) / "policy.md"
             policy.write_text("policy\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
-        self.assertNotIn("control.sqlite3", rendered)
-        self.assertNotIn(".local/state/symphony-pilot/control", rendered)
+        self.assertIn("kind: sqlite", rendered)
+        self.assertIn("database_path: /home/operator/.local/state/symphony-pilot/control.sqlite3", rendered)
+        self.assertIn("project_slug: demo", rendered)
+        self.assertIn("- QUEUED", rendered)
+        self.assertIn("- READY_FOR_HUMAN_MERGE", rendered)
 
     def test_task_deletion_is_restricted_by_audit_history(self):
         task = self.task()
