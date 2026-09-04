@@ -270,9 +270,25 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
             profile = pw.load_profile(ROOT / "projects/symphony-canary/profile.toml")
             with mock.patch.object(project, "install_root", return_value=target):
                 project.verify_deployment(profile)
+                docs_path = (ROOT / "docs" / "ARCHITECTURE.md").resolve()
+                original_read_bytes = pathlib.Path.read_bytes
+
+                def mutate_path(path):
+                    data = original_read_bytes(path)
+                    return data + b"\n# temporary documentation mutation\n" if path.resolve() == docs_path else data
+
+                with mock.patch.object(pathlib.Path, "read_bytes", mutate_path):
+                    project.verify_deployment(profile)
                 for relative in ("workflow/architect_policy.md", "workflow/agents/reviewer.toml"):
+                    changed_path = (ROOT / relative).resolve()
+
+                    def mutate_policy(path, changed_path=changed_path):
+                        data = original_read_bytes(path)
+                        return data + b"\n# temporary constitutive policy mutation\n" \
+                            if path.resolve() == changed_path else data
+
                     with self.subTest(relative=relative), mock.patch.object(
-                            project, "contract_digest", return_value="temporary-policy-mutation"):
+                            pathlib.Path, "read_bytes", mutate_policy):
                         with self.assertRaises(pw.PreparationError) as raised:
                             project.verify_deployment(profile)
                         self.assertIn("operator/runtime contract differs", str(raised.exception))
