@@ -27,6 +27,18 @@ host database read-only and receives no GitHub tracker credential. GitHub code
 that remains in the repository is explicitly deferred publication/lifecycle
 code and is not a scheduler fallback.
 
+The Step-5 after_run script returns 78 and performs no legacy GitHub lifecycle
+mapping. Frozen Runtime treats after_run hook failures as best-effort, so this
+return code is not an activation barrier. Current Step-5 safety instead
+depends on the existing execution-capability gate; Step 6 must establish
+lifecycle reconciliation before Step 8 may authorize unattended execution.
+
+## STEP-6-BEFORE-ACTIVATION
+
+Step 6 lifecycle persistence/reconciliation must be accepted before the Step-8
+execution-capability blocker may be removed. The Step-5 after_run exit status
+is not a substitute for this ordering.
+
 ## Step 4 boundary
 
 The local API is read-only and adds no credential or execution path. It does not

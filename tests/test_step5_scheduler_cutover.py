@@ -160,7 +160,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertNotIn('env["SYMPHONY_PILOT_GITHUB_TOKEN"]', source)
         self.assertNotIn("dispatchable issues exceed", source)
 
-    def test_after_run_is_an_explicit_step6_fail_closed_boundary(self):
+    def test_after_run_reports_step6_boundary(self):
         import after_run
 
         with mock.patch.object(after_run, "load_profile"):
@@ -169,6 +169,14 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertEqual(result, 78)
         output.assert_called_once()
         self.assertIn("Step 6", output.call_args.args[0])
+        after_run_source = (ROOT / "runtime/after_run.py").read_text(encoding="utf-8")
+        architecture = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+        findings = (ROOT / "docs/SECURITY_FINDINGS.md").read_text(encoding="utf-8")
+        self.assertIn("best-effort", after_run_source)
+        self.assertIn("not an activation barrier", " ".join(architecture.split()))
+        self.assertIn("STEP-6-BEFORE-ACTIVATION", findings)
+        self.assertIn("not a substitute for this ordering", findings)
+        self.assertNotIn("after_run hook fails\nclosed", architecture)
 
     def test_deployment_generator_and_verifier_share_exact_runtime_inventory(self):
         def clean_git_result(args, **kwargs):

@@ -57,14 +57,19 @@ Publication uses the deterministic host secret
 separate from the Issues/PR tracker token, human account, and task domain.
 
 The prior task outbox and broker remain deferred lifecycle/publication source
-code. Step 5 does not activate them: the rendered `after_run` hook fails
-closed with an explicit Step-6 boundary, so no local `T-N` task is mapped to a
-GitHub issue or publication record here.
+code. Step 5 does not activate them: the rendered `after_run` script returns
+78 and performs no legacy GitHub lifecycle mapping, so no local `T-N` task is
+mapped to a GitHub issue or publication record here. Frozen Runtime treats
+after_run hook failures as best-effort; this return code is not an activation
+barrier.
 
 The prior ready_for_human_merge bundle/publication path remains a deferred
 Step-6/Step-7 seam. Step 5 does not persist full lifecycle state, publish
 branches, create draft PRs, or map local tasks to GitHub records. The rendered
-after_run hook fails closed pending that later work.
+after_run script only signals that reconciliation is unavailable. Actual
+Step-5 safety depends on the existing execution-capability gate. Step 6 must
+establish lifecycle reconciliation before Step 8 may authorize unattended
+execution.
 
 ## Execution truth states
 
@@ -74,10 +79,12 @@ after_run hook fails closed pending that later work.
 | Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
 | Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
 | Aggregate persistent-workspace disk quota | UNBOUNDED | no generic quota authority in this cutover |
-| Host admission and dispatch provenance | PROVEN BY FIXTURES | strict parser and pagination fixtures |
-| Host broker and publication transfer | PROVEN BY FIXTURES | lifecycle and sterile bundle fixture |
+| Local SQLite task intake / queue authority | TARGETED / FIXTURE-VERIFIED | trusted task CLI, transactionally allocated identity, and PREPARED-to-QUEUED CAS tests |
+| Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
+| Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
+| Host broker and publication transfer | DEFERRED / NOT ACTIVE | source-only lifecycle/publication seam reserved for Steps 6 and 7 |
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
-| Codex App Server activation | BLOCKED | auth boundary remains unproven |
+| Codex App Server activation | BLOCKED | existing execution-capability gate and launch boundary remain fail-closed |
 | Live Codex task containment | NOT YET PROVEN | no Codex task was started |
 | Multi-role canary and live cutover | NOT RUN | explicitly prohibited for this PR |
 
