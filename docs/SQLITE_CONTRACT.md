@@ -111,6 +111,14 @@ next state. The `ARCHITECT` role is represented in
 `PROJECT-MANAGER`, `PLANNER`, `IMPLEMENTER`, `REVIEWER`, `ADVERSARY`, and
 `ARCHIVIST`.
 
+Step-6 result findings carry the finite `blocker_kind` value `human`,
+`project`, `infrastructure`, or `null`. `unresolved project decision` requires
+`human` or `project`; `infrastructure condition` requires `infrastructure`;
+licensed and rejected findings require `null`. Descriptive finding text never
+selects escalation authority. A canonical `BLOCKED` role verdict is distinct
+from a reviewer `REQUEST_CHANGES` report, which the strict result normalizes to
+`FINDINGS`.
+
 Database-enforceable identity, uniqueness, foreign-key, shape, and timestamp
 relationships belong to SQLite. Project-slug resolution, permission to
 perform a lifecycle transition, role adjudication, and scheduler policy remain

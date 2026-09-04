@@ -241,6 +241,42 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                         project.verify_deployment(profile)
         self.assertIn("operator/runtime contract differs", str(raised.exception))
 
+    def test_policy_and_launcher_changes_invalidate_existing_deployment(self):
+        self.assertEqual(
+            deployment_contract.POLICY_FILES,
+            (
+                "workflow/architect_policy.md",
+                "workflow/agents/adversary.toml",
+                "workflow/agents/archivist.toml",
+                "workflow/agents/implementer.toml",
+                "workflow/agents/planner.toml",
+                "workflow/agents/project-manager.toml",
+                "workflow/agents/reviewer.toml",
+            ),
+        )
+        self.assertIn("runtime/launch_codex.sh", deployment_contract.CONTRACT_FILES)
+
+        def clean_git_result(args, **kwargs):
+            stdout = "a" * 40 + "\n" if args[1:3] == ["rev-parse", "HEAD"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                deploy.subprocess, "run", side_effect=clean_git_result):
+            target = deploy.deploy(
+                ROOT / "projects/symphony-canary/profile.toml",
+                pathlib.Path(directory) / "deployment",
+                False,
+            )
+            profile = pw.load_profile(ROOT / "projects/symphony-canary/profile.toml")
+            with mock.patch.object(project, "install_root", return_value=target):
+                project.verify_deployment(profile)
+                for relative in ("workflow/architect_policy.md", "workflow/agents/reviewer.toml"):
+                    with self.subTest(relative=relative), mock.patch.object(
+                            project, "contract_digest", return_value="temporary-policy-mutation"):
+                        with self.assertRaises(pw.PreparationError) as raised:
+                            project.verify_deployment(profile)
+                        self.assertIn("operator/runtime contract differs", str(raised.exception))
+
     def test_runtime_environment_scrubs_all_retired_tracker_credentials(self):
         seeded = {
             "SYMPHONY_PILOT_GITHUB_TOKEN": "pilot",

@@ -140,6 +140,8 @@ and preserve the marker and history while compacting only if necessary.
     - licensed correction
     - unresolved project decision
     - infrastructure condition
+    - rejected
+    blocker_kind: human | project | infrastructure | null
     disposition:
 
     ### Correction round N
@@ -161,6 +163,14 @@ and preserve the marker and history while compacting only if necessary.
     publication state:
     unresolved decisions:
     status:
+
+The strict lifecycle result uses canonical `FINDINGS` for a reviewer
+`REQUEST_CHANGES` disposition and canonical `BLOCKED` when a specialized role
+cannot proceed. `blocker_kind` is finite host-routing evidence; descriptive
+finding prose never chooses human versus project escalation. A blocked result
+must contain a blocker-producing finding or a canonical `BLOCKED` role
+disposition, and Pilot persists an open SQLite blocker before completing the
+Architect attempt.
 
 At the beginning of every Architect attempt:
 

@@ -20,6 +20,13 @@ prose, workpad prose, task Git metadata, task output, and task filesystem state
 are untrusted payload. GitHub remains a deferred publication/lifecycle
 integration, not scheduler authority.
 
+Review correction routing is phase-specific: reviewer and adversary corrections
+require their specialized `FINDINGS` packet; mechanical-validation correction is
+top-level Architect evidence and requires no specialized packet. A `BLOCKED`
+result may contain only the bounded role evidence available before the stop, but
+must produce an open SQLite blocker. Human/project/infrastructure escalation is
+carried by finite `blocker_kind`, never inferred from finding prose.
+
 The profile supplies project onboarding data: repository, clone remote, any
 currently retained host-secret/publication settings, model settings, and
 resource preferences. Host paths and publication-key paths are derived from

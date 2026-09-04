@@ -17,7 +17,7 @@ import stat
 import subprocess
 import uuid
 from control_db import ControlPlaneDatabase, ControlPlaneError, StateConflict
-from prepare_workspace import (Profile, PreparationError, control_database_path,
+from prepare_workspace import (Profile, control_database_path,
                                local_task_facts, require_physical_namespace)
 
 
@@ -36,7 +36,6 @@ ACTIVE_STATES = (
     "QUEUED", "PLANNED", "IMPLEMENTED", "REVIEW",
     "ADVERSARIAL_REVIEW", "FINAL_MECHANICAL_ACCEPTANCE",
 )
-TERMINAL_STATE = "READY_FOR_HUMAN_MERGE"
 ROLE_NAMES = {"PROJECT-MANAGER", "PLANNER", "IMPLEMENTER", "REVIEWER", "ADVERSARY", "ARCHIVIST"}
 OUTCOMES = {
     "planning_complete", "implementation_complete", "correction_complete",
@@ -44,6 +43,8 @@ OUTCOMES = {
     "correction_required", "blocked",
 }
 FINDING_CLASSES = {"licensed correction", "unresolved project decision", "infrastructure condition", "rejected"}
+BLOCKER_KINDS = {None, "human", "project", "infrastructure"}
+FINDING_FIELDS = {"role", "kind", "severity", "body", "classification", "blocker_kind"}
 ROLE_PACKET_FIELDS = {"role", "verdict", "summary", "head_sha", "findings"}
 RESULT_FIELDS = {
     "schema", "task_uuid", "identifier", "architect_role_run_id", "expected_state",
@@ -54,6 +55,10 @@ RESULT_FIELDS = {
 
 class LifecycleError(ControlPlaneError):
     """A lifecycle result or host lifecycle invariant is invalid."""
+
+
+class AllocationConflict(LifecycleError):
+    """A caller lost a host-owned allocation race or hit a normal precondition."""
 
 
 def _now() -> str:
@@ -183,51 +188,93 @@ def _packet(database: ControlPlaneDatabase, task: dict[str, object], run_id: str
     }
 
 
+def _record_task_infrastructure_blocker(profile: Profile, task_id: str, detail: str) -> None:
+    """Persist a task blocker when allocation fails before a role row exists."""
+    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+        task = database.read_task(task_id)
+        with database._transaction():
+            _insert_blocker(database, task, "infrastructure", detail)
+
+
+def _allocate_architect_attempt(profile: Profile, facts):
+    """Atomically allocate one Architect attempt, including its input packet."""
+    task: dict[str, object]
+    packet: dict[str, object]
+    run_id: str | None = None
+    task_identity_known = False
+    try:
+        with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+            # The check, round allocation, UUID allocation, role row, and start
+            # event share one BEGIN IMMEDIATE transaction. A concurrent loser sees
+            # the committed started row and exits without adding a blocker.
+            with database._transaction():
+                task = database.read_task(facts.task_uuid)
+                task_identity_known = True
+                if task["project_slug"] != profile.slug or task["identifier"] != facts.identifier:
+                    raise AllocationConflict("task identity is not project-scoped")
+                if task["state"] not in ACTIVE_STATES:
+                    raise AllocationConflict(f"task state is not Step-6 active: {task['state']}")
+                if database.connection.execute(
+                    "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (facts.task_uuid,)
+                ).fetchone():
+                    raise AllocationConflict("task has an open blocker")
+                if _open_started_architect(database, facts.task_uuid) is not None:
+                    raise AllocationConflict("an Architect attempt is already started")
+                workpad = database.read_workpad(facts.task_uuid)
+                if workpad is None:
+                    database.connection.execute(
+                        "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
+                        (facts.task_uuid, _initial_workpad(task), _now()),
+                    )
+                    workpad = database.read_workpad(facts.task_uuid)
+                run_id = str(uuid.uuid4())
+                round_number = _next_round(database, facts.task_uuid, "ARCHITECT")
+                packet = _packet(database, task, run_id)
+                timestamp = _now()
+                database.connection.execute(
+                    "INSERT INTO role_runs(id, task_id, role, round, head_sha, status, started_at, finished_at, result_summary) "
+                    "VALUES (?, ?, 'ARCHITECT', ?, ?, 'started', ?, NULL, NULL)",
+                    (run_id, facts.task_uuid, round_number, facts.selected_head, timestamp),
+                )
+                database._insert_event(
+                    facts.task_uuid, "architect_started",
+                    {"task_state": task["state"], "selected_head": facts.selected_head,
+                     "workpad_version": workpad["version"],
+                     "expected_next_action": packet["next_expected_action"],
+                     "task_identifier": facts.identifier},
+                    role_run_id=run_id, occurred_at=timestamp,
+                )
+            run = database.read_role_run(run_id)
+    except AllocationConflict:
+        raise
+    except LifecycleError as exc:
+        if task_identity_known:
+            detail = f"Architect allocation failed: {type(exc).__name__}"
+            try:
+                _record_task_infrastructure_blocker(profile, facts.task_uuid, detail)
+            except Exception as compensation_error:
+                raise LifecycleError("Architect allocation failed and task compensation failed") from compensation_error
+            raise LifecycleError(detail) from exc
+        raise
+    except Exception as exc:
+        detail = f"Architect allocation failed: {type(exc).__name__}"
+        try:
+            _record_task_infrastructure_blocker(profile, facts.task_uuid, detail)
+        except Exception as compensation_error:
+            raise LifecycleError("Architect allocation failed and task compensation failed") from compensation_error
+        raise LifecycleError(detail) from exc
+    return task, packet, run_id, run
+
+
 def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
     """Allocate the sole Architect attempt and its fixed lifecycle mounts."""
     workspace = require_physical_namespace(workspace.resolve())
     facts, _ = local_task_facts(profile, workspace)
     if facts.branch != _git(workspace, "branch", "--show-current"):
         raise LifecycleError("workspace is not on the host-owned task branch")
-    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
-        task = database.read_task(facts.task_uuid)
-        if task["project_slug"] != profile.slug or task["identifier"] != facts.identifier:
-            raise LifecycleError("task identity is not project-scoped")
-        if task["state"] not in ACTIVE_STATES:
-            raise LifecycleError(f"task state is not Step-6 active: {task['state']}")
-        if database.connection.execute(
-            "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (facts.task_uuid,)
-        ).fetchone():
-            raise LifecycleError("task has an open blocker")
-        if _open_started_architect(database, facts.task_uuid) is not None:
-            raise LifecycleError("an Architect attempt is already started")
-        workpad = database.read_workpad(facts.task_uuid)
-        if workpad is None:
-            with database._transaction():
-                database.connection.execute(
-                    "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
-                    (facts.task_uuid, _initial_workpad(task), _now()),
-                )
-            workpad = database.read_workpad(facts.task_uuid)
-        run_id = str(uuid.uuid4())
-        round_number = _next_round(database, facts.task_uuid, "ARCHITECT")
+    task, packet, run_id, run = _allocate_architect_attempt(profile, facts)
+    try:
         namespace = lifecycle_root(profile, facts.identifier, run_id)
-        with database._transaction():
-            timestamp = _now()
-            database.connection.execute(
-                "INSERT INTO role_runs(id, task_id, role, round, head_sha, status, started_at, finished_at, result_summary) "
-                "VALUES (?, ?, 'ARCHITECT', ?, ?, 'started', ?, NULL, NULL)",
-                (run_id, facts.task_uuid, round_number, facts.selected_head, timestamp),
-            )
-            database._insert_event(
-                facts.task_uuid, "architect_started",
-                {"task_state": task["state"], "selected_head": facts.selected_head,
-                 "workpad_version": workpad["version"],
-                 "expected_next_action": _packet(database, task, run_id)["next_expected_action"],
-                 "task_identifier": facts.identifier},
-                role_run_id=run_id, occurred_at=timestamp,
-            )
-        packet = _packet(database, task, run_id)
         _write_host_json(namespace / "inbox" / "lifecycle.json", packet)
         marker_path = workspace / ".git" / "symphony-preparation.json"
         marker = _read_host_json(marker_path, "preparation marker")
@@ -236,12 +283,21 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
         marker.update({"architect_role_run_id": run_id, "lifecycle_namespace": str(namespace),
                        "lifecycle_packet": "inbox/lifecycle.json"})
         _write_host_json(marker_path, marker)
-        return {"task": task, "run": database.read_role_run(run_id), "packet": packet,
-                "namespace": str(namespace)}
+    except Exception as exc:
+        detail = f"lifecycle staging failed: {type(exc).__name__}"
+        try:
+            _fail_started_attempt(profile, facts.task_uuid, run_id, detail)
+        except Exception as compensation_error:
+            raise LifecycleError("lifecycle staging failed and compensation failed") from compensation_error
+        raise LifecycleError(detail) from exc
+    return {"task": task, "run": run, "packet": packet, "namespace": str(namespace)}
 
 
 def _read_host_json(path: pathlib.Path, label: str) -> object:
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -296,7 +352,7 @@ def read_result(path: pathlib.Path) -> dict[str, object]:
             raise LifecycleError("lifecycle requested finding identity is invalid")
     seen_roles: set[str] = set()
     def validate_finding(finding: object, expected_role: str | None = None) -> None:
-        if not isinstance(finding, dict) or set(finding) != {"role", "kind", "severity", "body", "classification"}:
+        if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS:
             raise LifecycleError("lifecycle finding fields are invalid")
         if finding["role"] not in seen_roles and finding["role"] != "ARCHITECT":
             raise LifecycleError("lifecycle finding role is not licensed")
@@ -306,6 +362,18 @@ def read_result(path: pathlib.Path) -> dict[str, object]:
             raise LifecycleError("lifecycle finding severity is invalid")
         if finding["classification"] not in FINDING_CLASSES:
             raise LifecycleError("lifecycle finding classification is invalid")
+        if finding["blocker_kind"] not in BLOCKER_KINDS:
+            raise LifecycleError("lifecycle blocker kind is invalid")
+        expected_blocker_kind = {
+            "licensed correction": None,
+            "rejected": None,
+            "unresolved project decision": {"human", "project"},
+            "infrastructure condition": {"infrastructure"},
+        }[finding["classification"]]
+        if expected_blocker_kind is None and finding["blocker_kind"] is not None:
+            raise LifecycleError("lifecycle blocker kind is not valid for this finding")
+        if isinstance(expected_blocker_kind, set) and finding["blocker_kind"] not in expected_blocker_kind:
+            raise LifecycleError("lifecycle blocker kind does not match finding classification")
         _bounded_text(finding["kind"], "finding kind", 256)
         _bounded_text(finding["body"], "finding body", MAX_SUMMARY_BYTES)
 
@@ -319,7 +387,9 @@ def read_result(path: pathlib.Path) -> dict[str, object]:
         _bounded_text(packet["summary"], "role summary", MAX_SUMMARY_BYTES)
         if packet["head_sha"] is not None and (not isinstance(packet["head_sha"], str) or not SHA_RE.fullmatch(packet["head_sha"])):
             raise LifecycleError("lifecycle role HEAD is invalid")
-        if not isinstance(packet["verdict"], str) or packet["verdict"] not in {"APPROVE", "PASS", "COMPLETE", "FINDINGS"}:
+        if not isinstance(packet["verdict"], str) or packet["verdict"] not in {
+            "APPROVE", "PASS", "COMPLETE", "FINDINGS", "BLOCKED"
+        }:
             raise LifecycleError("lifecycle role verdict is invalid")
         if not isinstance(packet["findings"], list):
             raise LifecycleError("lifecycle role findings must be a list")
@@ -380,13 +450,6 @@ def _insert_role_result(database: ControlPlaneDatabase, task: dict[str, object],
     return run_id
 
 
-def _blocker_kind(finding: dict[str, object]) -> str:
-    kind = str(finding["kind"]).lower()
-    if kind.startswith("human"):
-        return "human"
-    return "project"
-
-
 def _insert_finding(database: ControlPlaneDatabase, task: dict[str, object], role_run_id: str,
                     finding: dict[str, object], correction_round: int | None) -> str:
     finding_id = str(uuid.uuid4())
@@ -403,7 +466,9 @@ def _insert_finding(database: ControlPlaneDatabase, task: dict[str, object], rol
     if classification == "infrastructure condition":
         _insert_blocker(database, task, "infrastructure", str(finding["body"]))
     elif classification == "unresolved project decision":
-        _insert_blocker(database, task, _blocker_kind(finding), str(finding["body"]))
+        # The finite blocker_kind field, not hostile descriptive prose, carries
+        # the escalation authority distinction.
+        _insert_blocker(database, task, str(finding["blocker_kind"]), str(finding["body"]))
     return finding_id
 
 
@@ -432,6 +497,20 @@ def _finish_architect(database: ControlPlaneDatabase, task: dict[str, object], r
         raise StateConflict("Architect attempt is no longer started")
     _insert_event(database, task["id"], "role_finished",
                   {"role": "ARCHITECT", "round": run["round"], "status": status}, role_run_id=run_id)
+
+
+def _fail_started_attempt(profile: Profile, task_id: str, run_id: str, detail: str) -> None:
+    """Compensate a post-allocation staging failure using the exact run id."""
+    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+        task = database.read_task(task_id)
+        run = database.read_role_run(run_id)
+        if run["task_id"] != task["id"]:
+            raise StateConflict("staging failure run does not belong to its task")
+        with database._transaction():
+            if run["status"] == "started":
+                _finish_architect(database, task, run_id, detail,
+                                   str(task["current_head"] or task["base_sha"]), "failed")
+                _insert_blocker(database, task, "infrastructure", detail)
 
 
 def _current_acceptance(database: ControlPlaneDatabase, task_id: str, event_type: str, head: str) -> bool:
@@ -485,7 +564,13 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
             "FINAL_MECHANICAL_ACCEPTANCE": ({"ARCHIVIST"}, {"archive_complete", "blocked"}),
         }[state]
     packets = {str(packet["role"]): packet for packet in result["role_results"]}
-    if set(packets) != expected_roles or result["outcome"] not in allowed_outcomes:
+    outcome = str(result["outcome"])
+    if outcome not in allowed_outcomes:
+        raise LifecycleError("lifecycle outcome is impossible for the current next action")
+    if outcome == "blocked":
+        if not set(packets).issubset(expected_roles):
+            raise LifecycleError("blocked lifecycle result contains an unlicensed role")
+    elif set(packets) != expected_roles:
         raise LifecycleError("lifecycle outcome is impossible for the current next action")
     expected_verdicts = {
         "PROJECT-MANAGER": "APPROVE", "PLANNER": "COMPLETE", "IMPLEMENTER": "COMPLETE",
@@ -493,14 +578,19 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     }
     for role, packet in packets.items():
         allowed_verdict = {expected_verdicts[role]}
-        if result["outcome"] == "correction_required" and role in {"REVIEWER", "ADVERSARY"}:
+        if outcome == "correction_required" and role in {"REVIEWER", "ADVERSARY"}:
             allowed_verdict.add("FINDINGS")
+        if outcome == "blocked":
+            allowed_verdict.add("BLOCKED")
         if packet["verdict"] not in allowed_verdict:
             raise LifecycleError("lifecycle role verdict is not licensed for that role")
-    if result["outcome"] == "correction_required" and not any(
-        packet["verdict"] == "FINDINGS" for packet in packets.values()
-    ):
-        raise LifecycleError("correction outcome requires a findings verdict")
+    if outcome == "correction_required":
+        if state in {"IMPLEMENTED", "REVIEW"}:
+            required_role = "REVIEWER" if state == "IMPLEMENTED" else "ADVERSARY"
+            if packets[required_role]["verdict"] != "FINDINGS":
+                raise LifecycleError("phase correction requires the specialized FINDINGS verdict")
+        elif state == "ADVERSARIAL_REVIEW" and packets:
+            raise LifecycleError("mechanical-validation correction has no specialized role packet")
     implementation_phase = state == "PLANNED" or (
         state in {"IMPLEMENTED", "REVIEW", "ADVERSARIAL_REVIEW"} and has_licensed
     )
@@ -509,7 +599,7 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
         raise LifecycleError("read-only lifecycle phase changed Git HEAD")
     if implementation_phase and actual_head == selected_head:
         raise LifecycleError("IMPLEMENTER did not produce a new committed HEAD")
-    correction_round = _next_round(database, task["id"], "IMPLEMENTER") if result["outcome"] == "correction_required" else None
+    correction_round = _next_round(database, task["id"], "IMPLEMENTER") if outcome == "correction_required" else None
     specialized_runs: dict[str, str] = {}
     for role, packet in packets.items():
         if packet["head_sha"] is not None and packet["head_sha"] != actual_head:
@@ -519,30 +609,47 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     for packet in packets.values():
         all_findings.extend(packet["findings"])
     classifications = {finding["classification"] for finding in all_findings}
-    if "licensed correction" in classifications and result["outcome"] != "correction_required":
+    if "licensed correction" in classifications and outcome != "correction_required":
         raise LifecycleError("a licensed correction must be the explicit lifecycle outcome")
-    if classifications & {"unresolved project decision", "infrastructure condition"} and result["outcome"] != "blocked":
+    if classifications & {"unresolved project decision", "infrastructure condition"} and outcome != "blocked":
         raise LifecycleError("an unresolved or infrastructure finding must block lifecycle advancement")
+    if outcome == "correction_required":
+        licensed_findings = [finding for finding in all_findings if finding["classification"] == "licensed correction"]
+        if state in {"IMPLEMENTED", "REVIEW"}:
+            required_role = "REVIEWER" if state == "IMPLEMENTED" else "ADVERSARY"
+            if not any(finding["role"] == required_role for finding in licensed_findings):
+                raise LifecycleError("phase correction requires a licensed finding from its specialized role")
+        elif state == "ADVERSARIAL_REVIEW":
+            if not any(
+                finding["role"] == "ARCHITECT" and finding in result["findings"]
+                for finding in licensed_findings
+            ):
+                raise LifecycleError("mechanical-validation correction requires a top-level Architect finding")
+    if outcome == "blocked" and not (
+        classifications & {"unresolved project decision", "infrastructure condition"}
+        or any(packet["verdict"] == "BLOCKED" for packet in packets.values())
+    ):
+        raise LifecycleError("blocked lifecycle result has no blocker-producing evidence")
     for finding in all_findings:
         role = str(finding["role"])
         role_run_id = specialized_runs.get(role, run_id)
         _insert_finding(database, task, role_run_id, finding, correction_round)
-    if result["outcome"] == "review_approved":
+    if outcome == "review_approved":
         if database.connection.execute(
             "SELECT 1 FROM findings WHERE task_id = ? AND status = 'licensed' LIMIT 1", (task["id"],)
         ).fetchone():
             raise LifecycleError("review approval has unresolved licensed findings")
-    if result["outcome"] in {"adversary_pass", "validation_pass", "archive_complete"}:
+    if outcome in {"adversary_pass", "validation_pass", "archive_complete"}:
         if not _current_acceptance(database, task["id"], "review_accepted", actual_head):
             raise LifecycleError("current-head reviewer acceptance is missing")
-    if result["outcome"] in {"validation_pass", "archive_complete"}:
+    if outcome in {"validation_pass", "archive_complete"}:
         if not _current_acceptance(database, task["id"], "adversary_accepted", actual_head):
             raise LifecycleError("current-head adversary acceptance is missing")
-    if result["outcome"] == "correction_required" and not any(
+    if outcome == "correction_required" and not any(
         finding["classification"] == "licensed correction" for finding in all_findings
     ):
         raise LifecycleError("correction outcome has no licensed correction finding")
-    if result["outcome"] == "correction_complete":
+    if outcome == "correction_complete":
         impl_run = specialized_runs["IMPLEMENTER"]
         impl_round = database.read_role_run(impl_run)["round"]
         licensed_ids = {
@@ -566,6 +673,16 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
             )
     elif result["requested_resolved_finding_ids"]:
         raise LifecycleError("finding resolutions are only licensed for an IMPLEMENTER correction")
+    if outcome == "blocked" and not database.connection.execute(
+        "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)
+    ).fetchone():
+        blocked_packets = [packet for packet in packets.values() if packet["verdict"] == "BLOCKED"]
+        evidence = blocked_packets[0]["summary"] if blocked_packets else str(result["summary"])
+        _insert_blocker(database, task, "infrastructure", evidence)
+    if outcome == "blocked" and not database.connection.execute(
+        "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)
+    ).fetchone():
+        raise LifecycleError("blocked lifecycle result did not produce an open blocker")
     if implementation_phase:
         old_head = task["current_head"]
         if old_head != actual_head:
@@ -580,14 +697,14 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
         "validation_pass": "FINAL_MECHANICAL_ACCEPTANCE", "archive_complete": "ARCHIVIST",
         "correction_complete": "IMPLEMENTED", "correction_required": state,
         "blocked": state,
-    }[str(result["outcome"])]
-    if result["outcome"] not in {"blocked", "correction_required"}:
+    }[outcome]
+    if outcome not in {"blocked", "correction_required"}:
         _state_transition(database, task, next_state)
-    if result["outcome"] == "review_approved":
+    if outcome == "review_approved":
         _insert_event(database, task["id"], "review_accepted", {"head_sha": actual_head}, role_run_id=specialized_runs["REVIEWER"])
-    elif result["outcome"] == "adversary_pass":
+    elif outcome == "adversary_pass":
         _insert_event(database, task["id"], "adversary_accepted", {"head_sha": actual_head}, role_run_id=specialized_runs["ADVERSARY"])
-    elif result["outcome"] == "validation_pass":
+    elif outcome == "validation_pass":
         _insert_event(database, task["id"], "validation_passed", {"head_sha": actual_head}, role_run_id=run_id)
     _finish_architect(database, task, run_id, str(result["summary"]), actual_head)
     body = str(result["workpad_body"])

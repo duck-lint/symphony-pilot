@@ -7,12 +7,20 @@ repository is merged by Step 6.
 
 - Pilot base: `bf7c546aa87e085e8ebaa5782f9193f8aa45a2e3`
 - Runtime base: `54753c1a702a3131c5f522703af8c25e10638f44`
-- `RUNTIME_STEP6_HEAD`: `12cf1a06490f76cbcd994032ab7c7ed8656f453f`
+- `RUNTIME_STEP6_HEAD`: `9ad5a047d28ebfc14f390965851003e3ed99d389`
 - Runtime branch: `codex/step-6-runtime-routing`
 - Pilot branch: `codex/step-6-pilot-lifecycle`
 
 Pilot targets the exact Runtime candidate above. No alternate Runtime revision
 is silently substituted.
+
+The review correction round makes mechanical-validation correction top-level
+Architect evidence with no specialized packet, permits bounded partial blocked
+evidence with canonical `BLOCKED` role verdicts, binds blocker authority to a
+finite `blocker_kind`, opens hostile files nonblocking before `fstat`, and
+compensates post-allocation staging failures. Architect allocation and its
+started event now share one SQLite `BEGIN IMMEDIATE` transaction. Policy files
+and the activation launcher are part of deployment coherence.
 
 ## Implemented authority
 

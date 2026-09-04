@@ -1,16 +1,23 @@
 """Bounded source/deployment compatibility identity.
 
 The deployment contains a snapshot of runtime hooks and policy, but lifecycle
-authority remains in the source checkout.  This digest covers only source
-modules whose changes can alter generation or lifecycle meaning; registry
-membership, documentation, and unrelated project profiles are deliberately
-outside the contract.
+authority remains in the source checkout. This digest covers source modules
+and constitutive policy files whose changes can alter generation or lifecycle
+meaning; registry membership, documentation, and unrelated project profiles
+are deliberately outside the contract.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import pathlib
+
+
+ROLE_POLICY_FILES = tuple(
+    f"workflow/agents/{name}.toml"
+    for name in ("adversary", "archivist", "implementer", "planner", "project-manager", "reviewer")
+)
+POLICY_FILES = ("workflow/architect_policy.md", *ROLE_POLICY_FILES)
 
 
 CONTRACT_FILES = (
@@ -31,6 +38,8 @@ CONTRACT_FILES = (
     "runtime/wsl_contained_exec.py",
     "runtime/control_db.py",
     "runtime/runtime_lock.py",
+    "runtime/launch_codex.sh",
+    *POLICY_FILES,
 )
 
 # Complete runtime snapshot for a Step-6 deployment. Publication remains
