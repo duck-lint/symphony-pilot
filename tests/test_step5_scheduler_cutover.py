@@ -170,6 +170,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         import after_run
 
         with mock.patch.object(after_run, "load_profile"), mock.patch.object(
+                after_run, "reconcile", side_effect=RuntimeError), mock.patch.object(
                 after_run, "fail_attempt_for_workspace"):
             with mock.patch.object(after_run, "print") as output:
                 result = after_run.main(["--profile", "profile.toml", "--workspace", "T-000001"])
