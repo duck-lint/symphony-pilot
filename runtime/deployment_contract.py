@@ -18,6 +18,8 @@ CONTRACT_FILES = (
     "scripts/project.py",
     "scripts/task.py",
     "runtime/after_run.py",
+    "runtime/before_run.py",
+    "runtime/lifecycle.py",
     "runtime/before_remove.py",
     "runtime/host_integration.py",
     "runtime/prepare_workspace.py",
@@ -31,11 +33,13 @@ CONTRACT_FILES = (
     "runtime/runtime_lock.py",
 )
 
-# Complete runtime snapshot for a Step-5 deployment. Deferred broker,
-# publication, and lifecycle modules remain source-only.
+# Complete runtime snapshot for a Step-6 deployment. Publication remains
+# source-only; the SQLite lifecycle broker is deployed and manifest-covered.
 DEPLOYED_RUNTIME_FILES = (
     "runtime/prepare_workspace.py",
     "runtime/after_run.py",
+    "runtime/before_run.py",
+    "runtime/lifecycle.py",
     "runtime/before_remove.py",
     "runtime/host_integration.py",
     "runtime/process_identity.py",

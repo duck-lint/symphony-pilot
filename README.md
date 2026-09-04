@@ -7,6 +7,11 @@ validation, and stop conditions.
 
 ## Architecture
 
+Step 5: SQLite determines what work exists. Step 6: SQLite determines what
+has happened to that work. Lifecycle reconciliation is host-only; Runtime
+remains read-only, and ARCHIVIST is the Step-6 endpoint pending Step 7
+publication.
+
 The trusted host owns project admission, server-derived Git identity, runtime
 locks, process state, credentials, logs, recovery, branch-protection preflight,
 and publication. A T-N task receives only its current source checkout and a
@@ -29,9 +34,9 @@ tool network.
 ## Current status
 
 Host-side local-task intake, SQLite scheduler configuration, local workspace
-preparation, ruleset protection checks, runtime identity locks, and fail-closed
-containment gates are implemented and fixture-tested. Full lifecycle
-persistence and publication narrowing remain deferred to Steps 6 and 7.
+preparation, Step-6 lifecycle persistence, ruleset protection checks, runtime
+identity locks, and fail-closed containment gates are implemented and
+fixture-tested. Publication narrowing remains deferred to Step 7.
 Persistent task-workspace aggregate disk growth is explicitly unbounded in this
 cutover, and the exact current Codex App Server authentication path has no
 proven way to keep its credential out of hostile tool children. Unattended

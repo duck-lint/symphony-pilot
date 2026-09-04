@@ -855,6 +855,39 @@ class ControlPlaneDatabase:
             raise ControlPlaneError(f"task does not exist: {task_id}")
         return value
 
+    def queue_task(self, task_id: str | uuid.UUID, *, project_slug: str) -> dict[str, object]:
+        """Atomically activate a task and create its first canonical workpad."""
+        task_id = _uuid(task_id, "task_id")
+        project_slug = _project_slug(project_slug)
+        timestamp = _timestamp(None, "occurred_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            if task["project_slug"] != project_slug:
+                raise StateConflict("task is not registered to the selected project")
+            if task["state"] != "PREPARED":
+                raise StateConflict("only PREPARED tasks may be queued")
+            self.connection.execute(
+                "UPDATE tasks SET state = 'QUEUED', updated_at = ? WHERE id = ? AND state = 'PREPARED'",
+                (timestamp, task_id),
+            )
+            self._insert_event(
+                task_id, "queued",
+                {"identifier": task["identifier"], "project_slug": project_slug},
+                occurred_at=timestamp,
+            )
+            if self.connection.execute("SELECT 1 FROM workpads WHERE task_id = ?", (task_id,)).fetchone() is None:
+                body = "\n".join((
+                    "<!-- symphony-workpad:v1 -->", "## Symphony Workpad", "",
+                    f"- Task: {task['identifier']}", f"- Objective: {task['objective']}",
+                    f"- Base: {task['base_ref']} @ {task['base_sha']}",
+                    f"- Branch: {task['branch']}", "- Lifecycle state: QUEUED", "",
+                ))
+                self.connection.execute(
+                    "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
+                    (task_id, body, timestamp),
+                )
+        return self.read_task(task_id)
+
     def read_task_by_identifier(self, identifier: str, *, project_slug: str | None = None) -> dict[str, object]:
         """Read one local task identity, optionally enforcing project ownership."""
         if not isinstance(identifier, str) or not IDENTIFIER_RE.fullmatch(identifier):
@@ -1236,6 +1269,15 @@ class ControlPlaneDatabase:
         task_id = _uuid(task_id, "task_id")
         expected_state = _state(expected_state)
         new_state = _state(new_state)
+        if expected_state == "ARCHIVIST" and new_state == "READY_FOR_HUMAN_MERGE":
+            task = self.read_task(task_id)
+            publication = self.read_publication(task_id)
+            if (not publication or publication["publication_status"] != "published" or
+                    publication["head_sha"] != task["current_head"]):
+                raise StateConflict(
+                    "ARCHIVIST cannot transition to READY_FOR_HUMAN_MERGE without "
+                    "successful exact-current-HEAD publication"
+                )
         if event_type not in EVENT_TYPES:
             raise ValueError(f"event type is not supported: {event_type}")
         timestamp = _timestamp(occurred_at, "occurred_at")

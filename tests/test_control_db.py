@@ -487,7 +487,10 @@ class ControlDatabaseTests(unittest.TestCase):
         self.assertIn("database_path: /home/operator/.local/state/symphony-pilot/control.sqlite3", rendered)
         self.assertIn("project_slug: demo", rendered)
         self.assertIn("- QUEUED", rendered)
+        self.assertIn("- PLANNED", rendered)
+        self.assertIn("- FINAL_MECHANICAL_ACCEPTANCE", rendered)
         self.assertIn("- READY_FOR_HUMAN_MERGE", rendered)
+        self.assertIn("max_turns: 1", rendered)
 
     def test_task_deletion_is_restricted_by_audit_history(self):
         task = self.task()

@@ -115,11 +115,7 @@ def queue(args: argparse.Namespace) -> int:
                 if selector_kind == "identifier" else database.read_task(selector))
         if task["project_slug"] != profile.slug:
             raise TaskCommandError("task is not registered to this project")
-        task = database.transition_task(
-            task["id"], expected_state="PREPARED", new_state="QUEUED",
-            event_type="queued",
-            payload={"identifier": task["identifier"], "project_slug": profile.slug},
-        )
+        task = database.queue_task(task["id"], project_slug=profile.slug)
     _emit(task)
     return 0
 
@@ -133,6 +129,50 @@ def show(args: argparse.Namespace) -> int:
         if task["project_slug"] != profile.slug:
             raise TaskCommandError("task is not registered to this project")
         _emit(database.read_projection(task["id"]))
+    return 0
+
+
+def _read_project_task(database: ControlPlaneDatabase, profile, selector_kind: str, selector: str):
+    task = (database.read_task_by_identifier(selector, project_slug=profile.slug)
+            if selector_kind == "identifier" else database.read_task(selector))
+    if task["project_slug"] != profile.slug:
+        raise TaskCommandError("task is not registered to this project")
+    return task
+
+
+def blockers(args: argparse.Namespace) -> int:
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+        _emit([row for row in database.read_projection(task["id"])["blockers"] if row["status"] == "open"])
+    return 0
+
+
+def resolve_blocker(args: argparse.Namespace) -> int:
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    if not UUID_RE.fullmatch(args.blocker):
+        raise TaskCommandError("--blocker must be a canonical lowercase UUID")
+    with ControlPlaneDatabase.open(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+        blocker = database.read_blocker(args.blocker)
+        if blocker["task_id"] != task["id"]:
+            raise TaskCommandError("blocker is not owned by the selected task")
+        _emit(database.resolve_blocker(args.blocker))
+    return 0
+
+
+def fail_attempt(args: argparse.Namespace) -> int:
+    from lifecycle import fail_attempt as fail_stale_attempt
+
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+    if not fail_stale_attempt(profile, str(task["id"]), detail="operator failed stale Architect attempt"):
+        raise TaskCommandError("the selected task has no single started Architect attempt")
+    _emit({"task_uuid": task["id"], "status": "failed", "blocker": "infrastructure"})
     return 0
 
 
@@ -157,6 +197,22 @@ def main(argv: list[str] | None = None) -> int:
     queue_parser.add_argument("--project", required=True)
     queue_parser.add_argument("--task", required=True)
     queue_parser.set_defaults(handler=queue)
+
+    blockers_parser = subparsers.add_parser("blockers", help="inspect open blockers for one task")
+    blockers_parser.add_argument("--project", required=True)
+    blockers_parser.add_argument("--task", required=True)
+    blockers_parser.set_defaults(handler=blockers)
+
+    resolve_parser = subparsers.add_parser("resolve-blocker", help="resolve one exact task blocker")
+    resolve_parser.add_argument("--project", required=True)
+    resolve_parser.add_argument("--task", required=True)
+    resolve_parser.add_argument("--blocker", required=True)
+    resolve_parser.set_defaults(handler=resolve_blocker)
+
+    fail_parser = subparsers.add_parser("fail-attempt", help="fail the one stale Architect attempt")
+    fail_parser.add_argument("--project", required=True)
+    fail_parser.add_argument("--task", required=True)
+    fail_parser.set_defaults(handler=fail_attempt)
 
     show_parser = subparsers.add_parser("show", help="show one local task and its projection")
     show_parser.add_argument("--project", required=True)

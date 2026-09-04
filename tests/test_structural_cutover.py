@@ -13,8 +13,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
 import containment
-import broker
 import control_db
+import lifecycle
 import outbox
 import prepare_workspace as pw
 import rulesets
@@ -228,39 +228,12 @@ class StructuralCutoverTests(unittest.TestCase):
         self.assertEqual(blockers[0]["kind"], "infrastructure")
         self.assertIn("exact diagnostic detail", blockers[0]["body"])
 
-    def test_host_broker_maps_human_block_without_task_supplied_labels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            profile = mock.Mock(state_root=root, dispatch_labels=("symphony:auto",), blocked_label="symphony:human")
-            profile.slug = "demo"
-            task = self.task()
-            task_path = root / "tasks" / "GH-10" / "task.json"
-            task_admission.write_task(task_path, task)
-            outbox_path = outbox.task_outbox_path(task_path)
-            outbox_path.parent.mkdir()
-            outbox_path.write_text(json.dumps({
-                "schema": outbox.OUTBOX_SCHEMA, "task_id": task["task_id"], "head": None,
-                "workpad_body": "blocked", "disposition": "human_blocked", "summary": "needs human",
-            }), encoding="utf-8")
-            with mock.patch.object(broker, "read_secret", return_value="token"), \
-                 mock.patch.object(broker, "github") as api:
-                self.assertEqual(broker.process_result(profile, root / "GH-10"), 0)
-        paths = [call.args[3] for call in api.call_args_list]
-        self.assertIn("/issues/comments/42", paths)
-        self.assertIn("/issues/10/labels/symphony%3Aauto", paths)
-        self.assertIn("/issues/10/labels", paths)
-
-    def test_host_broker_reconciles_the_exact_draft_pr(self):
-        profile = mock.Mock(repository="example/project")
-        task = self.task()
-        matching = {"number": 7, "draft": True,
-                    "head": {"ref": task["issue_branch"], "repo": {"full_name": profile.repository}},
-                    "base": {"ref": task["default_ref"]}}
-        with mock.patch.object(broker, "github", side_effect=[[matching], {}]) as api:
-            self.assertEqual(broker.draft_pr(profile, "token", task, published_head="d" * 40), {
-                "number": 7, "base_ref": "master", "head_ref": task["issue_branch"]})
-        self.assertEqual(api.call_args_list[1].args[3], "/pulls/7")
-        self.assertIn("d" * 40, api.call_args_list[1].args[4]["body"])
+    def test_step6_lifecycle_broker_has_no_github_lifecycle_surface(self):
+        source = (ROOT / "runtime/lifecycle.py").read_text(encoding="utf-8")
+        self.assertNotIn("from prepare_workspace import github", source)
+        self.assertNotIn("/issues/", source)
+        self.assertEqual(lifecycle.RESULT_SCHEMA, "symphony-pilot-lifecycle-result/v1")
+        self.assertIn("requested_resolved_finding_ids", source)
 
     @unittest.skipIf(os.name == "nt", "publication deploy-key mode is a native WSL contract")
     def test_publication_imports_fixed_bundle_into_sterile_repo(self):

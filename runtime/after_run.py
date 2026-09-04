@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Explicit Step-6 lifecycle boundary for the managed workflow.
+"""Reconcile one hostile Architect lifecycle result into Pilot SQLite.
 
-Step 5 makes SQLite the scheduler authority but does not yet migrate the
-full role/workpad/publication lifecycle. This script returns 78 and performs
-no legacy GitHub lifecycle mapping. Frozen Runtime treats after_run hook
-failures as best-effort, so this return code is not an activation barrier.
+The after_run exit status is not an activation barrier; SQLite blocker side
+effects are the scheduler barrier.
 """
 from __future__ import annotations
 
 import argparse
 import pathlib
-import re
+import sys
 
+from lifecycle import fail_attempt_for_workspace, reconcile
 from prepare_workspace import load_profile
 
 
@@ -22,14 +21,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         profile = load_profile(args.profile)
+        reconcile(profile, args.workspace)
+        return 0
     except Exception as exc:
-        print(f"symphony-pilot after_run error: {type(exc).__name__}")
+        # Runtime treats after_run as best-effort. Persisting the blocker is
+        # therefore the safety boundary, not this process's exit status.
+        try:
+            profile = load_profile(args.profile)
+            fail_attempt_for_workspace(profile, args.workspace, f"lifecycle reconciliation failed: {type(exc).__name__}")
+        except Exception:
+            pass
+        print(f"symphony-pilot after_run stopped: {type(exc).__name__}", file=sys.stderr)
         return 78
-    workspace = args.workspace.resolve()
-    if not re.fullmatch(r"T-(\d{6})", workspace.name):
-        return 78
-    print("symphony-pilot after_run returned 78: lifecycle reconciliation is deferred to Step 6")
-    return 78
 
 
 if __name__ == "__main__":

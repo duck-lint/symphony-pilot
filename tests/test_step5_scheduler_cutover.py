@@ -146,7 +146,13 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertIn("database_path: /home/operator/state/control.sqlite3", rendered)
         self.assertIn("project_slug: alpha", rendered)
         self.assertIn("- QUEUED", rendered)
+        self.assertIn("- PLANNED", rendered)
+        self.assertIn("- IMPLEMENTED", rendered)
+        self.assertIn("- REVIEW", rendered)
+        self.assertIn("- ADVERSARIAL_REVIEW", rendered)
+        self.assertIn("- FINAL_MECHANICAL_ACCEPTANCE", rendered)
         self.assertIn("- READY_FOR_HUMAN_MERGE", rendered)
+        self.assertIn("max_turns: 1", rendered)
         for forbidden in (
             "kind: github", "SYMPHONY_PILOT_GITHUB_TOKEN", "required_labels", "- open", "- closed",
             "admit_task.py", "GH-", "/issues?",
@@ -160,15 +166,16 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertNotIn('env["SYMPHONY_PILOT_GITHUB_TOKEN"]', source)
         self.assertNotIn("dispatchable issues exceed", source)
 
-    def test_after_run_reports_step6_boundary(self):
+    def test_after_run_reconciles_step6_and_fails_closed_without_a_result(self):
         import after_run
 
-        with mock.patch.object(after_run, "load_profile"):
+        with mock.patch.object(after_run, "load_profile"), mock.patch.object(
+                after_run, "fail_attempt_for_workspace"):
             with mock.patch.object(after_run, "print") as output:
                 result = after_run.main(["--profile", "profile.toml", "--workspace", "T-000001"])
         self.assertEqual(result, 78)
         output.assert_called_once()
-        self.assertIn("Step 6", output.call_args.args[0])
+        self.assertIn("after_run stopped", output.call_args.args[0])
         after_run_source = (ROOT / "runtime/after_run.py").read_text(encoding="utf-8")
         architecture = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
         findings = (ROOT / "docs/SECURITY_FINDINGS.md").read_text(encoding="utf-8")
@@ -176,7 +183,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertIn("not an activation barrier", " ".join(architecture.split()))
         self.assertIn("STEP-6-BEFORE-ACTIVATION", findings)
         self.assertIn("not a substitute for this ordering", findings)
-        self.assertNotIn("after_run hook fails\nclosed", architecture)
+        self.assertIn("not an activation barrier", " ".join(after_run_source.split()))
 
     def test_deployment_generator_and_verifier_share_exact_runtime_inventory(self):
         def clean_git_result(args, **kwargs):

@@ -21,6 +21,24 @@ GitHub issue labels and event history are not scheduler trust inputs after Step
 5. They survive only in deferred legacy/publication code and cannot create a
 local task or authorize a workspace.
 
+## SQLite lifecycle trust
+
+Step 6 makes the host lifecycle broker the only writer of lifecycle state. A
+trusted `before_run` allocates one Architect attempt and one derived staging
+namespace; a trusted `after_run` verifies the workspace and applies one strict
+result atomically. The result is hostile input: it cannot choose a project,
+database, branch, base, role round, next state, publication destination, or
+credential. Specialized role rows record accepted result packets; they do not
+prove that a named custom agent was actually invoked.
+
+An invalid, stale, missing, dirty, or otherwise unsafe result leaves the prior
+milestone in place and records an infrastructure blocker when the database is
+available. Runtime `after_run` exit status is best-effort; the SQLite blocker
+is the routing barrier. ARCHIVIST is the Step-6 endpoint. Step 7 owns
+publication and the exact-head READY transition. The existing credential
+isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live WSL
+containment findings remain open activation blockers.
+
 ## GitHub trust
 
 The tracker token is API-only. The publication deploy key is project-scoped,
