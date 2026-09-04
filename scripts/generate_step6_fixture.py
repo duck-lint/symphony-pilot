@@ -63,7 +63,7 @@ def generate(output: pathlib.Path) -> None:
             task_id=blocked["id"], kind="project", body="Fixture project decision pending",
             created_at=CREATED_AT,
         )
-        database.create_task(
+        beta = database.create_task(
             task_id="a0000000-0000-0000-0000-000000000000",
             identifier="T-000010",
             project_slug="beta",
@@ -75,6 +75,7 @@ def generate(output: pathlib.Path) -> None:
             state="PREPARED",
             created_at=CREATED_AT,
         )
+        database.queue_task(beta["id"], project_slug="beta")
 
 
 def main() -> int:
