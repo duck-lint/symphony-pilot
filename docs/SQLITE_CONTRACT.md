@@ -1,8 +1,9 @@
 # SQLite control-plane contract
 
-Step 2 establishes the host-owned persistence contract that the later runtime
-tracker adapter will consume read-only. It does not switch scheduler polling,
-workspace admission, or publication from GitHub to SQLite.
+Step 2 established the host-owned persistence contract. Step 5 now cuts the
+managed scheduler and workspace admission over to that contract; full
+role/workpad/lifecycle persistence and publication narrowing remain later
+steps.
 
 ## Authority and location
 
@@ -22,8 +23,9 @@ store `project_slug` as a semantic reference; there is deliberately no
 SQLite `projects` table and no SQLite project registry.
 
 The existing GitHub issue, label, comment, task-record, and JSONL-shaped
-mechanisms are historical/current integration seams until a later cutover.
-This step does not migrate or delete them and adds no compatibility path.
+mechanisms are deferred lifecycle/publication seams. They do not create or
+queue local tasks after Step 5, and no GitHub compatibility path is part of the
+managed scheduler.
 
 ## Baseline inventory
 
@@ -33,7 +35,7 @@ kept distinct:
 | Existing seam | Step 2 classification |
 |---|---|
 | `projects/<slug>/profile.toml` and `project_registry.py` | Current project-registration authority; stays outside SQLite |
-| `task_admission.py` task records and server-derived GitHub facts | Current host admission identity; GitHub issue number, labels, and comments are later-cutover authority, not the new local task identity |
+| `task_admission.py` task records and server-derived GitHub facts | Retired scheduler admission seam; retained only as non-deployed legacy source pending lifecycle/publication cleanup |
 | `workflow/architect_policy.md` and role-policy files | Accepted lifecycle and role semantics; generated policy payload, not durable state |
 | Workpad comments, task outboxes, task JSON, logs, and process markers | Current integration/transient or generated state; not copied wholesale into relational tables |
 | `broker.py` blockers and publication/draft-PR handling | Accepted blocker/publication concepts with GitHub-specific mechanisms deferred to later cutover |
@@ -42,8 +44,7 @@ kept distinct:
 The genuinely new Step 2 choices are a host-owned local UUID plus deterministic
 `T-000001`-style identifier, finite database state vocabulary, current-state
 tables with foreign keys, and structured event history. These choices establish
-the later read-only runtime contract; they do not claim that the scheduler has
-already been cut over.
+the read-only Runtime contract consumed by the Step-5 scheduler.
 
 ## Schema version and safety
 
@@ -191,7 +192,7 @@ compatibility migration was added for disposable pre-acceptance test state.
 
 ## Deferred boundaries
 
-This contract does not add `tracker.kind = sqlite`, runtime database reads,
-GitHub-to-SQLite migration, GH-N identity changes, browser endpoints, inbox or
-outbox routing, project-registry duplication, or App Server authentication
-changes. Those are later seams.
+This contract does not define full role/workpad/lifecycle persistence, GitHub
+publication narrowing, project-registry duplication, or App Server
+authentication changes. Step 5 deliberately leaves those seams for Steps 6
+and 7 (and the existing activation gates).

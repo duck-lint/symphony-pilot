@@ -27,12 +27,7 @@ CONTRACT_FILES = (
     "runtime/deployment_contract.py",
     "runtime/containment.py",
     "runtime/wsl_contained_exec.py",
-    "runtime/task_admission.py",
-    "runtime/dispatch_provenance.py",
-    "runtime/admit_task.py",
-    "runtime/outbox.py",
-    "runtime/rulesets.py",
-    "runtime/publication.py",
+    "runtime/control_db.py",
     "runtime/runtime_lock.py",
 )
 

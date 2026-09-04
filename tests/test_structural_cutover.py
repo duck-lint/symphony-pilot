@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "runtime"))
 
 import containment
 import broker
-import dispatch_provenance
+import control_db
 import outbox
 import prepare_workspace as pw
 import rulesets
@@ -56,28 +56,6 @@ class StructuralCutoverTests(unittest.TestCase):
             malformed = dict(task, attacker_control="master")
             with self.assertRaises(task_admission.TaskAdmissionError):
                 task_admission.validate_task_record(malformed)
-
-    def test_dispatch_provenance_uses_latest_server_event_and_trusted_actor(self):
-        issue = {"state": "open", "labels": [{"name": "symphony:auto"}]}
-        events = [
-            {"id": 1, "event": "labeled", "label": {"name": "symphony:auto"},
-             "actor": {"login": "duck-lint"}, "created_at": "2026-01-01T00:00:00Z"},
-            {"id": 2, "event": "unlabeled", "label": {"name": "symphony:auto"},
-             "actor": {"login": "attacker"}, "created_at": "2026-01-01T01:00:00Z"},
-        ]
-        with self.assertRaises(dispatch_provenance.DispatchProvenanceError):
-            dispatch_provenance.prove_dispatch(issue, events, ("symphony:auto",), ("duck-lint",))
-        events[1] = {"id": 3, "event": "labeled", "label": {"name": "symphony:auto"},
-                     "actor": {"login": "duck-lint"}, "created_at": "2026-01-01T02:00:00Z"}
-        proven = dispatch_provenance.prove_dispatch(issue, events, ("symphony:auto",), ("duck-lint",))
-        self.assertEqual(proven[0]["event_id"], 3)
-
-    def test_dispatch_event_fetch_is_complete_and_paginated(self):
-        pages = {1: [{"id": index} for index in range(100)], 2: [{"id": 101}]}
-        seen = []
-        result = dispatch_provenance.fetch_all_events(lambda page: seen.append(page) or pages[page])
-        self.assertEqual(seen, [1, 2])
-        self.assertEqual(len(result), 101)
 
     def test_outbox_rejects_unknown_fields_and_wrong_task(self):
         task = self.task()
@@ -228,17 +206,27 @@ class StructuralCutoverTests(unittest.TestCase):
         with self.assertRaises(runtime_lock.RuntimeLockError):
             runtime_lock.validate_lock(dict(lock, extra=True))
 
-    def test_blocker_detail_is_persisted_in_host_state(self):
+    def test_blocker_detail_is_persisted_in_sqlite_host_state(self):
         with tempfile.TemporaryDirectory() as directory:
-            profile = mock.Mock(state_root=pathlib.Path(directory))
-            profile.slug = "demo"
-            pw.record_blocker(profile, ROOT,
-                              pw.IssueFacts(10, "codex/gh-10-cccccccccccc", "b" * 40,
-                                            "master", "b" * 40, "initial", None, None, []),
-                              "test_blocker", "exact diagnostic detail")
-            saved = json.loads((pathlib.Path(directory) / "blockers" / "GH-10.json").read_text())
-        self.assertEqual(saved["schema"], "symphony-pilot-blocker/v1")
-        self.assertEqual(saved["detail"], "exact diagnostic detail")
+            database_path = pathlib.Path(directory) / "control.sqlite3"
+            with control_db.open_database(database_path) as database:
+                task = database.create_task(
+                    project_slug="demo", title="Task", objective="Test blocker",
+                    base_ref="master", base_sha="b" * 40,
+                    task_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+                )
+            profile = mock.Mock(state_root=pathlib.Path(directory), slug="demo")
+            facts = pw.LocalTaskFacts(
+                task_uuid=task["id"], identifier=task["identifier"], branch=task["branch"],
+                selected_head=task["base_sha"], base_ref=task["base_ref"], base_sha=task["base_sha"],
+                mode="initial", current_head=None, published_head=None,
+            )
+            with mock.patch.object(pw, "control_database_path", return_value=database_path):
+                pw.record_blocker(profile, ROOT, facts, "test_blocker", "exact diagnostic detail")
+            with control_db.open_database_readonly(database_path) as database:
+                blockers = database.read_projection(task["id"])["blockers"]
+        self.assertEqual(blockers[0]["kind"], "infrastructure")
+        self.assertIn("exact diagnostic detail", blockers[0]["body"])
 
     def test_host_broker_maps_human_block_without_task_supplied_labels(self):
         with tempfile.TemporaryDirectory() as directory:

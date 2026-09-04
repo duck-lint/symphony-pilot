@@ -57,5 +57,7 @@ unattended activation. Secrets, environments, raw files, and credential
 references are never returned.
 
 This UI is not an agent chat or a second state model. It provides no queue or
-dispatch mutation, manual Codex launch, scheduler cutover, publication, merge,
-or arbitrary repository control. Queue/dispatch semantics wait for Step 5.
+dispatch mutation, manual Codex launch, publication, merge, or arbitrary
+repository control. Queue mutation remains on the trusted host CLI; the
+browser stays read-only. Runtime scheduler authority is host SQLite and the
+local `T-N` identity.

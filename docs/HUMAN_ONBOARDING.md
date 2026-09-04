@@ -1,20 +1,20 @@
 # Human onboarding
 
 Create one non-secret `projects/<slug>/profile.toml` with repository, clone
-remote, required dispatch labels, `trusted_dispatchers`, blocked label, and
-model/resource settings. Validate the complete registry before selecting a
-project. The trusted dispatcher list contains GitHub actor logins allowed to
-perform the server label event that admits work; it is not a generic hard-coded
-runtime identity.
+remote, and model/resource settings. Legacy dispatch labels,
+`trusted_dispatchers`, and blocked label fields may remain for deferred
+publication/lifecycle seams; they are not scheduler authority. Validate the
+complete registry before selecting a project.
 
 Provision two separate host secrets under WSL/Linux:
 
 ```text
-~/.config/symphony-pilot/secrets/<slug>/github.token
+~/.config/symphony-pilot/secrets/<slug>/github.token (host-side only)
 ~/.config/symphony-pilot/secrets/<slug>/publication-ssh-key
 ```
 
-The tracker token is for GitHub Issues/PR API calls. The publication key is a
+The retained host token is for deferred GitHub publication/lifecycle API calls;
+it is not passed to Runtime's SQLite scheduler. The publication key is a
 repository-scoped write deploy key used only for derived branch pushes. Do not
 reuse a personal key or SSH agent, and never print either secret.
 

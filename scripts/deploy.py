@@ -69,10 +69,7 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         for name in ("prepare_workspace.py", "after_run.py", "before_remove.py",
                      "host_integration.py", "process_identity.py", "launch_codex.sh",
                      "deployment_contract.py", "containment.py", "wsl_contained_exec.py",
-                     "task_admission.py", "broker.py",
-                     "dispatch_provenance.py",
-                     "admit_task.py", "outbox.py", "rulesets.py", "publication.py",
-                     "runtime_lock.py"):
+                     "control_db.py", "runtime_lock.py"):
             shutil.copy2(ROOT / "runtime" / name, stage / "runtime" / name)
         shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
         for policy in ROLE_POLICY_FILES:

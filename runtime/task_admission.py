@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Host-owned task admission records.
+"""Retired legacy GitHub admission records.
 
-Issue prose and task-local Git metadata are semantic/untrusted input.  This
-module accepts only server-derived values supplied by the trusted dispatcher
-and stores a strict record outside the execution workspace.
+This module is not deployed or imported by the Step-5 scheduler. It remains
+only as a deferred downstream publication/lifecycle seam until Steps 6 and 7
+replace its JSON record shape. Local scheduler authority is in
+``control_db.py`` and uses ``T-N`` plus UUID identities.
 """
 from __future__ import annotations
 

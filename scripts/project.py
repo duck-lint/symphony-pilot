@@ -14,7 +14,6 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
@@ -295,12 +294,6 @@ def runtime_state(profile):
     endpoint = _dashboard_url(profile)
     return runtime_state_at(endpoint) if endpoint is not None else None
 
-def active_issues(profile, token):
-    issues = github(profile, token, "GET", "/issues?state=open&labels=" +
-                    urllib.parse.quote(",".join(profile.dispatch_labels)) + "&per_page=100")
-    return issues if isinstance(issues, list) else []
-
-
 def branch_protection_preflight(profile, token):
     """Require the one supported real GitHub repository-ruleset contract."""
     repository = github(profile, token, "GET", "")
@@ -363,10 +356,13 @@ def start(profile):
             return 78
         print("Cannot start Symphony: stale process state requires explicit recovery before cutover")
         return 78
+    # This credential is used only for the host-side branch-protection
+    # preflight. It is not tracker configuration and never enters Runtime's
+    # scheduler environment.
     try:
         token = read_secret(profile)
     except PreparationError as exc:
-        print(f"Cannot start Symphony: {exc}")
+        print(f"Cannot verify protected default branch: {exc}")
         return 1
     try:
         branch_protection_preflight(profile, token)
@@ -374,20 +370,11 @@ def start(profile):
         print(f"Cannot start Symphony: protected default-branch preflight failed: {exc}")
         return 78
     try:
-        issues = active_issues(profile, token)
-    except Exception as exc:
-        print(f"Cannot verify GitHub dispatch state: {type(exc).__name__}. No process was started.")
-        return 1
-    if len(issues) > profile.max_concurrent_agents:
-        print(f"Refusing to start: {len(issues)} dispatchable issues exceed the one-issue pilot limit.")
-        return 1
-    try:
         establish_awake_guard(profile)
     except (RuntimeError, PreparationError) as exc:
         print(f"Cannot start {project_name(profile)}: {exc}")
         return 1
     env = os.environ.copy()
-    env["SYMPHONY_PILOT_GITHUB_TOKEN"] = token
     env["SYMPHONY_PROFILE"] = str(root / "profile.toml")
     env["SYMPHONY_WORKFLOW"] = str(workflow)
     env.pop("GITHUB_TOKEN", None)
@@ -652,11 +639,7 @@ REQUIRED_DEPLOYMENT_FILES = (
     "runtime/launch_codex.sh",
     "runtime/deployment_contract.py",
     "runtime/containment.py",
-    "runtime/task_admission.py",
-    "runtime/admit_task.py",
-    "runtime/outbox.py",
-    "runtime/rulesets.py",
-    "runtime/publication.py",
+    "runtime/control_db.py",
     "runtime/runtime_lock.py",
     "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",

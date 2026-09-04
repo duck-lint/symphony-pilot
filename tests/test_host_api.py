@@ -34,7 +34,7 @@ class HostApiTests(unittest.TestCase):
             database.create_task(
                 project_slug="cleanroom", title="Local task",
                 objective="Do not leak github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-                base_ref="main", base_sha="a" * 40, branch="codex/test",
+                base_ref="main", base_sha="a" * 40,
                 task_id=self.TASK_ID,
             )
             database.upsert_workpad(self.TASK_ID, "Bearer very-secret-value")
