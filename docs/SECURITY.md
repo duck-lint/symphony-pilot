@@ -84,7 +84,11 @@ The fixed helper is a source-controlled setuid-root capability with exact
 opened-object identity pinning, not a general command broker. Pool admission
 uses unprivileged `f_bavail`/`f_favail`. The current root filesystem is rejected
 and no task is admitted until a dedicated kernel-enforced byte/inode domain and
-task-binding proof are available.
+task-binding proof are available. The source digest is checked against the
+reviewed supervisor before compilation; the installed helper must be root-owned,
+owned by the fixed helper group, and exactly setuid-root mode 4750. Its task
+root enables project-ID inheritance so descendants remain inside the same
+kernel quota.
 
 This fixture proves the constructor, not live Codex behavior. The real launcher
 still fails closed because the accepted Codex App Server authentication path

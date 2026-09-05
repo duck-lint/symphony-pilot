@@ -251,8 +251,15 @@ def validate_task_quota_binding(
         raise StorageContractError("task quota binding proof is malformed") from exc
     if not isinstance(proof, Mapping) or proof.get("schema") != "symphony-pilot-task-quota-proof/v1":
         raise StorageContractError("task quota binding proof schema is unsupported")
-    if proof.get("project_id") != expected_id or proof.get("workspace_project_id") != expected_id:
+    if (proof.get("project_id") != expected_id or
+            proof.get("workspace_project_id") != expected_id or
+            proof.get("workspace_project_inherit") is not True):
         raise StorageContractError("task quota identity is not proven on the workspace")
+    inheritance_probe = proof.get("inheritance_probe")
+    if (not isinstance(inheritance_probe, Mapping) or
+            inheritance_probe.get("attempted") is not True or
+            inheritance_probe.get("result") != "project-id"):
+        raise StorageContractError("task quota project inheritance is not proven")
     if proof.get("byte_hard_limit") != policy.task_bytes or proof.get("inode_hard_limit") != policy.task_inodes:
         raise StorageContractError("task quota hard limits do not match policy")
     byte_probe = proof.get("byte_probe")

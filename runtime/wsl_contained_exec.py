@@ -46,8 +46,9 @@ QUOTA_HELPER_PATH = pathlib.PurePosixPath(
 QUOTA_HELPER_IDENTITY_PATH = pathlib.PurePosixPath(
     "/etc/symphony-pilot/quota-admit-task.identity.json"
 )
+QUOTA_HELPER_GROUP = "symphony-pilot"
 QUOTA_HELPER_SOURCE_SHA256 = (
-    "8824ee3621b109950927de1b54a83c468aa1db28515164a8a6ce9090a528b0a5"
+    "f212db1e8bcedf1246ba760643c6c56dca0f29e4d5dff5fead2fe21be66f498f"
 )
 
 
@@ -347,8 +348,14 @@ def _quota_helper_fd() -> int:
         raise ContainmentError("quota_provisioning", "task quota helper is unavailable") from exc
     try:
         metadata = os.fstat(fd)
+        try:
+            import grp
+            expected_gid = grp.getgrnam(QUOTA_HELPER_GROUP).gr_gid
+        except (ImportError, KeyError) as exc:
+            raise ContainmentError("quota_provisioning", "task quota helper group is unavailable") from exc
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
-                metadata.st_mode & 0o022 or not metadata.st_mode & 0o111):
+                metadata.st_gid != expected_gid or metadata.st_mode & 0o022 or
+                not metadata.st_mode & 0o111 or not metadata.st_mode & stat.S_ISUID):
             raise ContainmentError("quota_provisioning", "task quota helper is not a trusted executable")
         try:
             identity_fd = os.open(
@@ -367,9 +374,10 @@ def _quota_helper_fd() -> int:
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ContainmentError("quota_provisioning", "task quota helper identity is unavailable") from exc
         if (not isinstance(identity_document, dict) or
-                set(identity_document) != {"schema", "source_sha256", "helper_sha256", "privilege"} or
+                set(identity_document) != {"schema", "source_sha256", "helper_sha256", "group", "privilege"} or
                 identity_document.get("schema") != "symphony-pilot-quota-helper/v1" or
                 identity_document.get("source_sha256") != QUOTA_HELPER_SOURCE_SHA256 or
+                identity_document.get("group") != QUOTA_HELPER_GROUP or
                 identity_document.get("privilege") != "setuid-root" or
                 not isinstance(identity_document.get("helper_sha256"), str) or
                 not SHA256.fullmatch(identity_document["helper_sha256"])):
@@ -395,7 +403,8 @@ def _validate_task_quota_result(
         raise ContainmentError("quota_provisioning", "task quota helper returned unsupported evidence")
     required = {
         "schema", "identifier", "workspace_path", "project_id", "workspace_project_id",
-        "byte_hard_limit", "inode_hard_limit", "usage", "byte_probe", "inode_probe",
+        "workspace_project_inherit", "inheritance_probe", "byte_hard_limit",
+        "inode_hard_limit", "usage", "byte_probe", "inode_probe",
     }
     if set(result) != required:
         raise ContainmentError("quota_provisioning", "task quota helper returned incomplete evidence")
@@ -403,6 +412,10 @@ def _validate_task_quota_result(
     expected_path = f"/home/duck-lint/symphony-workspaces/{project}/{identifier}"
     if (result["identifier"] != identifier or result["workspace_path"] != expected_path or
             result["project_id"] != expected_id or result["workspace_project_id"] != expected_id or
+            result["workspace_project_inherit"] is not True or
+            not isinstance(result["inheritance_probe"], dict) or
+            result["inheritance_probe"].get("attempted") is not True or
+            result["inheritance_probe"].get("result") != "project-id" or
             result["byte_hard_limit"] != byte_limit or result["inode_hard_limit"] != inode_limit):
         raise ContainmentError("quota_provisioning", "task quota helper returned mismatched identity or limits")
     usage = result["usage"]

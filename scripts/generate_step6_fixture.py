@@ -46,6 +46,8 @@ def queue_fixture_task(database: ControlPlaneDatabase, task: dict[str, object]) 
             "schema": "symphony-pilot-task-quota-proof/v1",
             "identifier": str(task["identifier"]),
             "project_id": quota_id, "workspace_project_id": quota_id,
+            "workspace_project_inherit": True,
+            "inheritance_probe": {"attempted": True, "result": "project-id"},
             "byte_hard_limit": 8 * GIB, "inode_hard_limit": 250_000,
             "usage": {"bytes": 0, "inodes": 1},
             "byte_probe": {"attempted": True, "result": "EDQUOT"},

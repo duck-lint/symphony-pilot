@@ -74,6 +74,16 @@ installation recipe are `provisioning/quota-admit-task.c` and
 `scripts/provision_storage_domain.sh`; normal Pilot, Runtime, and model
 execution never receive privilege.
 
+The helper binds `fsx_projid` and preserves existing xflags while enabling
+`FS_XFLAG_PROJINHERIT` on the exact task root; it verifies a descendant inherits
+the same project ID. Kernel limits use the generic Linux
+`Q_GETQUOTA`/`Q_SETQUOTA` calls with `PRJQUOTA` and `struct dqblk`, addressed
+through the opened pool filesystem object. The provisioning recipe formats the
+dedicated 64-GiB ext4 volume with `project,quota`, initializes
+`quotatype=prjquota`, sets `-m 0`, and verifies the project quota inode,
+mount/remount state, generic get/set round trip, and task-usable
+`f_bavail`/`f_favail` capacity before installing the helper.
+
 Admission is two phase. A trusted SQLite transaction first holds the complete
 task reservation while the task remains PREPARED. Only then may the helper
 create/bind the exact project-quota directory and prove both kernel EDQUOT

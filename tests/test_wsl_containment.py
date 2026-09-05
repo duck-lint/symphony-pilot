@@ -121,6 +121,8 @@ class SupervisorValidationTests(unittest.TestCase):
             "identifier": "T-000001",
             "workspace_path": "/home/duck-lint/symphony-workspaces/symphony-pilot/T-000001",
             "project_id": 1_000_001, "workspace_project_id": 1_000_001,
+            "workspace_project_inherit": True,
+            "inheritance_probe": {"attempted": True, "result": "project-id"},
             "byte_hard_limit": 8 * 1024 ** 3, "inode_hard_limit": 250_000,
             "usage": {"bytes": 0, "inodes": 1},
             "byte_probe": {"attempted": True, "result": "EDQUOT"},
