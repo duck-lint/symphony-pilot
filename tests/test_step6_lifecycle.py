@@ -137,6 +137,181 @@ class Step6LifecycleTests(unittest.TestCase):
         reconcile(self.profile, self.workspace)
         return head
 
+    def _license_validation_correction(self) -> tuple[str, dict[str, object], int]:
+        head = self._reach_adversarial_review()
+        attempt = self._attempt()
+        self._write_result(attempt, self._result(
+            attempt, "correction_required", findings=[self._finding("ARCHITECT", "licensed correction")],
+        ))
+        reconcile(self.profile, self.workspace)
+        with control_db.open_database(self.database_path) as database:
+            finding = database.read_projection(self.TASK_ID)["findings"][0]
+        return head, finding, int(finding["licensed_correction_round"])
+
+    def _resolve_blocker(self, blocker_id: str) -> None:
+        with control_db.open_database(self.database_path) as database:
+            database.resolve_blocker(blocker_id, resolved_at="2026-09-04T12:30:00+00:00")
+
+    def _record_blocked_correction(self, *, partial_head: bool = False) -> tuple[dict[str, object], str, str]:
+        attempt = self._attempt()
+        if partial_head:
+            (self.workspace / "partial-correction").write_text("partial\n", encoding="utf-8")
+            self._git("add", "partial-correction")
+            self._git("commit", "-qm", "partial correction")
+            actual_head = self._git("rev-parse", "HEAD")
+        else:
+            actual_head = self._git("rev-parse", "HEAD")
+        blocked_finding = self._finding(
+            "IMPLEMENTER", "unresolved project decision", blocker_kind="project"
+        )
+        self._write_result(attempt, self._result(
+            attempt, "blocked",
+            roles=[self._role("IMPLEMENTER", "BLOCKED", actual_head if partial_head else None) | {
+                "findings": [blocked_finding],
+            }],
+        ))
+        reconcile(self.profile, self.workspace)
+        with control_db.open_database(self.database_path) as database:
+            projection = database.read_projection(self.TASK_ID)
+            role_run = next(row for row in reversed(projection["role_runs"]) if row["role"] == "IMPLEMENTER")
+            blocker_id = str(projection["blockers"][-1]["id"])
+            current_head = str(database.read_task(self.TASK_ID)["current_head"])
+        return role_run, blocker_id, current_head
+
+    def _complete_correction(self, expected_head: str, finding_id: str) -> str:
+        attempt = self._attempt()
+        (self.workspace / "completed-correction").write_text("complete\n", encoding="utf-8")
+        self._git("add", "completed-correction")
+        self._git("commit", "-qm", "complete correction")
+        corrected_head = self._git("rev-parse", "HEAD")
+        self.assertNotEqual(corrected_head, expected_head)
+        self._write_result(attempt, self._result(
+            attempt, "correction_complete",
+            roles=[self._role("IMPLEMENTER", "COMPLETE", corrected_head)],
+            resolved=[finding_id],
+        ))
+        reconcile(self.profile, self.workspace)
+        return corrected_head
+
+    def test_blocked_correction_rolls_over_and_completes_after_blocker_resolution(self):
+        old_head, finding, licensed_round = self._license_validation_correction()
+        role_run, blocker_id, current_head = self._record_blocked_correction()
+        self.assertEqual(current_head, old_head)
+        self.assertEqual(role_run["round"], licensed_round)
+        self.assertEqual(finding["status"], "licensed")
+        with control_db.open_database(self.database_path) as database:
+            stored = database.read_finding(finding["id"])
+            self.assertEqual(stored["licensed_correction_round"], licensed_round + 1)
+            self.assertEqual(database.read_task(self.TASK_ID)["state"], "ADVERSARIAL_REVIEW")
+        self._resolve_blocker(blocker_id)
+
+        corrected_head = self._complete_correction(old_head, str(finding["id"]))
+        with control_db.open_database(self.database_path) as database:
+            stored = database.read_finding(finding["id"])
+            self.assertEqual(stored["status"], "resolved")
+            self.assertIsNone(stored["licensed_correction_round"])
+            self.assertEqual(database.read_task(self.TASK_ID)["state"], "IMPLEMENTED")
+            self.assertEqual(database.read_task(self.TASK_ID)["current_head"], corrected_head)
+            correction_runs = [
+                row for row in database.read_projection(self.TASK_ID)["role_runs"]
+                if row["role"] == "IMPLEMENTER"
+            ]
+            self.assertEqual(correction_runs[-1]["round"], licensed_round + 1)
+
+    def test_blocked_partial_correction_rolls_over_and_invalidates_acceptance(self):
+        old_head, finding, licensed_round = self._license_validation_correction()
+        role_run, blocker_id, partial_head = self._record_blocked_correction(partial_head=True)
+        self.assertNotEqual(partial_head, old_head)
+        self.assertEqual(role_run["round"], licensed_round)
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_task(self.TASK_ID)["current_head"], partial_head)
+            self.assertEqual(database.read_finding(finding["id"])["licensed_correction_round"], licensed_round + 1)
+            self.assertFalse(lifecycle_module._current_acceptance(
+                database, self.TASK_ID, "review_accepted", old_head
+            ))
+            self.assertFalse(lifecycle_module._current_acceptance(
+                database, self.TASK_ID, "adversary_accepted", old_head
+            ))
+        self._resolve_blocker(blocker_id)
+
+        corrected_head = self._complete_correction(partial_head, str(finding["id"]))
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_finding(finding["id"])["status"], "resolved")
+            self.assertEqual(database.read_task(self.TASK_ID)["current_head"], corrected_head)
+
+    def test_multiple_blocked_corrections_roll_license_once_per_implementer_round(self):
+        old_head, finding, licensed_round = self._license_validation_correction()
+        first_run, first_blocker, current_head = self._record_blocked_correction()
+        self.assertEqual(current_head, old_head)
+        self.assertEqual(first_run["round"], licensed_round)
+        self._resolve_blocker(first_blocker)
+
+        second_run, second_blocker, current_head = self._record_blocked_correction()
+        self.assertEqual(current_head, old_head)
+        self.assertEqual(second_run["round"], licensed_round + 1)
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_finding(finding["id"])["licensed_correction_round"], licensed_round + 2)
+        self._resolve_blocker(second_blocker)
+
+        self._complete_correction(old_head, str(finding["id"]))
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_finding(finding["id"])["status"], "resolved")
+            self.assertIsNone(database.read_finding(finding["id"])["licensed_correction_round"])
+
+    def test_architect_only_block_does_not_consume_correction_round(self):
+        old_head, finding, licensed_round = self._license_validation_correction()
+        attempt = self._attempt()
+        self._write_result(attempt, self._result(
+            attempt, "blocked", findings=[self._finding(
+                "ARCHITECT", "infrastructure condition", blocker_kind="infrastructure"
+            )],
+        ))
+        reconcile(self.profile, self.workspace)
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_task(self.TASK_ID)["state"], "ADVERSARIAL_REVIEW")
+            self.assertEqual(database.read_task(self.TASK_ID)["current_head"], old_head)
+            self.assertEqual(database.read_finding(finding["id"])["licensed_correction_round"], licensed_round)
+            self.assertFalse(any(
+                row["role"] == "IMPLEMENTER" and row["round"] == licensed_round + 1
+                for row in database.read_projection(self.TASK_ID)["role_runs"]
+            ))
+
+    def test_stale_correction_round_fails_closed_and_preserves_evidence(self):
+        old_head, finding, licensed_round = self._license_validation_correction()
+        with control_db.open_database(self.database_path) as database:
+            database.connection.execute(
+                "UPDATE findings SET licensed_correction_round = ? WHERE id = ?",
+                (licensed_round + 99, finding["id"]),
+            )
+        attempt = self._attempt()
+        self._write_result(attempt, self._result(
+            attempt, "blocked",
+            roles=[self._role("IMPLEMENTER", "BLOCKED") | {
+                "findings": [self._finding(
+                    "IMPLEMENTER", "infrastructure condition", blocker_kind="infrastructure"
+                )],
+            }],
+        ))
+        import after_run
+        with mock.patch.object(after_run, "load_profile", return_value=self.profile):
+            self.assertEqual(
+                after_run.main(["--profile", str(self.profile_path), "--workspace", str(self.workspace)]),
+                78,
+            )
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_task(self.TASK_ID)["current_head"], old_head)
+            self.assertEqual(
+                database.read_finding(finding["id"])["licensed_correction_round"], licensed_round + 99
+            )
+            self.assertEqual(
+                database.read_projection(self.TASK_ID)["blockers"][-1]["kind"], "infrastructure"
+            )
+            implementer_runs = [
+                row for row in database.read_projection(self.TASK_ID)["role_runs"]
+                if row["role"] == "IMPLEMENTER"
+            ]
+            self.assertEqual(len(implementer_runs), 1)
+
     def test_complete_lifecycle_stops_at_archivist_and_ready_is_guarded(self):
         attempt = self._attempt()
         self._write_result(attempt, self._result(

@@ -134,6 +134,40 @@ def _next_round(database: ControlPlaneDatabase, task_id: str, role: str) -> int:
     return int(row[0])
 
 
+def _rollover_blocked_correction(
+    database: ControlPlaneDatabase,
+    task: dict[str, object],
+    licensed_rows: list[object],
+    implementer_run_id: str | None,
+) -> None:
+    """Move an unresolved correction license to the next real IMPLEMENTER run.
+
+    A blocked IMPLEMENTER attempt consumes a role round but does not consume the
+    correction license.  The round is allocated from persisted role history
+    after that attempt is recorded; hostile result data never selects it.
+    """
+    if implementer_run_id is None:
+        return
+    implementer_run = database.read_role_run(implementer_run_id)
+    correction_round = int(implementer_run["round"])
+    if not licensed_rows or any(
+        row["licensed_correction_round"] != correction_round for row in licensed_rows
+    ):
+        raise LifecycleError(
+            "licensed correction findings are not licensed for the blocked IMPLEMENTER round"
+        )
+    next_round = _next_round(database, str(task["id"]), "IMPLEMENTER")
+    for row in licensed_rows:
+        updated = database.connection.execute(
+            "UPDATE findings SET licensed_correction_round = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'licensed' "
+            "AND licensed_correction_round = ?",
+            (next_round, row["id"], task["id"], correction_round),
+        )
+        if updated.rowcount != 1:
+            raise LifecycleError("licensed correction changed while blocked IMPLEMENTER was reconciled")
+
+
 def _insert_event(database: ControlPlaneDatabase, task_id: str, event_type: str,
                   payload: object, *, role_run_id: str | None = None) -> None:
     database._insert_event(task_id, event_type, payload, role_run_id=role_run_id, occurred_at=_now())
@@ -598,6 +632,21 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     implementation_phase = state == "PLANNED" or (
         state in {"IMPLEMENTED", "REVIEW", "ADVERSARIAL_REVIEW"} and has_licensed
     )
+    licensed_rows = []
+    blocked_implementer_round = None
+    if outcome == "blocked" and has_licensed and "IMPLEMENTER" in packets:
+        licensed_rows = database.connection.execute(
+            "SELECT id, licensed_correction_round FROM findings "
+            "WHERE task_id = ? AND status = 'licensed' ORDER BY rowid",
+            (task["id"],),
+        ).fetchall()
+        blocked_implementer_round = _next_round(database, task["id"], "IMPLEMENTER")
+        if not licensed_rows or any(
+            row["licensed_correction_round"] != blocked_implementer_round for row in licensed_rows
+        ):
+            raise LifecycleError(
+                "licensed correction findings are not licensed for the blocked IMPLEMENTER round"
+            )
     readonly_phase = not implementation_phase
     if readonly_phase and actual_head != selected_head:
         raise LifecycleError("read-only lifecycle phase changed Git HEAD")
@@ -687,6 +736,11 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
         "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)
     ).fetchone():
         raise LifecycleError("blocked lifecycle result did not produce an open blocker")
+    if outcome == "blocked" and blocked_implementer_round is not None:
+        implementer_run_id = specialized_runs.get("IMPLEMENTER")
+        if implementer_run_id is None or database.read_role_run(implementer_run_id)["round"] != blocked_implementer_round:
+            raise LifecycleError("blocked IMPLEMENTER round was not persisted as allocated")
+        _rollover_blocked_correction(database, task, licensed_rows, implementer_run_id)
     if implementation_phase:
         old_head = selected_head
         if old_head != actual_head:

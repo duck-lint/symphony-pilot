@@ -110,3 +110,11 @@ does not switch the branch as a continuation repair. A branch or HEAD mismatch
 is persisted as an infrastructure blocker while leaving both the local branch
 and SQLite value unchanged. The remote task branch remains a Step-7 publication
 artifact.
+
+When a licensed correction reaches an actual IMPLEMENTER attempt and that attempt
+is blocked, the persisted role round is retained in role history and the exact
+still-licensed findings are atomically moved to the next host-allocated
+IMPLEMENTER round. The lifecycle phase, blocker, ownership and HEAD rules do not
+change. A blocker before an IMPLEMENTER packet consumes no IMPLEMENTER round, so
+the correction license remains where it was. Completion still requires a new
+clean HEAD and an exact finding/round match.
