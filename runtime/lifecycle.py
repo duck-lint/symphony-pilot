@@ -14,9 +14,9 @@ import os
 import pathlib
 import re
 import stat
-import subprocess
 import uuid
 from control_db import ControlPlaneDatabase, ControlPlaneError, StateConflict
+from workspace_boundary import atomic_metadata_write, physical_directory, run_git
 from prepare_workspace import (Profile, control_database_path,
                                local_task_facts, require_physical_namespace)
 
@@ -140,9 +140,7 @@ def _insert_event(database: ControlPlaneDatabase, task_id: str, event_type: str,
 
 
 def _write_host_json(path: pathlib.Path, value: object) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    atomic_metadata_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def _packet(database: ControlPlaneDatabase, task: dict[str, object], run_id: str) -> dict[str, object]:
@@ -268,7 +266,7 @@ def _allocate_architect_attempt(profile: Profile, facts):
 
 def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
     """Allocate the sole Architect attempt and its fixed lifecycle mounts."""
-    workspace = require_physical_namespace(workspace.resolve())
+    workspace = physical_directory(workspace)
     facts, _ = local_task_facts(profile, workspace)
     if facts.branch != _git(workspace, "branch", "--show-current"):
         raise LifecycleError("workspace is not on the host-owned task branch")
@@ -401,7 +399,7 @@ def read_result(path: pathlib.Path) -> dict[str, object]:
 
 
 def _git(workspace: pathlib.Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=workspace, capture_output=True, text=True, check=False)
+    result = run_git(workspace, *args)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip().replace("\n", " ")
         raise LifecycleError(f"Git verification failed: {detail[:240]}")
@@ -420,8 +418,7 @@ def verify_git_truth(profile: Profile, workspace: pathlib.Path, task: dict[str, 
     head = _git(workspace, "rev-parse", "HEAD")
     if not SHA_RE.fullmatch(head):
         raise LifecycleError("workspace HEAD is not a commit SHA")
-    if subprocess.run(["git", "merge-base", "--is-ancestor", str(task["base_sha"]), head],
-                      cwd=workspace, check=False).returncode:
+    if run_git(workspace, "merge-base", "--is-ancestor", str(task["base_sha"]), head).returncode:
         raise LifecycleError("workspace HEAD is not descended from the accepted base")
     return head
 
@@ -563,8 +560,15 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
             "ADVERSARIAL_REVIEW": (set(), {"validation_pass", "correction_required", "blocked"}),
             "FINAL_MECHANICAL_ACCEPTANCE": ({"ARCHIVIST"}, {"archive_complete", "blocked"}),
         }[state]
-    packets = {str(packet["role"]): packet for packet in result["role_results"]}
     outcome = str(result["outcome"])
+    role_sequence = [packet["role"] for packet in result["role_results"]]
+    if state == "QUEUED":
+        prefixes = [[], ["PROJECT-MANAGER"], ["PROJECT-MANAGER", "PLANNER"]]
+        if role_sequence not in (prefixes if outcome == "blocked" else [prefixes[-1]]):
+            raise LifecycleError("authority/planning role history is not a possible prefix")
+        if len(role_sequence) == 2 and result["role_results"][0]["verdict"] != "APPROVE":
+            raise LifecycleError("Planner requires preceding Project-Manager approval")
+    packets = {str(packet["role"]): packet for packet in result["role_results"]}
     if outcome not in allowed_outcomes:
         raise LifecycleError("lifecycle outcome is impossible for the current next action")
     if outcome == "blocked":
@@ -597,7 +601,7 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     readonly_phase = not implementation_phase
     if readonly_phase and actual_head != selected_head:
         raise LifecycleError("read-only lifecycle phase changed Git HEAD")
-    if implementation_phase and actual_head == selected_head:
+    if outcome in {"implementation_complete", "correction_complete"} and actual_head == selected_head:
         raise LifecycleError("IMPLEMENTER did not produce a new committed HEAD")
     correction_round = _next_round(database, task["id"], "IMPLEMENTER") if outcome == "correction_required" else None
     specialized_runs: dict[str, str] = {}
@@ -684,7 +688,7 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     ).fetchone():
         raise LifecycleError("blocked lifecycle result did not produce an open blocker")
     if implementation_phase:
-        old_head = task["current_head"]
+        old_head = selected_head
         if old_head != actual_head:
             database.connection.execute(
                 "UPDATE tasks SET current_head = ?, updated_at = ? WHERE id = ?",
@@ -733,7 +737,8 @@ def fail_attempt(profile: Profile, task_id: str, *, detail: str) -> bool:
 
 
 def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
-    workspace = require_physical_namespace(workspace.resolve())
+    workspace = physical_directory(workspace)
+    physical_directory(workspace / ".git")
     facts, _ = local_task_facts(profile, workspace)
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
         task = database.read_task(facts.task_uuid)

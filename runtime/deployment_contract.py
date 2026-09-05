@@ -30,6 +30,7 @@ CONTRACT_FILES = (
     "runtime/before_remove.py",
     "runtime/host_integration.py",
     "runtime/prepare_workspace.py",
+    "runtime/workspace_boundary.py",
     "runtime/process_identity.py",
     "runtime/render_workflow.py",
     "runtime/project_registry.py",
@@ -46,6 +47,7 @@ CONTRACT_FILES = (
 # source-only; the SQLite lifecycle broker is deployed and manifest-covered.
 DEPLOYED_RUNTIME_FILES = (
     "runtime/prepare_workspace.py",
+    "runtime/workspace_boundary.py",
     "runtime/after_run.py",
     "runtime/before_run.py",
     "runtime/lifecycle.py",

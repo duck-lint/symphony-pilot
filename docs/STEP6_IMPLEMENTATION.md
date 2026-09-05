@@ -7,7 +7,7 @@ repository is merged by Step 6.
 
 - Pilot base: `bf7c546aa87e085e8ebaa5782f9193f8aa45a2e3`
 - Runtime base: `54753c1a702a3131c5f522703af8c25e10638f44`
-- `RUNTIME_STEP6_HEAD`: `9ad5a047d28ebfc14f390965851003e3ed99d389`
+- `RUNTIME_STEP6_HEAD`: `5a4405d8346caee6fff0ed50dcc11119151a1f3e`
 - Runtime branch: `codex/step-6-runtime-routing`
 - Pilot branch: `codex/step-6-pilot-lifecycle`
 
@@ -55,8 +55,46 @@ project. The lifecycle E2E uses a disposable target Git repository and
 disposable SQLite database without launching Codex.
 
 Pilot tests and Python compilation are runnable in this Windows environment.
-Runtime canonical `make ci` and live Windows-to-WSL proof remain unavailable:
-`make`/the Elixir toolchain are absent and WSL returns
-`Wsl/EnumerateDistros/Service/E_ACCESSDENIED`. Existing Step-8 findings remain
+The sandbox still reports WSL `E_ACCESSDENIED`, but approved execution outside
+the sandbox reaches Ubuntu-24.04 and runs native tests. Runtime PR #1 first
+tested `9ad5a04` and failed dependency audit (Mint 1.9.3); native `make all`
+then exposed the remaining blocker-free HUMAN_BLOCKED fixture assertion.
+The corrected candidate changes only that assertion and the Mint lock entry.
+Native `make all` passes, including audit, coverage and Dialyzer; the PR's
+production artifact workflow supplies the separate hosted artifact evidence.
+Existing Step-8 findings remain
 open, including credential isolation, aggregate task storage, Runtime
 pin-to-exec TOCTOU, and live WSL containment.
+
+## Trusted workspace boundary correction
+
+`workspace_boundary.py` owns host Git calls against reused task clones and
+atomic host metadata writes. The task must be stopped during these operations;
+this does not prove safe concurrent execution or remove the Step-8 gate.
+Local configuration is parsed as data outside the repository with includes
+disabled, then admitted through a finite allowlist: basic non-executable clone
+settings, origin URL/fetch refspec, branch tracking, and inert author identity.
+Unknown keys, includes, filters, execution commands, rewrite rules, metadata
+symlinks/special files and external Git-directory/object indirection fail closed.
+Hooks and fsmonitor are disabled even for otherwise accepted repositories.
+
+The Git environment drops inherited Git variables and system/global config,
+replacement objects, interactive prompts and pagers. The registered remote is
+verified literally and supplied directly to fetch. SSH may use the operator's
+host-owned SSH configuration and agent. Optional Git credential/transport
+configuration is admitted only from the explicit host file
+`~/.config/symphony-pilot/git-transport.config` for transport calls; it must
+remain outside the task. Task configuration cannot select that authority.
+
+Metadata writes use unpredictable exclusive regular temporaries (0600), fsync
+and atomic replacement. POSIX parent descriptors are opened without following
+symlinks. Windows rejects reparse parents; the stopped-task prerequisite also
+applies there. Existing predictable `.tmp` and final leaf symlinks are never
+followed. Preparation resolves T-N through project-scoped SQLite before Git
+inspection, permitting durable infrastructure blockers for early failures.
+
+Successful implementation/correction requires a new clean descendant HEAD.
+A blocked implementation can retain its starting HEAD; a clean partial commit
+is persisted with `head_changed`, invalidating earlier acceptance while keeping
+the phase and blocker. Planning requires ordered PM then Planner evidence;
+blocked planning accepts only prefixes of that order.
