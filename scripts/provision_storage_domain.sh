@@ -14,6 +14,9 @@ HELPER_GROUP=symphony-pilot
 EXPECTED_BYTES=$((64 * 1024 * 1024 * 1024))
 
 [ "$(id -u)" -eq 0 ] || { echo "must run once as root" >&2; exit 78; }
+[ "$(id -u duck-lint)" -ge 0 ] || { echo "fixed duck-lint account is required" >&2; exit 78; }
+getent group "$HELPER_GROUP" >/dev/null 2>&1 || groupadd --system "$HELPER_GROUP"
+usermod --append --groups "$HELPER_GROUP" duck-lint
 case "$POOL_DEVICE" in /dev/sdd|/dev/sdd/*) echo "ordinary Ubuntu root device is rejected" >&2; exit 78;; esac
 [ -b "$POOL_DEVICE" ] || { echo "dedicated block device is required" >&2; exit 78; }
 [ "$(blockdev --getsize64 "$POOL_DEVICE")" -eq "$EXPECTED_BYTES" ] || {
