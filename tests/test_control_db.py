@@ -44,7 +44,7 @@ class ControlDatabaseTests(unittest.TestCase):
         self.assertEqual(control_db.inspect_schema_version(self.database_path), 0)
 
         with control_db.open_database(self.database_path) as database:
-            self.assertEqual(database.schema_version, 1)
+            self.assertEqual(database.schema_version, 2)
             self.assertEqual(database.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(database.connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(database.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
@@ -57,8 +57,8 @@ class ControlDatabaseTests(unittest.TestCase):
             self.assertIn("tasks", tables)
 
         with control_db.open_database(self.database_path) as reopened:
-            self.assertEqual(reopened.schema_version, 1)
-            self.assertEqual(reopened.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+            self.assertEqual(reopened.schema_version, 2)
+            self.assertEqual(reopened.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
 
     def test_readonly_open_denies_writes_and_blocks_restore_until_closed(self):
         task = self.task()
@@ -81,12 +81,12 @@ class ControlDatabaseTests(unittest.TestCase):
         newer_path = pathlib.Path(self.temporary.name) / "newer.sqlite3"
         connection = sqlite3.connect(newer_path)
         try:
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
         finally:
             connection.close()
         with self.assertRaises(control_db.UnsupportedSchemaVersion):
             control_db.open_database(newer_path)
-        self.assertEqual(control_db.inspect_schema_version(newer_path), 2)
+        self.assertEqual(control_db.inspect_schema_version(newer_path), 3)
 
         partial_path = pathlib.Path(self.temporary.name) / "partial.sqlite3"
         connection = sqlite3.connect(partial_path)
@@ -428,7 +428,7 @@ class ControlDatabaseTests(unittest.TestCase):
         backup_path = pathlib.Path(self.temporary.name) / "backup.sqlite3"
         self.database.backup_to(backup_path)
         self.assertTrue(backup_path.is_file())
-        self.assertEqual(control_db.inspect_schema_version(backup_path), 1)
+        self.assertEqual(control_db.inspect_schema_version(backup_path), 2)
         backup_bytes = backup_path.read_bytes()
 
         self.task(task_id="33333333-3333-3333-3333-333333333333")
@@ -450,7 +450,7 @@ class ControlDatabaseTests(unittest.TestCase):
         self.database.backup_to(backup_path)
         connection = sqlite3.connect(backup_path)
         try:
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
         finally:
             connection.close()
         with control_db.open_database(target_path) as target:

@@ -22,6 +22,7 @@ import prepare_workspace as pw
 import project
 import render_workflow
 import task
+from storage import VerifiedStorageDomain
 
 
 class Step5SchedulerCutoverTests(unittest.TestCase):
@@ -107,7 +108,15 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                             project_slug="alpha", title="bad", objective="bad",
                             base_ref="main", base_sha="a" * 40, branch="operator-choice",
                         )
-                self.assertEqual(task.queue(Namespace(project="alpha", task="T-000001")), 0)
+                domain = VerifiedStorageDomain(
+                    project="alpha", source="/dev/vdb", target=str(profile.workspace_root),
+                    fstype="ext4", options="rw,relatime,prjquota",
+                    pool_bytes=64 * 1024 ** 3, pool_inodes=1_000_000,
+                    free_bytes=60 * 1024 ** 3, free_inodes=900_000,
+                    evidence_json='{"synthetic":true}',
+                )
+                with mock.patch.object(task, "verify_profile_storage", return_value=domain):
+                    self.assertEqual(task.queue(Namespace(project="alpha", task="T-000001")), 0)
                 with self.assertRaises(control_db.StateConflict):
                     task.queue(Namespace(project="alpha", task="T-000001"))
                 with control_db.open_database_readonly(database_path) as database:
@@ -135,6 +144,25 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
             with mock.patch.object(pw, "control_database_path", return_value=database_path):
                 with self.assertRaises(pw.PreparationError):
                     pw.local_task_facts(self.profile(root, "beta"), workspace)
+
+    def test_storage_admission_failure_persists_infrastructure_blocker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            database_path = root / "control.sqlite3"
+            profile = self.profile(root)
+            with mock.patch.object(task, "_profile", return_value=profile), \
+                 mock.patch.object(task, "resolve_remote_head", return_value=("main", "a" * 40)), \
+                 mock.patch.object(task, "default_database_path", return_value=database_path), \
+                 mock.patch.object(task, "verify_profile_storage",
+                                   side_effect=task.TaskCommandError("quota backend unavailable")):
+                task.create(Namespace(project="alpha", title="Local task", objective="Do it"))
+                self.assertEqual(task.main(["queue", "--project", "alpha", "--task", "T-000001"]), 78)
+            with control_db.open_database_readonly(database_path) as database:
+                record = database.read_task_by_identifier("T-000001", project_slug="alpha")
+                self.assertEqual(record["state"], "PREPARED")
+                blockers = database.read_projection(record["id"])["blockers"]
+                self.assertEqual(len(blockers), 1)
+                self.assertEqual(blockers[0]["kind"], "infrastructure")
 
     def test_rendered_workflow_has_sqlite_scheduler_and_no_github_scheduler_surface(self):
         profile = self.profile(pathlib.Path("/home/operator"))

@@ -151,6 +151,7 @@ PROJECT_ROOTS = {
     "symphony-pilot": pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-pilot"),
     "symphony-runtime": pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime"),
 }
+STORAGE_PROJECTS = frozenset({"symphony-pilot", "symphony-runtime", "symphony-canary"})
 
 
 def _project_root(project: str) -> pathlib.Path:
@@ -195,7 +196,7 @@ def _ensure_plain_directory(path: pathlib.Path, kind: str) -> tuple[pathlib.Path
 
 
 def _workspace_storage_root(project: str) -> tuple[pathlib.Path, bool]:
-    if project not in PROJECT_ROOTS:
+    if project not in STORAGE_PROJECTS:
         raise ContainmentError("project", "project is not admitted to the WSL quota domain")
     namespace = pathlib.Path(WORKSPACE_ROOT)
     namespace, _ = _ensure_plain_directory(namespace, "quota_workspace")
@@ -250,8 +251,20 @@ def _quota_inspection(project: str) -> dict[str, object]:
             usage = os.statvfs(target)
         except OSError as exc:
             raise ContainmentError("quota_inspection", "persistent task filesystem statistics are unavailable") from exc
+        try:
+            ownership = os.stat(target, follow_symlinks=False)
+        except OSError:
+            # Some unit fixtures provide only statvfs evidence. A missing
+            # ownership proof is represented as untrusted and is rejected by
+            # the host verifier for real admission.
+            ownership = None
         option_set = frozenset(options.split(","))
         project_quota = fstype in {"ext4", "xfs"} and bool(option_set & {"prjquota", "pquota"})
+        trusted_ownership = (
+            ownership is not None and
+            ownership.st_uid == getattr(os, "getuid", lambda: -1)() and
+            not (ownership.st_mode & 0o022)
+        )
         return {
             "schema": QUOTA_INSPECTION_SCHEMA,
             "project": project,
@@ -270,6 +283,21 @@ def _quota_inspection(project: str) -> dict[str, object]:
                     "inodes": usage.f_files,
                     "free_inodes": usage.f_ffree,
                 },
+            },
+            "ownership": {
+                "uid": ownership.st_uid if ownership is not None else None,
+                "gid": ownership.st_gid if ownership is not None else None,
+                "mode": ownership.st_mode & 0o777 if ownership is not None else None,
+                "trusted": trusted_ownership,
+            },
+            # Mount flags alone do not prove that a task quota identity is
+            # applicable or that either hard limit is enforced. Those facts
+            # require the separate trusted provisioning/verifier proof.
+            "quota": {
+                "backend": "ext4-project-quota" if project_quota else None,
+                "identity_applicable": False,
+                "byte_hard_limit_enforced": False,
+                "inode_hard_limit_enforced": False,
             },
         }
     finally:

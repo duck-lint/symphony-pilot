@@ -20,7 +20,9 @@ sys.path.insert(0, str(ROOT / "runtime"))
 
 from control_db import (ControlPlaneDatabase, ControlPlaneError,
                         default_database_path)  # noqa: E402
+from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
+from storage import StorageContractError, verify_storage_evidence  # noqa: E402
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -107,6 +109,22 @@ def create(args: argparse.Namespace) -> int:
     return 0
 
 
+def verify_profile_storage(profile):
+    """Obtain the fixed Linux proof; never inspect storage with host commands."""
+    try:
+        from wsl_adapter import WslAdapterError, inspect_quota
+        evidence = inspect_quota(profile.slug, request_id=f"storage-{profile.slug}-admission")
+    except WslAdapterError as exc:
+        raise TaskCommandError(f"trusted storage capability is unavailable: {exc.kind}") from exc
+    try:
+        return verify_storage_evidence(
+            profile.slug, evidence, profile.storage_policy,
+            expected_target=str(profile.workspace_root),
+        )
+    except StorageContractError as exc:
+        raise TaskCommandError(f"storage admission failed closed: {exc}") from exc
+
+
 def queue(args: argparse.Namespace) -> int:
     profile = _profile(args.project)
     selector_kind, selector = _task_selector(args.task)
@@ -115,7 +133,20 @@ def queue(args: argparse.Namespace) -> int:
                 if selector_kind == "identifier" else database.read_task(selector))
         if task["project_slug"] != profile.slug:
             raise TaskCommandError("task is not registered to this project")
-        task = database.queue_task(task["id"], project_slug=profile.slug)
+        if task["state"] != "PREPARED":
+            raise StateConflict("only PREPARED tasks may be queued")
+        try:
+            domain = verify_profile_storage(profile)
+            task = database.queue_task_with_storage(
+                task["id"], project_slug=profile.slug,
+                domain=domain, policy=profile.storage_policy,
+            )
+        except (TaskCommandError, StateConflict) as exc:
+            database.record_blocker(
+                task_id=task["id"], kind="infrastructure",
+                body=f"storage admission failed: {type(exc).__name__}: {exc}",
+            )
+            raise
     _emit(task)
     return 0
 

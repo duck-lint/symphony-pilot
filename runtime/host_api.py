@@ -22,6 +22,7 @@ from prepare_workspace import deployment_path, project_namespaces
 from process_identity import matches
 from project_registry import resolve_project, validate_registry
 from runtime_lock import RuntimeLockError, validate_lock
+from storage import capacity_snapshot
 
 
 TASK_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -83,6 +84,9 @@ class HostControlApplication:
         for profile in validate_registry(self.registry_root):
             with self._read_database() as database:
                 tasks = database.list_tasks(project_slug=profile.slug)
+                domain = database.read_storage_domain(profile.slug)
+                reservations = database.storage_reservation_totals(profile.slug)
+            storage = self._storage_summary(profile, domain, reservations)
             projects.append({
                 "slug": profile.slug,
                 "display_name": profile.display_name,
@@ -93,6 +97,7 @@ class HostControlApplication:
                 "deployment": self._deployment_summary(profile),
                 "process": self._process_summary(profile),
                 "runtime": self._runtime_summary(profile),
+                "storage": storage,
             })
         return projects
 
@@ -163,6 +168,44 @@ class HostControlApplication:
                 key: lock[name][key] for key in ("executable", "version", "sha256")
             }
         return summary
+
+    @staticmethod
+    def _storage_summary(profile, domain, reservations) -> dict[str, object]:
+        """Expose trusted capacity observations without adding a write route."""
+        policy = profile.storage_policy
+        if domain is None:
+            return {
+                "state": "unverified",
+                "reason": "dedicated kernel quota domain is not verified",
+                "policy": {
+                    "pool_bytes": policy.pool_bytes,
+                    "task_bytes": policy.task_bytes,
+                    "task_inodes": policy.task_inodes,
+                    "emergency_reserve_bytes": policy.emergency_reserve_bytes,
+                    "emergency_reserve_inodes": policy.emergency_reserve_inodes,
+                },
+                "reserved_bytes": reservations["reserved_bytes"],
+                "reserved_inodes": reservations["reserved_inodes"],
+            }
+        values = capacity_snapshot(
+            domain, reservations["reserved_bytes"], reservations["reserved_inodes"],
+            configured_pool_bytes=policy.pool_bytes,
+        )
+        return {
+            "state": "verified",
+            "source": domain["source"],
+            "mount_target": domain["mount_target"],
+            "fstype": domain["fstype"],
+            "mount_options": domain["mount_options"],
+            "policy": {
+                "pool_bytes": policy.pool_bytes,
+                "task_bytes": policy.task_bytes,
+                "task_inodes": policy.task_inodes,
+                "emergency_reserve_bytes": policy.emergency_reserve_bytes,
+                "emergency_reserve_inodes": policy.emergency_reserve_inodes,
+            },
+            **values,
+        }
 
 
 class HostControlServer(http.server.ThreadingHTTPServer):

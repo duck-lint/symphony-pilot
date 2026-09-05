@@ -28,6 +28,7 @@ import urllib.request
 import uuid
 from workspace_boundary import (atomic_metadata_write,
                                 physical_directory, run_git, validate_repository)
+from storage import StoragePolicy, StorageContractError
 
 class PreparationError(RuntimeError):
     def __init__(self, kind: str, message: str, persisted: bool = False):
@@ -62,6 +63,7 @@ class Profile:
     display_name: str = ""
     notification_backend: str = "windows-toast"
     source_profile_path: pathlib.Path | None = None
+    storage_policy: StoragePolicy = dataclasses.field(default_factory=StoragePolicy)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,14 +176,18 @@ def load_profile(path: pathlib.Path) -> Profile:
                "blocked_label", "max_concurrent_agents", "max_turns", "poll_interval_ms",
                "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
                "prevent_host_sleep", "notifications_enabled", "display_name",
-               "notification_backend", "dashboard_port"}
+               "notification_backend", "dashboard_port", "storage_pool_bytes",
+               "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes",
+               "storage_emergency_reserve_inodes"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise PreparationError("profile", "unsupported profile fields: " + ",".join(unknown))
     required = ["slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels", "blocked_label",
                 "max_concurrent_agents", "max_turns", "dashboard_port",
                 "poll_interval_ms", "max_retry_backoff_ms", "codex_model",
-                "codex_reasoning_effort"]
+                "codex_reasoning_effort", "storage_pool_bytes", "task_storage_bytes",
+                "task_storage_inodes", "storage_emergency_reserve_bytes",
+                "storage_emergency_reserve_inodes"]
     missing = [key for key in required if key not in raw]
     if missing:
         raise PreparationError("profile", "missing profile fields: " + ",".join(missing))
@@ -223,6 +229,16 @@ def load_profile(path: pathlib.Path) -> Profile:
         raise PreparationError("profile", "prevent_host_sleep must be boolean")
     if not isinstance(raw.get("notifications_enabled", False), bool):
         raise PreparationError("profile", "notifications_enabled must be boolean")
+    try:
+        storage_policy = StoragePolicy(
+            pool_bytes=raw["storage_pool_bytes"],
+            task_bytes=raw["task_storage_bytes"],
+            task_inodes=raw["task_storage_inodes"],
+            emergency_reserve_bytes=raw["storage_emergency_reserve_bytes"],
+            emergency_reserve_inodes=raw["storage_emergency_reserve_inodes"],
+        ).validate()
+    except (TypeError, ValueError, StorageContractError) as exc:
+        raise PreparationError("storage_policy", "profile storage policy is invalid") from exc
     profile = Profile(
         slug=slug,
         repository=str(raw["repository"]),
@@ -248,6 +264,7 @@ def load_profile(path: pathlib.Path) -> Profile:
         display_name=str(raw.get("display_name", slug)),
         notification_backend=str(raw.get("notification_backend", "windows-toast")),
         source_profile_path=path.resolve(),
+        storage_policy=storage_policy,
     )
     namespaces = project_namespaces(profile)
     return dataclasses.replace(

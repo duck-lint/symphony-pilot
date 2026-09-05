@@ -136,12 +136,15 @@ class HostApiTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         projects = json.loads(body)["projects"]
         self.assertEqual(projects[0]["repository"], "duck-lint/CLEANROOM")
+        self.assertEqual(projects[0]["storage"]["state"], "unverified")
+        self.assertEqual(projects[0]["storage"]["policy"]["pool_bytes"], 64 * 1024 ** 3)
         self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
         self.assertNotIn("secret_reference", body.decode())
         response, body = self.request("GET", f"/api/v1/projects/cleanroom/tasks/{self.TASK_ID}")
         self.assertEqual(response.status, 200)
         self.assertNotIn("github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ", body.decode())
         self.assertNotIn("very-secret-value", body.decode())
+        self.assertIn('"storage": null', body.decode())
         with control_db.open_database(self.database_path) as database:
             self.assertEqual(database.read_task(self.TASK_ID), before_task)
             self.assertEqual(database.list_events(self.TASK_ID), before_events)

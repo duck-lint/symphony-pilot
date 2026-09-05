@@ -27,9 +27,10 @@ from prepare_workspace import resolve_host_root
 
 CONTROL_DB_FILENAME = "control.sqlite3"
 CONTROL_DB_DIRECTORY = pathlib.Path(".local") / "state" / "symphony-pilot"
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5_000
 MIGRATION_ID = "control-plane-v1"
+STORAGE_MIGRATION_ID = "control-plane-v2-storage-reservations"
 
 TASK_STATES = frozenset({
     "PREPARED",
@@ -407,6 +408,53 @@ MIGRATIONS = (
             "CREATE INDEX task_events_type_idx ON task_events(event_type)",
         ),
     ),
+    Migration(
+        version=2,
+        identity=STORAGE_MIGRATION_ID,
+        statements=(
+            """
+            CREATE TABLE storage_domains (
+                project_slug TEXT PRIMARY KEY
+                    CHECK (
+                        length(project_slug) BETWEEN 1 AND 64 AND
+                        project_slug NOT GLOB '*[^a-z0-9-]*' AND
+                        project_slug GLOB '[a-z0-9]*'
+                    ),
+                source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+                mount_target TEXT NOT NULL CHECK (length(trim(mount_target)) > 0),
+                fstype TEXT NOT NULL CHECK (fstype = 'ext4'),
+                mount_options TEXT NOT NULL CHECK (length(trim(mount_options)) > 0),
+                pool_bytes INTEGER NOT NULL CHECK (pool_bytes > 0),
+                pool_inodes INTEGER NOT NULL CHECK (pool_inodes > 0),
+                free_bytes INTEGER NOT NULL CHECK (free_bytes >= 0 AND free_bytes <= pool_bytes),
+                free_inodes INTEGER NOT NULL CHECK (free_inodes >= 0 AND free_inodes <= pool_inodes),
+                verified_at TEXT NOT NULL CHECK (length(verified_at) > 0),
+                evidence_json TEXT NOT NULL CHECK (length(evidence_json) > 0 AND json_valid(evidence_json))
+            )
+            """,
+            """
+            CREATE TABLE storage_reservations (
+                task_id TEXT PRIMARY KEY,
+                project_slug TEXT NOT NULL
+                    CHECK (
+                        length(project_slug) BETWEEN 1 AND 64 AND
+                        project_slug NOT GLOB '*[^a-z0-9-]*' AND
+                        project_slug GLOB '[a-z0-9]*'
+                    ),
+                quota_id INTEGER NOT NULL UNIQUE CHECK (quota_id >= 1),
+                reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes > 0),
+                reserved_inodes INTEGER NOT NULL CHECK (reserved_inodes > 0),
+                status TEXT NOT NULL CHECK (status IN ('reserved', 'released')),
+                created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+                released_at TEXT,
+                CHECK ((status = 'reserved' AND released_at IS NULL) OR
+                       (status = 'released' AND released_at IS NOT NULL)),
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE RESTRICT
+            )
+            """,
+            "CREATE INDEX storage_reservations_project_status_idx ON storage_reservations(project_slug, status)",
+        ),
+    ),
 )
 
 
@@ -428,6 +476,14 @@ EXPECTED_TABLE_COLUMNS = {
     "blockers": {"id", "task_id", "kind", "body", "status", "created_at", "resolved_at"},
     "publications": {"task_id", "head_sha", "remote_branch", "github_pr_number", "publication_status", "published_at"},
     "task_events": {"id", "task_id", "event_type", "role_run_id", "payload_json", "occurred_at"},
+    "storage_domains": {
+        "project_slug", "source", "mount_target", "fstype", "mount_options",
+        "pool_bytes", "pool_inodes", "free_bytes", "free_inodes", "verified_at", "evidence_json",
+    },
+    "storage_reservations": {
+        "task_id", "project_slug", "quota_id", "reserved_bytes", "reserved_inodes",
+        "status", "created_at", "released_at",
+    },
 }
 
 EXPECTED_INDEXES = {
@@ -438,6 +494,9 @@ EXPECTED_INDEXES = {
     "blockers_task_status_idx": ("blockers", False, ("task_id", "status")),
     "task_events_task_time_idx": ("task_events", False, ("task_id", "occurred_at", "id")),
     "task_events_type_idx": ("task_events", False, ("event_type",)),
+    "storage_reservations_project_status_idx": (
+        "storage_reservations", False, ("project_slug", "status")
+    ),
 }
 
 EXPECTED_UNIQUE_INDEX_COLUMNS = {
@@ -450,6 +509,8 @@ EXPECTED_UNIQUE_INDEX_COLUMNS = {
     "blockers": {("id",)},
     "publications": {("task_id",)},
     "task_events": {("id",)},
+    "storage_domains": {("project_slug",)},
+    "storage_reservations": {("task_id",), ("quota_id",)},
 }
 
 EXPECTED_FOREIGN_KEYS = {
@@ -466,6 +527,10 @@ EXPECTED_FOREIGN_KEYS = {
     "task_events": {
         (("task_id",), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE"),
         (("role_run_id", "task_id"), "role_runs", ("id", "task_id"), "NO ACTION", "RESTRICT", "NONE"),
+    },
+    "storage_domains": set(),
+    "storage_reservations": {
+        (("task_id",), "tasks", ("id",), "NO ACTION", "RESTRICT", "NONE"),
     },
 }
 
@@ -574,7 +639,9 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     migration_rows = connection.execute(
         "SELECT version, identity FROM schema_migrations ORDER BY version"
     ).fetchall()
-    if [(row[0], row[1]) for row in migration_rows] != [(1, MIGRATION_ID)]:
+    if [(row[0], row[1]) for row in migration_rows] != [
+        (1, MIGRATION_ID), (2, STORAGE_MIGRATION_ID)
+    ]:
         raise SchemaError("SQLite migration history is invalid")
 
     foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
@@ -856,6 +923,50 @@ class ControlPlaneDatabase:
             raise ControlPlaneError(f"task does not exist: {task_id}")
         return value
 
+    def record_storage_domain(self, domain: object) -> dict[str, object]:
+        """Persist one host-verified domain without creating task authority."""
+        from storage import StorageContractError, VerifiedStorageDomain
+
+        if not isinstance(domain, VerifiedStorageDomain):
+            raise StorageContractError("storage domain must be verified before persistence")
+        timestamp = _timestamp(None, "verified_at")
+        with self._transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM storage_domains WHERE project_slug = ?", (domain.project,)
+            ).fetchone()
+            if existing is not None:
+                identity = (existing["source"], existing["mount_target"],
+                            existing["fstype"], existing["mount_options"])
+                proposed = (domain.source, domain.target, domain.fstype, domain.options)
+                active = self.connection.execute(
+                    "SELECT 1 FROM storage_reservations WHERE project_slug = ? AND status = 'reserved' LIMIT 1",
+                    (domain.project,),
+                ).fetchone()
+                if active is not None and identity != proposed:
+                    raise StateConflict("storage domain identity changed while tasks were reserved")
+            self.connection.execute(
+                """
+                INSERT INTO storage_domains(
+                    project_slug, source, mount_target, fstype, mount_options,
+                    pool_bytes, pool_inodes, free_bytes, free_inodes, verified_at, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_slug) DO UPDATE SET
+                    source = excluded.source, mount_target = excluded.mount_target,
+                    fstype = excluded.fstype, mount_options = excluded.mount_options,
+                    pool_bytes = excluded.pool_bytes, pool_inodes = excluded.pool_inodes,
+                    free_bytes = excluded.free_bytes, free_inodes = excluded.free_inodes,
+                    verified_at = excluded.verified_at, evidence_json = excluded.evidence_json
+                """,
+                (domain.project, domain.source, domain.target, domain.fstype, domain.options,
+                 domain.pool_bytes, domain.pool_inodes, domain.free_bytes, domain.free_inodes,
+                 timestamp, domain.evidence_json),
+            )
+            result = self.connection.execute(
+                "SELECT * FROM storage_domains WHERE project_slug = ?", (domain.project,)
+            ).fetchone()
+        assert result is not None
+        return dict(result)
+
     def queue_task(self, task_id: str | uuid.UUID, *, project_slug: str) -> dict[str, object]:
         """Atomically activate a task and create its first canonical workpad."""
         task_id = _uuid(task_id, "task_id")
@@ -888,6 +999,166 @@ class ControlPlaneDatabase:
                     (task_id, body, timestamp),
                 )
         return self.read_task(task_id)
+
+    def queue_task_with_storage(
+        self,
+        task_id: str | uuid.UUID,
+        *,
+        project_slug: str,
+        domain: object,
+        policy: object,
+    ) -> dict[str, object]:
+        """Verify admission capacity and queue one task in one transaction.
+
+        ``domain`` is a host-verified storage proof, never model input.  This
+        method records the proof and reserves the task's complete allowance
+        before the lifecycle can become QUEUED.  It intentionally has no
+        fallback to the low-level ``queue_task`` path.
+        """
+        from storage import StorageContractError, StoragePolicy, VerifiedStorageDomain, derive_quota_id
+
+        task_id = _uuid(task_id, "task_id")
+        project_slug = _project_slug(project_slug)
+        if not isinstance(domain, VerifiedStorageDomain):
+            raise StorageContractError("storage admission requires verified host evidence")
+        if not isinstance(policy, StoragePolicy):
+            raise StorageContractError("storage admission requires a validated profile policy")
+        policy.validate()
+        if domain.project != project_slug:
+            raise StateConflict("storage domain is not registered to the selected project")
+        timestamp = _timestamp(None, "occurred_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            if task["project_slug"] != project_slug:
+                raise StateConflict("task is not registered to the selected project")
+            if task["state"] != "PREPARED":
+                raise StateConflict("only PREPARED tasks may be queued")
+            existing_domain = self.connection.execute(
+                "SELECT * FROM storage_domains WHERE project_slug = ?", (project_slug,)
+            ).fetchone()
+            if existing_domain is not None:
+                identity = (existing_domain["source"], existing_domain["mount_target"],
+                            existing_domain["fstype"], existing_domain["mount_options"])
+                proposed = (domain.source, domain.target, domain.fstype, domain.options)
+                active = self.connection.execute(
+                    "SELECT 1 FROM storage_reservations WHERE project_slug = ? AND status = 'reserved' LIMIT 1",
+                    (project_slug,),
+                ).fetchone()
+                if active is not None and identity != proposed:
+                    raise StateConflict("storage domain identity changed while tasks were reserved")
+            self.connection.execute(
+                """
+                INSERT INTO storage_domains(
+                    project_slug, source, mount_target, fstype, mount_options,
+                    pool_bytes, pool_inodes, free_bytes, free_inodes, verified_at, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_slug) DO UPDATE SET
+                    source = excluded.source, mount_target = excluded.mount_target,
+                    fstype = excluded.fstype, mount_options = excluded.mount_options,
+                    pool_bytes = excluded.pool_bytes, pool_inodes = excluded.pool_inodes,
+                    free_bytes = excluded.free_bytes, free_inodes = excluded.free_inodes,
+                    verified_at = excluded.verified_at, evidence_json = excluded.evidence_json
+                """,
+                (domain.project, domain.source, domain.target, domain.fstype, domain.options,
+                 domain.pool_bytes, domain.pool_inodes, domain.free_bytes, domain.free_inodes,
+                 timestamp, domain.evidence_json),
+            )
+            reserved = self.connection.execute(
+                """
+                SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(reserved_inodes), 0)
+                FROM storage_reservations
+                WHERE project_slug = ? AND status = 'reserved'
+                """, (project_slug,),
+            ).fetchone()
+            used_bytes = domain.pool_bytes - domain.free_bytes
+            used_inodes = domain.pool_inodes - domain.free_inodes
+            if used_bytes > policy.pool_bytes:
+                raise StateConflict("observed storage usage exceeds the configured fixed pool")
+            available_bytes = policy.pool_bytes - used_bytes - int(reserved[0]) - policy.task_bytes
+            available_inodes = domain.pool_inodes - used_inodes - int(reserved[1]) - policy.task_inodes
+            if (available_bytes < policy.emergency_reserve_bytes or
+                    available_inodes < policy.emergency_reserve_inodes):
+                raise StateConflict("storage admission would consume the emergency reserve")
+            quota_id = derive_quota_id(str(task["identifier"]))
+            try:
+                self.connection.execute(
+                    """
+                    INSERT INTO storage_reservations(
+                        task_id, project_slug, quota_id, reserved_bytes, reserved_inodes,
+                        status, created_at, released_at
+                    ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, NULL)
+                    """,
+                    (task_id, project_slug, quota_id, policy.task_bytes, policy.task_inodes, timestamp),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StateConflict("task or host quota identity already has a storage reservation") from exc
+            self.connection.execute(
+                "UPDATE tasks SET state = 'QUEUED', updated_at = ? WHERE id = ? AND state = 'PREPARED'",
+                (timestamp, task_id),
+            )
+            self._insert_event(
+                task_id, "queued",
+                {"identifier": task["identifier"], "project_slug": project_slug,
+                 "reserved_bytes": policy.task_bytes, "reserved_inodes": policy.task_inodes},
+                occurred_at=timestamp,
+            )
+            body = "\n".join((
+                "<!-- symphony-workpad:v1 -->", "## Symphony Workpad", "",
+                f"- Task: {task['identifier']}", f"- Objective: {task['objective']}",
+                f"- Base: {task['base_ref']} @ {task['base_sha']}",
+                f"- Branch: {task['branch']}", "- Lifecycle state: QUEUED", "",
+            ))
+            self.connection.execute(
+                "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
+                (task_id, body, timestamp),
+            )
+        return self.read_task(task_id)
+
+    def read_storage_domain(self, project_slug: str) -> dict[str, object] | None:
+        project_slug = _project_slug(project_slug)
+        return _row(self.connection.execute(
+            "SELECT * FROM storage_domains WHERE project_slug = ?", (project_slug,)
+        ).fetchone())
+
+    def read_storage_reservation(self, task_id: str | uuid.UUID) -> dict[str, object] | None:
+        task_id = _uuid(task_id, "task_id")
+        return _row(self.connection.execute(
+            "SELECT * FROM storage_reservations WHERE task_id = ?", (task_id,)
+        ).fetchone())
+
+    def storage_reservation_totals(self, project_slug: str) -> dict[str, int]:
+        project_slug = _project_slug(project_slug)
+        row = self.connection.execute(
+            """
+            SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(reserved_inodes), 0)
+            FROM storage_reservations WHERE project_slug = ? AND status = 'reserved'
+            """, (project_slug,),
+        ).fetchone()
+        return {"reserved_bytes": int(row[0]), "reserved_inodes": int(row[1])}
+
+    def release_storage_reservation(
+        self, task_id: str | uuid.UUID, *, released_at: str | None = None
+    ) -> dict[str, object]:
+        """Release one reservation through an explicit trusted host action."""
+        task_id = _uuid(task_id, "task_id")
+        timestamp = _timestamp(released_at, "released_at")
+        with self._transaction():
+            row = self.connection.execute(
+                "SELECT * FROM storage_reservations WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise ControlPlaneError(f"storage reservation does not exist: {task_id}")
+            if row["status"] == "released":
+                return dict(row)
+            self.connection.execute(
+                "UPDATE storage_reservations SET status = 'released', released_at = ? WHERE task_id = ?",
+                (timestamp, task_id),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM storage_reservations WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
 
     def read_task_by_identifier(self, identifier: str, *, project_slug: str | None = None) -> dict[str, object]:
         """Read one local task identity, optionally enforcing project ownership."""
@@ -1573,6 +1844,7 @@ class ControlPlaneDatabase:
                 ).fetchall()
             ],
             "publication": self.read_publication(task_id),
+            "storage": self.read_storage_reservation(task_id),
             "events": self.list_events(task_id),
         }
 

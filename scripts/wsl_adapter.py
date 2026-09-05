@@ -37,6 +37,9 @@ PROJECT_ROOTS = {
     "symphony-pilot": "/mnt/f/PROJECT-REPOS/symphony-pilot",
     "symphony-runtime": "/mnt/f/PROJECT-REPOS/symphony-runtime",
 }
+# Storage inspection is a separate fixed capability. It does not expand the
+# executable project-root map or permit a caller-selected Linux path.
+STORAGE_PROJECTS = frozenset({"symphony-pilot", "symphony-runtime", "symphony-canary"})
 CONTROL_DEPLOYMENT_PROFILE = "symphony-canary"
 CONTROL_DEPLOYMENT_ROOT = (
     "/home/duck-lint/.local/share/symphony-pilot/deployments/"
@@ -131,6 +134,11 @@ def _sterile_windows_environment() -> dict[str, str]:
 def _validate_project(project: str) -> None:
     if project not in PROJECT_ROOTS:
         raise WslAdapterError("unknown_project", "project is not an approved SYMPHONY project")
+
+
+def _validate_storage_project(project: str) -> None:
+    if project not in STORAGE_PROJECTS:
+        raise WslAdapterError("unknown_storage_project", "project is not approved for storage inspection")
 
 
 def _validate_request_id(request_id: str) -> None:
@@ -392,7 +400,7 @@ def inspect_quota(
     """Inspect one derived persistent project-storage domain through the fixed supervisor."""
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
         raise WslAdapterError("invalid_timeout", "timeout is outside the bounded adapter range")
-    _validate_project(project)
+    _validate_storage_project(project)
     request_id = request_id or uuid.uuid4().hex
     _validate_request_id(request_id)
     wsl = _host_wsl_executable()

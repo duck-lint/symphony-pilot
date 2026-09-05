@@ -63,7 +63,10 @@ class InfrastructureTests(unittest.TestCase):
                     'dispatch_labels = ["auto"]\nblocked_label = "human"\n'
                     f'dashboard_port = {4100 + index}\nmax_concurrent_agents = 1\n'
                     'max_turns = 1\npoll_interval_ms = 1000\nmax_retry_backoff_ms = 0\n'
-                    'codex_model = "model"\ncodex_reasoning_effort = "high"\n', encoding="utf-8")
+                    'codex_model = "model"\ncodex_reasoning_effort = "high"\n'
+                    'storage_pool_bytes = 68719476736\ntask_storage_bytes = 8589934592\n'
+                    'task_storage_inodes = 250000\nstorage_emergency_reserve_bytes = 8589934592\n'
+                    'storage_emergency_reserve_inodes = 250000\n', encoding="utf-8")
                 paths.append(path)
             self.assertEqual(len(project_registry.validate_registry(root)), 5)
             (root / "p5").mkdir()

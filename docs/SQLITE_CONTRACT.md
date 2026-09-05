@@ -48,11 +48,16 @@ the read-only Runtime contract consumed by the Step-5 scheduler.
 
 ## Schema version and safety
 
-The schema is version `1`, stored in SQLite `PRAGMA user_version`, with the
-deterministic migration identity `control-plane-v1` in `schema_migrations`.
+The schema is version `2`, stored in SQLite `PRAGMA user_version`, with the
+deterministic migration identities `control-plane-v1` and
+`control-plane-v2-storage-reservations` in `schema_migrations`.
 An absent database is created and migrated transactionally. A newer version,
 partial migration, missing table/column, unexpected persistent object, or invalid
 migration history fails closed. Reopening an accepted database is idempotent.
+Version 2 adds the host-owned verified storage-domain snapshot and per-task
+full-capacity reservation ledger. A reservation is admission accounting only;
+the task cannot queue unless the fixed Linux capability has already supplied
+proof of kernel-enforced byte and inode hard limits.
 
 Every writable connection explicitly enables:
 
@@ -72,8 +77,8 @@ the checked-in migration, expected index names/columns/uniqueness, foreign-key
 definitions (including paired composite provenance keys), migration rows, and
 foreign-key enforcement. It also runs SQLite `PRAGMA integrity_check` and
 `PRAGMA foreign_key_check`. Persistent views, triggers, indexes, or tables not
-in the v1 contract fail closed even if `user_version` and `schema_migrations`
-still claim v1.
+in the v2 contract fail closed even if `user_version` and `schema_migrations`
+claim a supported version.
 
 ## Relational domain
 
@@ -86,6 +91,8 @@ still claim v1.
 | `blockers` | Human/project/infrastructure blockers | finite kind/status; open/resolved timestamp consistency |
 | `publications` | Optional downstream GitHub publication state | one optional row per task; GitHub PR number is nullable; published status requires a head and timestamp |
 | `task_events` | Structured lifecycle history | task foreign key; finite event vocabulary; optional role-run provenance paired to the task |
+| `storage_domains` | Verified dedicated persistent storage evidence | one project row; ext4 identity, mount/options, bounded capacity snapshot, and proof JSON |
+| `storage_reservations` | Pre-dispatch full-task capacity reservation | one host-derived quota identity per task; byte/inode allowance; reserved/released lifecycle |
 
 The accepted task state vocabulary is:
 
