@@ -408,13 +408,19 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                         "deploy_key_id": key_evidence["id"],
                         "deploy_key_fingerprint": key_evidence["fingerprint"],
                     }
+                    # All filesystem and external verification is complete;
+                    # remove the temporary bundle before the SQLite commit so
+                    # no cleanup or observation follows successful finalization.
+                    temp_directory.cleanup()
+                    temp_directory = None
                     finalized = database.finalize_publication(
                         task["id"], head_sha=str(task["current_head"]), remote_branch=remote_branch,
                         github_pr_number=pr_number, evidence=evidence,
                     )
-                    return {"task": finalized, "publication": database.read_publication(task["id"]), "idempotent": False}
+                    return {"task": finalized["task"], "publication": finalized["publication"], "idempotent": False}
             finally:
-                temp_directory.cleanup()
+                if temp_directory is not None:
+                    temp_directory.cleanup()
     except Exception as exc:
         # Exception (rather than BaseException) deliberately leaves
         # KeyboardInterrupt/SystemExit/GeneratorExit as process-disappearance

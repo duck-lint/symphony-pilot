@@ -825,6 +825,7 @@ class ControlPlaneDatabase:
         if identifier is not None and not IDENTIFIER_RE.fullmatch(identifier):
             raise ValueError("identifier must match T-000042")
         timestamp = _timestamp(created_at, "created_at")
+        result: dict[str, object] | None = None
         with self._transaction():
             identifier = identifier or self._allocate_identifier()
             branch = derive_task_branch(identifier, task_id)
@@ -1224,6 +1225,7 @@ class ControlPlaneDatabase:
         head_sha = _sha(head_sha, "head_sha")
         remote_branch = _text(remote_branch, "remote_branch")
         timestamp = _timestamp(started_at, "started_at")
+        result: dict[str, object] | None = None
         with self._transaction():
             task = self.read_task(task_id)
             if task["state"] != "ARCHIVIST" or task["current_head"] != head_sha:
@@ -1264,27 +1266,32 @@ class ControlPlaneDatabase:
             if current and current["publication_status"] == "started":
                 if current["head_sha"] != head_sha or current["remote_branch"] != remote_branch:
                     raise StateConflict("started publication intent does not match the exact task identity")
-                return current
-            self.connection.execute(
-                """
-                INSERT INTO publications(task_id, head_sha, remote_branch, github_pr_number,
-                                         publication_status, published_at)
-                VALUES (?, ?, ?, NULL, 'started', NULL)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    head_sha = excluded.head_sha,
-                    remote_branch = excluded.remote_branch,
-                    github_pr_number = publications.github_pr_number,
-                    publication_status = 'started',
-                    published_at = NULL
-                """,
-                (task_id, head_sha, remote_branch),
-            )
-            self._insert_event(
-                task_id, "publication_started",
-                {"head_sha": head_sha, "remote_branch": remote_branch},
-                occurred_at=timestamp,
-            )
-        return self.read_publication(task_id)
+                result = current
+            else:
+                self.connection.execute(
+                    """
+                    INSERT INTO publications(task_id, head_sha, remote_branch, github_pr_number,
+                                             publication_status, published_at)
+                    VALUES (?, ?, ?, NULL, 'started', NULL)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        head_sha = excluded.head_sha,
+                        remote_branch = excluded.remote_branch,
+                        github_pr_number = publications.github_pr_number,
+                        publication_status = 'started',
+                        published_at = NULL
+                    """,
+                    (task_id, head_sha, remote_branch),
+                )
+                self._insert_event(
+                    task_id, "publication_started",
+                    {"head_sha": head_sha, "remote_branch": remote_branch},
+                    occurred_at=timestamp,
+                )
+                result = dict(self.connection.execute(
+                    "SELECT * FROM publications WHERE task_id = ?", (task_id,)
+                ).fetchone())
+        assert result is not None
+        return result
 
     def finalize_publication(
         self,
@@ -1305,6 +1312,7 @@ class ControlPlaneDatabase:
         if not isinstance(evidence, dict):
             raise ValueError("publication evidence must be an object")
         timestamp = _timestamp(published_at, "published_at")
+        result: dict[str, dict[str, object]] | None = None
         with self._transaction():
             task = self.read_task(task_id)
             if task["state"] != "ARCHIVIST" or task["current_head"] != head_sha:
@@ -1338,7 +1346,16 @@ class ControlPlaneDatabase:
             self._insert_event(
                 task_id, "ready_for_human_merge", payload, occurred_at=timestamp,
             )
-        return self.read_task(task_id)
+            result = {
+                "task": dict(self.connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()),
+                "publication": dict(self.connection.execute(
+                    "SELECT * FROM publications WHERE task_id = ?", (task_id,)
+                ).fetchone()),
+            }
+        assert result is not None
+        return result
 
     def fail_publication(
         self,
@@ -1358,9 +1375,14 @@ class ControlPlaneDatabase:
         if github_pr_number is not None and (not isinstance(github_pr_number, int) or isinstance(github_pr_number, bool) or github_pr_number < 1):
             raise ValueError("github_pr_number must be positive")
         timestamp = _timestamp(None, "created_at")
+        result: dict[str, object] | None = None
         with self._transaction():
             task = self.read_task(task_id)
             current = self.read_publication(task_id)
+            if task["state"] != "ARCHIVIST" or task["published_head"] is not None:
+                raise StateConflict("publication failure cannot alter a finalized task")
+            if current and current["publication_status"] == "published":
+                raise StateConflict("publication failure cannot downgrade published state")
             retained_head = head_sha or (current["head_sha"] if current else None)
             retained_branch = remote_branch or (current["remote_branch"] if current else None)
             retained_pr = github_pr_number or (current["github_pr_number"] if current else None)
@@ -1389,7 +1411,11 @@ class ControlPlaneDatabase:
                 {"blocker_id": blocker_id, "kind": "infrastructure"},
                 occurred_at=timestamp,
             )
-        return self.read_publication(task_id)
+            result = dict(self.connection.execute(
+                "SELECT * FROM publications WHERE task_id = ?", (task_id,)
+            ).fetchone())
+        assert result is not None
+        return result
 
     def update_heads(
         self,

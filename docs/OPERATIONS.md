@@ -5,8 +5,9 @@ All physical lifecycle operations run in the WSL/Linux operator environment. Nat
 ## Before start
 
 1. Validate the complete project registry, including `trusted_dispatchers`.
-2. Provision or explicitly adopt the host-side Ed25519 publication key, then
-   bind its public key to exactly one writable GitHub deploy key:
+2. As publication onboarding, provision or explicitly adopt the host-side
+   Ed25519 publication key, then bind its public key to exactly one writable
+   GitHub deploy key:
    `python3 scripts/provision_publication_key.py --project <slug>` followed by
    `python3 scripts/task.py bind-publication-key --project <slug>`. The Runtime
    scheduler does not receive a GitHub API credential.
@@ -23,11 +24,15 @@ Task mutation is explicit and host-only:
     python3 scripts/task.py show --project <slug> --task T-000001
     python3 scripts/task.py publish --project <slug> --task T-000001
 
-Start verifies deployment coherence, runtime lock, containment capability, and
-the host-side protection preflight before launching a process. It does not
-query GitHub Issues, count dispatch labels, or inject a tracker credential into
-Runtime. Any failed check is an infrastructure block; no old execution path is
-selected.
+Runtime `project start` verifies deployment coherence, the runtime lock, and
+containment capability before launching a process. It does not acquire a
+GitHub credential, verify publication keys or rulesets, query GitHub Issues,
+count dispatch labels, or inject a tracker credential into Runtime. Publication
+onboarding is operationally recommended but is not a Runtime-start prerequisite.
+
+The separate `task publish` operation requires the host GitHub API credential,
+the bound write-enabled deploy key, and fresh ruleset proof before it can
+publish an exact ARCHIVIST head.
 
 ## Step-6 lifecycle operations
 

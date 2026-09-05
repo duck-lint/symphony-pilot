@@ -94,17 +94,37 @@ class Step7PublicationTests(unittest.TestCase):
                                                   "deploy_key_id": 2, "deploy_key_fingerprint": "SHA256:x"},
                 )
             database.start_publication(self.task["id"], head_sha=self.head, remote_branch=self.task_branch)
-            task = database.finalize_publication(
+            finalized = database.finalize_publication(
                 self.task["id"], head_sha=self.head, remote_branch=self.task_branch,
                 github_pr_number=7, evidence={"ruleset_id": 1, "ruleset_fingerprint": "a" * 64,
                                               "deploy_key_id": 2, "deploy_key_fingerprint": "SHA256:x"},
             )
-            self.assertEqual(task["state"], "READY_FOR_HUMAN_MERGE")
-            self.assertEqual(task["published_head"], self.head)
+            self.assertEqual(finalized["task"]["state"], "READY_FOR_HUMAN_MERGE")
+            self.assertEqual(finalized["task"]["published_head"], self.head)
             self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "published")
             events = [event["event_type"] for event in database.list_events(self.task["id"])]
             self.assertIn("publication_finished", events)
             self.assertIn("ready_for_human_merge", events)
+
+    def test_fail_publication_cannot_downgrade_successful_finalization(self):
+        with control_db.open_database(self.database_path) as database:
+            database.start_publication(self.task["id"], head_sha=self.head, remote_branch=self.task_branch)
+            finalized = database.finalize_publication(
+                self.task["id"], head_sha=self.head, remote_branch=self.task_branch,
+                github_pr_number=7, evidence={"ruleset_id": 1, "ruleset_fingerprint": "a" * 64,
+                                              "deploy_key_id": 2, "deploy_key_fingerprint": "SHA256:x"},
+            )
+            with self.assertRaises(control_db.StateConflict):
+                database.fail_publication(
+                    self.task["id"], detail="late observation failure", head_sha=self.head,
+                    remote_branch=self.task_branch, github_pr_number=7,
+                )
+            self.assertEqual(finalized["task"]["state"], "READY_FOR_HUMAN_MERGE")
+            self.assertEqual(database.read_task(self.task["id"])["published_head"], self.head)
+            self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "published")
+            events = [event["event_type"] for event in database.list_events(self.task["id"])]
+            self.assertEqual(events.count("publication_finished"), 1)
+            self.assertEqual(events.count("ready_for_human_merge"), 1)
 
     def test_local_bare_remote_exact_publication(self):
         snapshots = iter(({"ruleset_id": 9, "fingerprint": "a" * 64},
@@ -135,6 +155,61 @@ class Step7PublicationTests(unittest.TestCase):
             )
         self.assertEqual(result["task"]["state"], "READY_FOR_HUMAN_MERGE")
         self.assertEqual(self.git(self.remote, "rev-parse", self.task_branch), self.head)
+
+    def test_failure_after_finalization_cannot_downgrade_or_block_retry(self):
+        snapshots = iter(({"ruleset_id": 9, "fingerprint": "a" * 64},
+                          {"ruleset_id": 9, "fingerprint": "a" * 64}))
+        exact_pr = {"number": 7, "state": "open", "draft": True,
+                    "head": {"ref": self.task_branch, "sha": self.head,
+                             "repo": {"full_name": self.profile.repository}},
+                    "base": {"ref": "master"}}
+
+        @contextlib.contextmanager
+        def key(*_args):
+            with tempfile.NamedTemporaryFile() as stream:
+                yield pathlib.Path(stream.name), {"id": 4, "fingerprint": "SHA256:key"}
+
+        def api(_profile, _token, method, path, body=None):
+            self.assertEqual((method, path), ("GET", "/pulls/7"))
+            return exact_pr
+
+        original = control_db.ControlPlaneDatabase.finalize_publication
+        def commit_then_raise(database, *args, **kwargs):
+            original(database, *args, **kwargs)
+            raise RuntimeError("response observation failed after commit")
+
+        with mock.patch.object(publication, "canonical_publication_remote", return_value=str(self.remote)), \
+             mock.patch.object(publication, "verified_private_key", side_effect=key), \
+             mock.patch.object(publication, "read_secret", return_value="token"), \
+             mock.patch.object(publication, "reconcile_pull_request", return_value={"number": 7}) as reconcile, \
+             mock.patch.object(publication, "_ruleset_snapshot", side_effect=lambda *args: next(snapshots)), \
+             mock.patch.object(control_db.ControlPlaneDatabase, "finalize_publication", new=commit_then_raise):
+            with self.assertRaises(publication.PublicationError) as caught:
+                publication.publish_task(
+                    self.profile, self.task["id"], database_path=self.database_path,
+                    github_call=api,
+                )
+
+        with control_db.ControlPlaneDatabase.open_readonly(self.database_path) as database:
+            task = database.read_task(self.task["id"])
+            publication_row = database.read_publication(self.task["id"])
+            self.assertEqual(publication_row["publication_status"], "published", str(caught.exception))
+            self.assertEqual(task["state"], "READY_FOR_HUMAN_MERGE")
+            self.assertEqual(task["published_head"], self.head)
+            self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "published")
+            events = [event["event_type"] for event in database.list_events(self.task["id"])]
+            self.assertEqual(events.count("publication_finished"), 1)
+            self.assertEqual(events.count("ready_for_human_merge"), 1)
+            self.assertFalse(database.connection.execute(
+                "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open'",
+                (self.task["id"],),
+            ).fetchone())
+
+        with mock.patch.object(publication, "_publish_branch") as push:
+            result = publication.publish_task(self.profile, self.task["id"], database_path=self.database_path)
+        self.assertTrue(result["idempotent"])
+        push.assert_not_called()
+        reconcile.assert_called_once()
 
     def test_pull_request_contract_rejects_non_draft_and_duplicate(self):
         task = {"identifier": "T-000001", "title": "Task", "branch": self.task_branch,
@@ -302,6 +377,54 @@ class Step7PublicationTests(unittest.TestCase):
                 publication.publish_task(self.profile, self.task["id"], database_path=database_path)
         with control_db.ControlPlaneDatabase.open_readonly(database_path) as database:
             self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "started")
+
+    def test_operational_failures_after_intent_are_durable(self):
+        def fresh_db(name):
+            path = self.root / name
+            with control_db.open_database(path) as destination, \
+                 control_db.ControlPlaneDatabase.open_readonly(self.database_path) as source:
+                source.connection.backup(destination.connection)
+            return path
+
+        failures = (
+            ("snapshot", {"read_secret": mock.DEFAULT, "snapshot_fn": True}),
+            ("key", {"read_secret": mock.DEFAULT, "key": True}),
+            ("timeout", {"read_secret": mock.DEFAULT, "timeout": True}),
+        )
+        for name, options in failures:
+            with self.subTest(name=name):
+                path = fresh_db(name + ".sqlite3")
+                patches = [mock.patch.object(publication, "read_secret", return_value="token")]
+                if options.get("snapshot_fn"):
+                    snapshot = lambda *_args: (_ for _ in ()).throw(OSError("GitHub transport"))
+                    patches.append(mock.patch.object(publication, "verified_private_key", side_effect=lambda *_args: (_ for _ in ()).throw(OSError("key API"))))
+                    # The key failure occurs before Snapshot A; cover Snapshot A
+                    # separately with a verified key context below.
+                    patches.pop()
+                    @contextlib.contextmanager
+                    def verified(*_args):
+                        with tempfile.NamedTemporaryFile() as stream:
+                            yield pathlib.Path(stream.name), {"id": 4, "fingerprint": "SHA256:key"}
+                    patches.append(mock.patch.object(publication, "verified_private_key", side_effect=verified))
+                    patches.append(mock.patch.object(publication, "_ruleset_snapshot", side_effect=snapshot))
+                elif options.get("key"):
+                    patches.append(mock.patch.object(publication, "verified_private_key", side_effect=OSError("key API")))
+                else:
+                    patches.append(mock.patch.object(
+                        publication, "_generate_bundle",
+                        side_effect=subprocess.TimeoutExpired("git", 1),
+                    ))
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(publication.PublicationError):
+                        publication.publish_task(self.profile, self.task["id"], database_path=path)
+                with control_db.ControlPlaneDatabase.open_readonly(path) as database:
+                    self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "failed")
+                    self.assertTrue(database.connection.execute(
+                        "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open'",
+                        (self.task["id"],),
+                    ).fetchone())
 
     def test_pre_intent_failure_records_blocker_without_publication_intent(self):
         with self.assertRaises(publication.PublicationError):
