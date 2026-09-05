@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import pathlib
 import stat
@@ -117,6 +119,38 @@ class DeploymentIdentityTests(unittest.TestCase):
             (root / "runtime").mkdir()
             (root / "runtime/wsl_contained_exec.py").write_text("bad", encoding="utf-8")
             with self.assertRaisesRegex(wsl_contained_exec.ContainmentError, "manifest"):
+                wsl_contained_exec._validate_deployment(root)
+
+    def test_independently_injected_file_remains_unlisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "demo"
+            root.mkdir()
+            runtime = root / "runtime"
+            runtime.mkdir()
+            files = {}
+            for relative, content in (
+                ("runtime/wsl_contained_exec.py", b"supervisor"),
+                ("runtime/containment.py", b"containment"),
+            ):
+                path = root / pathlib.PurePosixPath(relative)
+                path.write_bytes(content)
+                files[relative] = hashlib.sha256(content).hexdigest()
+            profile = root / "profile.toml"
+            profile.write_bytes(b"profile")
+            files["profile.toml"] = hashlib.sha256(profile.read_bytes()).hexdigest()
+            payload = {"files": files, "operator_contract_sha256": "b" * 64,
+                       "profile": "demo", "profile_sha256": "c" * 64}
+            identity = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            (root / "DEPLOYMENT.json").write_text(json.dumps({
+                "schema": wsl_contained_exec.DEPLOYMENT_SCHEMA,
+                "profile": "demo", "profile_sha256": "c" * 64,
+                "operator_contract_sha256": "b" * 64,
+                "deployment_identity": identity,
+                "source_commit": "a" * 40, "files": files,
+            }), encoding="utf-8")
+            (runtime / "__pycache__").mkdir()
+            (runtime / "__pycache__" / "injected.pyc").write_bytes(b"unlisted")
+            with self.assertRaisesRegex(wsl_contained_exec.ContainmentError, "unlisted file"):
                 wsl_contained_exec._validate_deployment(root)
 
     def test_output_symlink_is_rejected_after_contained_run(self):

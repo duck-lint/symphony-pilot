@@ -366,7 +366,11 @@ def execute(
         "/usr/bin/env", "-i",
         "HOME=/home/duck-lint", "USER=duck-lint", "LOGNAME=duck-lint",
         "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
-        "/usr/bin/python3", CONTAINED_ENTRYPOINT,
+        # The deployed supervisor imports authority modules from its own
+        # manifest-covered directory.  Python bytecode would be an unlisted
+        # file mutation of that directory, so disable writes at interpreter
+        # startup rather than relying on cleanup after the run.
+        "/usr/bin/python3", "-B", CONTAINED_ENTRYPOINT,
         "--project", project, "--cwd", resolved_cwd,
         "--wall-seconds", str(max(1.0, float(timeout_seconds) - 5.0)), "--",
         *validated_command,

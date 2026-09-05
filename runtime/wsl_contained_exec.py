@@ -133,6 +133,11 @@ def _deployment_root() -> pathlib.Path:
 
 def _load_containment(root: pathlib.Path):
     """Import containment only after the deployed manifest has been verified."""
+    # Keep the validated deployment immutable for the entire supervisor
+    # lifetime.  The adapter also supplies ``python3 -B``; this local guard
+    # protects the same authority boundary if the fixed entrypoint is invoked
+    # by another reviewed Linux-side caller.
+    sys.dont_write_bytecode = True
     sys.path.insert(0, str(root / "runtime"))
     import containment
     return containment

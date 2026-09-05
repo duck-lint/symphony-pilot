@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import pathlib
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -160,11 +163,42 @@ class WslAdapterTests(unittest.TestCase):
         self.assertIn("safe;still-one-arg", invocation.args[0])
         self.assertIn(wsl_adapter.CONTAINED_ENTRYPOINT, invocation.args[0])
         self.assertNotIn("/mnt/f/PROJECT-REPOS/symphony-pilot/runtime/wsl_contained_exec.py", invocation.args[0])
+        self.assertIn("-B", invocation.args[0])
         self.assertIn("--project", invocation.args[0])
         audit = result.audit_record()
         self.assertNotIn("safe;still-one-arg", audit)
         self.assertNotIn("ok\n", audit)
         self.assertEqual(audit["approval"], "none")
+
+    def test_repeated_supervisor_invocations_use_no_bytecode_mode(self):
+        """Two fixed supervisor-style runs cannot create deployment bytecode."""
+        process = FakeProcess(stdout=b"ok\n", stderr=b"", returncode=0)
+        with mock.patch.object(wsl_adapter, "_host_wsl_executable", return_value=pathlib.Path("C:/Windows/System32/wsl.exe")), \
+             mock.patch.object(wsl_adapter, "_canonicalize_cwd", return_value="/mnt/f/PROJECT-REPOS/symphony-pilot"), \
+             mock.patch.object(wsl_adapter, "_sterile_windows_environment", return_value={}), \
+             mock.patch.object(wsl_adapter.subprocess, "Popen", return_value=process) as popen:
+            for index in range(2):
+                wsl_adapter.execute(
+                    "symphony-pilot", "/mnt/f/PROJECT-REPOS/symphony-pilot", ["/usr/bin/true"],
+                    request_id=f"no-bytecode-{index}", timeout_seconds=1,
+                )
+                command = popen.call_args.args[0]
+                python_index = command.index("/usr/bin/python3")
+                self.assertEqual(command[python_index + 1], "-B")
+
+        # Exercise the interpreter property independently of the mocked WSL
+        # transport: importing an authority module twice with the exact
+        # adapter flag must leave the deployment tree unchanged.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "authority.py").write_text("VALUE = 1\n", encoding="utf-8")
+            runner = root / "runner.py"
+            runner.write_text("import authority\nassert authority.VALUE == 1\n", encoding="utf-8")
+            before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+            for _ in range(2):
+                subprocess.run([sys.executable, "-B", str(runner)], cwd=root, check=True)
+            after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+            self.assertEqual(after, before)
 
     def test_timeout_and_output_limits_terminate_the_process(self):
         timed_out = FakeProcess(running=True)
