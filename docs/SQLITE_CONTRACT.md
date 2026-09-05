@@ -54,10 +54,11 @@ deterministic migration identities `control-plane-v1` and
 An absent database is created and migrated transactionally. A newer version,
 partial migration, missing table/column, unexpected persistent object, or invalid
 migration history fails closed. Reopening an accepted database is idempotent.
-Version 2 adds the host-owned verified storage-domain snapshot and per-task
+Version 2 adds the host-owned verified shared-pool snapshot and per-task
 full-capacity reservation ledger. A reservation is admission accounting only;
 the task cannot queue unless the fixed Linux capability has already supplied
-proof of kernel-enforced byte and inode hard limits.
+both a task-specific identity/limit binding and proof of kernel-enforced byte
+and inode hard limits.
 
 Every writable connection explicitly enables:
 
@@ -91,7 +92,7 @@ claim a supported version.
 | `blockers` | Human/project/infrastructure blockers | finite kind/status; open/resolved timestamp consistency |
 | `publications` | Optional downstream GitHub publication state | one optional row per task; GitHub PR number is nullable; published status requires a head and timestamp |
 | `task_events` | Structured lifecycle history | task foreign key; finite event vocabulary; optional role-run provenance paired to the task |
-| `storage_domains` | Verified dedicated persistent storage evidence | one project row; ext4 identity, mount/options, bounded capacity snapshot, and proof JSON |
+| `storage_domains` | Verified shared Symphony-pool evidence | per-project observation rows; every row must carry the same ext4 mount identity and bounded capacity proof |
 | `storage_reservations` | Pre-dispatch full-task capacity reservation | one host-derived quota identity per task; byte/inode allowance; reserved/released lifecycle |
 
 The accepted task state vocabulary is:

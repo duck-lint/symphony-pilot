@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import sys
 import tempfile
@@ -9,6 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
 import control_db
+from tests.storage_support import admission_proof
 from storage import (GIB, StorageContractError, StoragePolicy,
                      VerifiedStorageDomain, capacity_snapshot,
                      derive_quota_id, verify_storage_evidence)
@@ -21,11 +23,11 @@ class StorageContractTests(unittest.TestCase):
             emergency_reserve_bytes=8 * GIB, emergency_reserve_inodes=250_000,
         )
 
-    def evidence(self, *, target: str = "/home/duck-lint/symphony-workspaces/demo") -> dict:
+    def evidence(self, *, target: str = "/home/duck-lint/symphony-workspaces") -> dict:
         return {
             "schema": "symphony-pilot-quota-inspection/v1",
             "project": "demo",
-            "scope": "persistent_project_workspace_root",
+            "scope": "persistent_symphony_workspace_pool",
             "filesystem": {
                 "target": target, "source": "/dev/vdb", "fstype": "ext4",
                 "options": "rw,relatime,prjquota",
@@ -45,7 +47,7 @@ class StorageContractTests(unittest.TestCase):
     def domain(self) -> VerifiedStorageDomain:
         return verify_storage_evidence(
             "demo", self.evidence(), self.policy(),
-            expected_target="/home/duck-lint/symphony-workspaces/demo",
+            expected_target="/home/duck-lint/symphony-workspaces",
         )
 
     def test_unqualified_current_root_is_rejected(self):
@@ -62,7 +64,7 @@ class StorageContractTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageContractError, "inode hard-limit"):
             verify_storage_evidence(
                 "demo", evidence, self.policy(),
-                expected_target="/home/duck-lint/symphony-workspaces/demo",
+                expected_target="/home/duck-lint/symphony-workspaces",
             )
 
     def test_capacity_snapshot_exposes_usage_and_reservations(self):
@@ -71,9 +73,56 @@ class StorageContractTests(unittest.TestCase):
             20, 100,
         )
         self.assertEqual(values["used_bytes"], 60)
-        self.assertEqual(values["available_bytes"], 20)
+        self.assertEqual(values["available_bytes"], 40)
         self.assertEqual(values["used_inodes"], 600)
-        self.assertEqual(values["available_inodes"], 300)
+        self.assertEqual(values["available_inodes"], 400)
+
+    def test_legacy_queue_transition_cannot_bypass_storage_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                task = database.create_task(
+                    project_slug="demo", title="Storage", objective="Bounded storage",
+                    base_ref="main", base_sha="a" * 40,
+                )
+                with self.assertRaisesRegex(control_db.StateConflict, "storage reservation"):
+                    database.queue_task(task["id"], project_slug="demo")
+                self.assertEqual(database.read_task(task["id"])["state"], "PREPARED")
+
+    def test_task_quota_binding_is_separate_and_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                task = database.create_task(
+                    project_slug="demo", title="Storage", objective="Bounded storage",
+                    base_ref="main", base_sha="a" * 40, identifier="T-000001",
+                )
+                domain = self.domain()
+                binding = dataclasses.replace(
+                    admission_proof(domain, identifier="T-000001").binding,
+                    quota_id=1,
+                )
+                with self.assertRaisesRegex(StorageContractError, "identity"):
+                    database.queue_task_with_storage(
+                        task["id"], project_slug="demo", domain=domain,
+                        policy=self.policy(), assignment=binding,
+                    )
+                self.assertEqual(database.read_task(task["id"])["state"], "PREPARED")
+
+    def test_reservations_are_accounted_against_one_shared_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                for project, identifier in (("demo", "T-000001"), ("other", "T-000002")):
+                    task = database.create_task(
+                        project_slug=project, title="Storage", objective="Shared pool",
+                        base_ref="main", base_sha="a" * 40, identifier=identifier,
+                    )
+                    domain = dataclasses.replace(self.domain(), project=project)
+                    database.queue_task_with_storage(
+                        task["id"], project_slug=project, domain=domain, policy=self.policy(),
+                        assignment=admission_proof(domain, identifier=identifier).binding,
+                    )
+                totals = database.storage_reservation_totals("demo")
+                self.assertEqual(totals["reserved_bytes"], 16 * GIB)
+                self.assertEqual(totals["project_reserved_bytes"], 8 * GIB)
 
     def test_queue_reserves_full_allowance_and_preserves_host_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,6 +136,7 @@ class StorageContractTests(unittest.TestCase):
                 )
                 queued = database.queue_task_with_storage(
                     task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                    assignment=admission_proof(self.domain(), identifier="T-000001").binding,
                 )
                 reservation = database.read_storage_reservation(task["id"])
                 self.assertEqual(queued["state"], "QUEUED")
@@ -99,36 +149,38 @@ class StorageContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "control.sqlite3"
             with control_db.open_database(path) as database:
-                for number in range(1, 8):
+                for number in range(1, 9):
                     task = database.create_task(
                         project_slug="demo", title="Storage", objective="Bounded storage",
                         base_ref="main", base_sha="a" * 40,
                         identifier=f"T-{number:06d}",
                     )
-                    if number == 7:
+                    if number == 8:
                         with self.assertRaises(control_db.StateConflict):
                             database.queue_task_with_storage(
                                 task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                                assignment=admission_proof(self.domain(), identifier=f"T-{number:06d}").binding,
                             )
                     else:
                         database.queue_task_with_storage(
                             task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                            assignment=admission_proof(self.domain(), identifier=f"T-{number:06d}").binding,
                         )
 
-    def test_verified_domain_requires_exact_project_mount_and_identity_proof(self):
+    def test_verified_domain_requires_exact_shared_pool_mount_and_identity_proof(self):
         evidence = self.evidence()
         evidence["filesystem"]["target"] = "/home/duck-lint/symphony-workspaces/other"
         with self.assertRaises(StorageContractError):
             verify_storage_evidence(
                 "demo", evidence, self.policy(),
-                expected_target="/home/duck-lint/symphony-workspaces/demo",
+                expected_target="/home/duck-lint/symphony-workspaces",
             )
         evidence = self.evidence()
         evidence["quota"]["identity_applicable"] = False
         with self.assertRaises(StorageContractError):
             verify_storage_evidence(
                 "demo", evidence, self.policy(),
-                expected_target="/home/duck-lint/symphony-workspaces/demo",
+                expected_target="/home/duck-lint/symphony-workspaces",
             )
 
 

@@ -107,7 +107,7 @@ protection and the exact PR head before merging.
 | Linux user/mount/PID/network namespace primitive | PROVEN | real WSL `unshare` probe |
 | Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
 | Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
-| Aggregate persistent-workspace disk quota | UNBOUNDED | no generic quota authority in this cutover |
+| Aggregate persistent-workspace disk quota | IMPLEMENTED / TARGETED-VERIFIED / REQUIRES STEP-8 REVIEW | shared-pool reservation and kernel-proof admission seams; dedicated domain provisioning remains required |
 | Local SQLite task intake / queue authority | TARGETED / FIXTURE-VERIFIED | trusted task CLI, transactionally allocated identity, and PREPARED-to-QUEUED CAS tests |
 | Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
 | Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
@@ -129,7 +129,9 @@ allowlist is empty. The shared runner uses util-linux `--kill-child=SIGKILL`,
 reaps the supervisor after timeout, and the fixture verifies a child and
 grandchild stop modifying a task sentinel. CPU time, process count, address
 space, open files, individual file size, task tmpfs, and wall clock are
-bounded. Aggregate writes to the persistent task workspace are not quota
-bounded, so unattended activation remains blocked. The constructor is
+bounded. The managed queue now reserves full task capacity against one shared
+pool and rejects admission unless task-specific kernel byte/inode proof is
+supplied. The current root filesystem is rejected, so unattended activation
+remains blocked pending dedicated-domain provisioning. The constructor is
 exercised independently of Codex; the auth blocker still stops the real
 launcher before App Server start.

@@ -28,7 +28,7 @@ def verify(args: argparse.Namespace) -> int:
         evidence = inspect_quota(profile.slug, request_id=f"storage-{profile.slug}-verify")
         domain = verify_storage_evidence(
             profile.slug, evidence, profile.storage_policy,
-            expected_target=str(profile.workspace_root),
+            expected_target=str(profile.workspace_root.parent),
         )
     except (WslAdapterError, StorageContractError) as exc:
         raise ControlPlaneError(f"storage domain verification failed closed: {exc}") from exc

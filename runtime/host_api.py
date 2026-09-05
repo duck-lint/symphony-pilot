@@ -84,7 +84,7 @@ class HostControlApplication:
         for profile in validate_registry(self.registry_root):
             with self._read_database() as database:
                 tasks = database.list_tasks(project_slug=profile.slug)
-                domain = database.read_storage_domain(profile.slug)
+                domain = database.read_storage_pool()
                 reservations = database.storage_reservation_totals(profile.slug)
             storage = self._storage_summary(profile, domain, reservations)
             projects.append({

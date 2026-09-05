@@ -151,7 +151,7 @@ PROJECT_ROOTS = {
     "symphony-pilot": pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-pilot"),
     "symphony-runtime": pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime"),
 }
-STORAGE_PROJECTS = frozenset({"symphony-pilot", "symphony-runtime", "symphony-canary"})
+STORAGE_PROJECTS = frozenset({"cleanroom", "symphony-pilot", "symphony-runtime", "symphony-canary"})
 
 
 def _project_root(project: str) -> pathlib.Path:
@@ -199,8 +199,10 @@ def _workspace_storage_root(project: str) -> tuple[pathlib.Path, bool]:
     if project not in STORAGE_PROJECTS:
         raise ContainmentError("project", "project is not admitted to the WSL quota domain")
     namespace = pathlib.Path(WORKSPACE_ROOT)
-    namespace, _ = _ensure_plain_directory(namespace, "quota_workspace")
-    return _ensure_plain_directory(namespace / project, "quota_workspace")
+    namespace, created = _ensure_plain_directory(namespace, "quota_workspace")
+    # The filesystem boundary is the one shared Symphony pool. Project and
+    # task directories are children inside it and are not quota domains.
+    return namespace, created
 
 
 def _quota_inspection(project: str) -> dict[str, object]:
@@ -268,7 +270,7 @@ def _quota_inspection(project: str) -> dict[str, object]:
         return {
             "schema": QUOTA_INSPECTION_SCHEMA,
             "project": project,
-            "scope": "persistent_project_workspace_root",
+        "scope": "persistent_symphony_workspace_pool",
             "probe_created": probe_created,
             "filesystem": {
                 "target": mount_target,

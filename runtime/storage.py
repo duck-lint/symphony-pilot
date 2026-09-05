@@ -16,8 +16,8 @@ from typing import Mapping
 
 GIB = 1024 ** 3
 STORAGE_INSPECTION_SCHEMA = "symphony-pilot-quota-inspection/v1"
-STORAGE_SCOPE = "persistent_project_workspace_root"
-STORAGE_RESERVATION_STATUS = "reserved"
+STORAGE_SCOPE = "persistent_symphony_workspace_pool"
+STORAGE_POOL_ROOT = "/home/duck-lint/symphony-workspaces"
 STORAGE_BYTES_MIN = 1
 STORAGE_INODES_MIN = 1
 
@@ -85,6 +85,27 @@ class VerifiedStorageDomain:
         return self.pool_inodes - self.free_inodes
 
 
+@dataclasses.dataclass(frozen=True)
+class TaskQuotaBinding:
+    """Host-derived task binding proved by the kernel quota capability."""
+
+    project: str
+    identifier: str
+    workspace_path: str
+    quota_id: int
+    byte_limit: int
+    inode_limit: int
+    proof_json: str
+
+
+@dataclasses.dataclass(frozen=True)
+class StorageAdmissionProof:
+    """Pool proof plus one independently verified task quota binding."""
+
+    domain: VerifiedStorageDomain
+    binding: TaskQuotaBinding
+
+
 def _positive_integer(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise StorageContractError(f"storage evidence field {field} is not a non-negative integer")
@@ -104,7 +125,7 @@ def verify_storage_evidence(
     *,
     expected_target: str,
 ) -> VerifiedStorageDomain:
-    """Accept only a dedicated domain with demonstrated hard quota limits."""
+    """Accept only the shared pool with demonstrated hard quota limits."""
     policy.validate()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", project):
         raise StorageContractError("storage project identity is malformed")
@@ -120,7 +141,7 @@ def verify_storage_evidence(
     fstype = _text(filesystem.get("fstype"), "fstype")
     options = _text(filesystem.get("options"), "options")
     if target != expected_target:
-        raise StorageContractError("persistent workspace is not mounted on the expected dedicated target")
+        raise StorageContractError("storage pool is not mounted on the expected shared target")
     if target == "/" or source == "/dev/sdd":
         raise StorageContractError("the ordinary Ubuntu root filesystem is not a storage domain")
     if fstype != "ext4":
@@ -184,11 +205,52 @@ def derive_quota_id(task_identifier: str) -> int:
     return 1_000_000 + int(match.group(1))
 
 
+def validate_task_quota_binding(
+    binding: object, *, project: str, identifier: str, policy: StoragePolicy,
+) -> TaskQuotaBinding:
+    """Require concrete identity, limit, and kernel-probe evidence.
+
+    The proof is intentionally separate from pool mount evidence. A numeric
+    reservation identity alone cannot authorize a task workspace.
+    """
+    if not isinstance(binding, TaskQuotaBinding):
+        raise StorageContractError("task quota binding proof is missing")
+    expected_id = derive_quota_id(identifier)
+    expected_path = f"{STORAGE_POOL_ROOT}/{project}/{identifier}"
+    if (binding.project != project or binding.identifier != identifier or
+            binding.workspace_path != expected_path or binding.quota_id != expected_id):
+        raise StorageContractError("task quota binding identity is not host-derived")
+    if binding.byte_limit != policy.task_bytes or binding.inode_limit != policy.task_inodes:
+        raise StorageContractError("task quota binding limits do not match policy")
+    try:
+        proof = json.loads(binding.proof_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StorageContractError("task quota binding proof is malformed") from exc
+    if not isinstance(proof, Mapping) or proof.get("schema") != "symphony-pilot-task-quota-proof/v1":
+        raise StorageContractError("task quota binding proof schema is unsupported")
+    if proof.get("project_id") != expected_id or proof.get("workspace_project_id") != expected_id:
+        raise StorageContractError("task quota identity is not proven on the workspace")
+    if proof.get("byte_hard_limit") != policy.task_bytes or proof.get("inode_hard_limit") != policy.task_inodes:
+        raise StorageContractError("task quota hard limits do not match policy")
+    byte_probe = proof.get("byte_probe")
+    inode_probe = proof.get("inode_probe")
+    if (not isinstance(byte_probe, Mapping) or byte_probe.get("result") != "EDQUOT" or
+            not isinstance(inode_probe, Mapping) or inode_probe.get("result") != "EDQUOT"):
+        raise StorageContractError("task quota hard-limit probes did not prove kernel enforcement")
+    return binding
+
+
 def capacity_snapshot(
     domain: Mapping[str, object], reserved_bytes: int, reserved_inodes: int,
     *, configured_pool_bytes: int | None = None,
 ) -> dict[str, int | str]:
-    """Calculate UI/accounting values from one verified domain snapshot."""
+    """Calculate non-overlapping physical and reservation capacity values.
+
+    Physical free space already includes bytes consumed by reserved tasks, so
+    admission availability is bounded by the lesser of physical free space
+    and capacity not already committed to reservations.  It must not subtract
+    both quantities from the pool a second time.
+    """
     observed_pool_bytes = int(domain["pool_bytes"])
     pool_bytes = observed_pool_bytes if configured_pool_bytes is None else configured_pool_bytes
     pool_inodes = int(domain["pool_inodes"])
@@ -196,13 +258,21 @@ def capacity_snapshot(
     free_inodes = int(domain["free_inodes"])
     used_bytes = observed_pool_bytes - free_bytes
     used_inodes = pool_inodes - free_inodes
+    uncommitted_bytes = max(0, pool_bytes - reserved_bytes)
+    uncommitted_inodes = max(0, pool_inodes - reserved_inodes)
     return {
         "pool_bytes": pool_bytes,
         "pool_inodes": pool_inodes,
         "used_bytes": used_bytes,
         "used_inodes": used_inodes,
+        "physical_used_bytes": used_bytes,
+        "physical_used_inodes": used_inodes,
+        "physical_free_bytes": free_bytes,
+        "physical_free_inodes": free_inodes,
         "reserved_bytes": reserved_bytes,
         "reserved_inodes": reserved_inodes,
-        "available_bytes": max(0, pool_bytes - used_bytes - reserved_bytes),
-        "available_inodes": max(0, pool_inodes - used_inodes - reserved_inodes),
+        "uncommitted_available_bytes": min(free_bytes, uncommitted_bytes),
+        "uncommitted_available_inodes": min(free_inodes, uncommitted_inodes),
+        "available_bytes": min(free_bytes, uncommitted_bytes),
+        "available_inodes": min(free_inodes, uncommitted_inodes),
     }

@@ -39,7 +39,7 @@ PROJECT_ROOTS = {
 }
 # Storage inspection is a separate fixed capability. It does not expand the
 # executable project-root map or permit a caller-selected Linux path.
-STORAGE_PROJECTS = frozenset({"symphony-pilot", "symphony-runtime", "symphony-canary"})
+STORAGE_PROJECTS = frozenset({"cleanroom", "symphony-pilot", "symphony-runtime", "symphony-canary"})
 CONTROL_DEPLOYMENT_PROFILE = "symphony-canary"
 CONTROL_DEPLOYMENT_ROOT = (
     "/home/duck-lint/.local/share/symphony-pilot/deployments/"

@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "runtime"))
 import after_run
 import before_run
 import control_db
+from tests.storage_support import queue_task
 import lifecycle
 import prepare_workspace as pw
 from prepare_workspace import Profile
@@ -59,7 +60,7 @@ class UnpublishedContinuationTests(unittest.TestCase):
                 base_ref="master", base_sha=self.base_sha, task_id=self.TASK_ID,
                 identifier="T-000001", created_at="2026-09-04T12:00:00+00:00",
             )
-            database.queue_task(task["id"], project_slug="demo")
+            queue_task(database, task)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()

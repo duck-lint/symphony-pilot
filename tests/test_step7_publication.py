@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "runtime"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import control_db
+from tests.storage_support import queue_task
 import publication
 import publication_key
 import rulesets
@@ -60,7 +61,7 @@ class Step7PublicationTests(unittest.TestCase):
                 base_ref="master", base_sha=self.base, task_id="11111111-1111-1111-1111-111111111111",
                 identifier="T-000001",
             )
-            database.queue_task(self.task["id"], project_slug="demo")
+            queue_task(database, self.task)
             database.update_heads(self.task["id"], current_head=self.head)
             for old, new in (("QUEUED", "PLANNED"), ("PLANNED", "IMPLEMENTED"),
                              ("IMPLEMENTED", "REVIEW"), ("REVIEW", "ADVERSARIAL_REVIEW"),

@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, str(ROOT / "runtime"))
 
 import control_db
+from tests.storage_support import queue_task
 import lifecycle as lifecycle_module
 from lifecycle import (RESULT_SCHEMA, LifecycleError, prepare_attempt, read_result,
                        reconcile)
@@ -53,7 +54,7 @@ class Step6LifecycleTests(unittest.TestCase):
             base_ref="master", base_sha=base_sha, task_id=self.TASK_ID,
             identifier="T-000001", created_at="2026-09-04T12:00:00+00:00",
         )
-        self.database.queue_task(task["id"], project_slug="demo")
+        queue_task(self.database, task)
         self.database.close()
 
     def tearDown(self) -> None:

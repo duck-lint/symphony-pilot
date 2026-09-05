@@ -924,7 +924,7 @@ class ControlPlaneDatabase:
         return value
 
     def record_storage_domain(self, domain: object) -> dict[str, object]:
-        """Persist one host-verified domain without creating task authority."""
+        """Persist one host-verified observation of the shared pool."""
         from storage import StorageContractError, VerifiedStorageDomain
 
         if not isinstance(domain, VerifiedStorageDomain):
@@ -934,16 +934,13 @@ class ControlPlaneDatabase:
             existing = self.connection.execute(
                 "SELECT * FROM storage_domains WHERE project_slug = ?", (domain.project,)
             ).fetchone()
-            if existing is not None:
-                identity = (existing["source"], existing["mount_target"],
-                            existing["fstype"], existing["mount_options"])
-                proposed = (domain.source, domain.target, domain.fstype, domain.options)
-                active = self.connection.execute(
-                    "SELECT 1 FROM storage_reservations WHERE project_slug = ? AND status = 'reserved' LIMIT 1",
-                    (domain.project,),
-                ).fetchone()
-                if active is not None and identity != proposed:
-                    raise StateConflict("storage domain identity changed while tasks were reserved")
+            proposed = (domain.source, domain.target, domain.fstype, domain.options)
+            for row in self.connection.execute(
+                "SELECT source, mount_target, fstype, mount_options FROM storage_domains"
+            ).fetchall():
+                identity = (row["source"], row["mount_target"], row["fstype"], row["mount_options"])
+                if identity != proposed:
+                    raise StateConflict("shared storage pool identity changed")
             self.connection.execute(
                 """
                 INSERT INTO storage_domains(
@@ -968,37 +965,9 @@ class ControlPlaneDatabase:
         return dict(result)
 
     def queue_task(self, task_id: str | uuid.UUID, *, project_slug: str) -> dict[str, object]:
-        """Atomically activate a task and create its first canonical workpad."""
-        task_id = _uuid(task_id, "task_id")
-        project_slug = _project_slug(project_slug)
-        timestamp = _timestamp(None, "occurred_at")
-        with self._transaction():
-            task = self.read_task(task_id)
-            if task["project_slug"] != project_slug:
-                raise StateConflict("task is not registered to the selected project")
-            if task["state"] != "PREPARED":
-                raise StateConflict("only PREPARED tasks may be queued")
-            self.connection.execute(
-                "UPDATE tasks SET state = 'QUEUED', updated_at = ? WHERE id = ? AND state = 'PREPARED'",
-                (timestamp, task_id),
-            )
-            self._insert_event(
-                task_id, "queued",
-                {"identifier": task["identifier"], "project_slug": project_slug},
-                occurred_at=timestamp,
-            )
-            if self.connection.execute("SELECT 1 FROM workpads WHERE task_id = ?", (task_id,)).fetchone() is None:
-                body = "\n".join((
-                    "<!-- symphony-workpad:v1 -->", "## Symphony Workpad", "",
-                    f"- Task: {task['identifier']}", f"- Objective: {task['objective']}",
-                    f"- Base: {task['base_ref']} @ {task['base_sha']}",
-                    f"- Branch: {task['branch']}", "- Lifecycle state: QUEUED", "",
-                ))
-                self.connection.execute(
-                    "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
-                    (task_id, body, timestamp),
-                )
-        return self.read_task(task_id)
+        """Reject the legacy transition that bypassed storage admission."""
+        del task_id, project_slug
+        raise StateConflict("QUEUED admission requires a verified storage reservation")
 
     def queue_task_with_storage(
         self,
@@ -1007,6 +976,7 @@ class ControlPlaneDatabase:
         project_slug: str,
         domain: object,
         policy: object,
+        assignment: object,
     ) -> dict[str, object]:
         """Verify admission capacity and queue one task in one transaction.
 
@@ -1015,7 +985,10 @@ class ControlPlaneDatabase:
         before the lifecycle can become QUEUED.  It intentionally has no
         fallback to the low-level ``queue_task`` path.
         """
-        from storage import StorageContractError, StoragePolicy, VerifiedStorageDomain, derive_quota_id
+        from storage import (
+            StorageContractError, StoragePolicy, VerifiedStorageDomain,
+            derive_quota_id, validate_task_quota_binding,
+        )
 
         task_id = _uuid(task_id, "task_id")
         project_slug = _project_slug(project_slug)
@@ -1033,19 +1006,16 @@ class ControlPlaneDatabase:
                 raise StateConflict("task is not registered to the selected project")
             if task["state"] != "PREPARED":
                 raise StateConflict("only PREPARED tasks may be queued")
-            existing_domain = self.connection.execute(
-                "SELECT * FROM storage_domains WHERE project_slug = ?", (project_slug,)
-            ).fetchone()
-            if existing_domain is not None:
-                identity = (existing_domain["source"], existing_domain["mount_target"],
-                            existing_domain["fstype"], existing_domain["mount_options"])
-                proposed = (domain.source, domain.target, domain.fstype, domain.options)
-                active = self.connection.execute(
-                    "SELECT 1 FROM storage_reservations WHERE project_slug = ? AND status = 'reserved' LIMIT 1",
-                    (project_slug,),
-                ).fetchone()
-                if active is not None and identity != proposed:
-                    raise StateConflict("storage domain identity changed while tasks were reserved")
+            validate_task_quota_binding(
+                assignment, project=project_slug, identifier=str(task["identifier"]), policy=policy,
+            )
+            proposed = (domain.source, domain.target, domain.fstype, domain.options)
+            for row in self.connection.execute(
+                "SELECT source, mount_target, fstype, mount_options FROM storage_domains"
+            ).fetchall():
+                identity = (row["source"], row["mount_target"], row["fstype"], row["mount_options"])
+                if identity != proposed:
+                    raise StateConflict("shared storage pool identity changed")
             self.connection.execute(
                 """
                 INSERT INTO storage_domains(
@@ -1067,15 +1037,22 @@ class ControlPlaneDatabase:
                 """
                 SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(reserved_inodes), 0)
                 FROM storage_reservations
-                WHERE project_slug = ? AND status = 'reserved'
-                """, (project_slug,),
+                WHERE status = 'reserved'
+                """,
             ).fetchone()
             used_bytes = domain.pool_bytes - domain.free_bytes
             used_inodes = domain.pool_inodes - domain.free_inodes
             if used_bytes > policy.pool_bytes:
                 raise StateConflict("observed storage usage exceeds the configured fixed pool")
-            available_bytes = policy.pool_bytes - used_bytes - int(reserved[0]) - policy.task_bytes
-            available_inodes = domain.pool_inodes - used_inodes - int(reserved[1]) - policy.task_inodes
+            # statvfs free space already reflects bytes/inodes used by
+            # reserved tasks. Compare physical free capacity with the
+            # uncommitted reservation capacity instead of subtracting both.
+            available_bytes = min(
+                domain.free_bytes, policy.pool_bytes - int(reserved[0])
+            ) - policy.task_bytes
+            available_inodes = min(
+                domain.free_inodes, domain.pool_inodes - int(reserved[1])
+            ) - policy.task_inodes
             if (available_bytes < policy.emergency_reserve_bytes or
                     available_inodes < policy.emergency_reserve_inodes):
                 raise StateConflict("storage admission would consume the emergency reserve")
@@ -1120,6 +1097,12 @@ class ControlPlaneDatabase:
             "SELECT * FROM storage_domains WHERE project_slug = ?", (project_slug,)
         ).fetchone())
 
+    def read_storage_pool(self) -> dict[str, object] | None:
+        """Read the one shared pool represented by per-project observations."""
+        return _row(self.connection.execute(
+            "SELECT * FROM storage_domains ORDER BY verified_at DESC LIMIT 1"
+        ).fetchone())
+
     def read_storage_reservation(self, task_id: str | uuid.UUID) -> dict[str, object] | None:
         task_id = _uuid(task_id, "task_id")
         return _row(self.connection.execute(
@@ -1127,14 +1110,26 @@ class ControlPlaneDatabase:
         ).fetchone())
 
     def storage_reservation_totals(self, project_slug: str) -> dict[str, int]:
+        """Return global pool reservations and the selected project's share."""
         project_slug = _project_slug(project_slug)
         row = self.connection.execute(
             """
             SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(reserved_inodes), 0)
-            FROM storage_reservations WHERE project_slug = ? AND status = 'reserved'
+            FROM storage_reservations WHERE status = 'reserved'
+            """,
+        ).fetchone()
+        project_row = self.connection.execute(
+            """
+            SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(reserved_inodes), 0)
+            FROM storage_reservations
+            WHERE project_slug = ? AND status = 'reserved'
             """, (project_slug,),
         ).fetchone()
-        return {"reserved_bytes": int(row[0]), "reserved_inodes": int(row[1])}
+        return {
+            "reserved_bytes": int(row[0]), "reserved_inodes": int(row[1]),
+            "project_reserved_bytes": int(project_row[0]),
+            "project_reserved_inodes": int(project_row[1]),
+        }
 
     def release_storage_reservation(
         self, task_id: str | uuid.UUID, *, released_at: str | None = None

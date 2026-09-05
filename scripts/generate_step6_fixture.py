@@ -15,6 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
 from control_db import ControlPlaneDatabase  # noqa: E402
+from storage import GIB, StoragePolicy, TaskQuotaBinding, VerifiedStorageDomain, derive_quota_id  # noqa: E402
+import json
 
 
 BASE_SHA = "a" * 40
@@ -23,6 +25,35 @@ STATES = (
     "PREPARED", "QUEUED", "PLANNED", "IMPLEMENTED", "REVIEW",
     "ADVERSARIAL_REVIEW", "FINAL_MECHANICAL_ACCEPTANCE", "ARCHIVIST",
 )
+
+
+def queue_fixture_task(database: ControlPlaneDatabase, task: dict[str, object]) -> None:
+    """Use synthetic proof only for this disposable fixture producer."""
+    domain = VerifiedStorageDomain(
+        project=str(task["project_slug"]), source="/dev/test-symphony-pool",
+        target="/home/duck-lint/symphony-workspaces", fstype="ext4",
+        options="rw,relatime,prjquota", pool_bytes=64 * GIB,
+        pool_inodes=100_000_000, free_bytes=60 * GIB, free_inodes=99_000_000,
+        evidence_json='{"synthetic_fixture_proof":true}',
+    )
+    quota_id = derive_quota_id(str(task["identifier"]))
+    assignment = TaskQuotaBinding(
+        project=str(task["project_slug"]), identifier=str(task["identifier"]),
+        workspace_path=(f"/home/duck-lint/symphony-workspaces/"
+                        f"{task['project_slug']}/{task['identifier']}"),
+        quota_id=quota_id, byte_limit=8 * GIB, inode_limit=250_000,
+        proof_json=json.dumps({
+            "schema": "symphony-pilot-task-quota-proof/v1",
+            "project_id": quota_id, "workspace_project_id": quota_id,
+            "byte_hard_limit": 8 * GIB, "inode_hard_limit": 250_000,
+            "byte_probe": {"result": "EDQUOT"},
+            "inode_probe": {"result": "EDQUOT"},
+        }),
+    )
+    database.queue_task_with_storage(
+        task["id"], project_slug=str(task["project_slug"]),
+        domain=domain, policy=StoragePolicy(), assignment=assignment,
+    )
 
 
 def generate(output: pathlib.Path) -> None:
@@ -45,7 +76,7 @@ def generate(output: pathlib.Path) -> None:
                 created_at=CREATED_AT,
             )
             if state == "QUEUED":
-                database.queue_task(task["id"], project_slug="alpha")
+                queue_fixture_task(database, task)
 
         blocked = database.create_task(
             task_id="90000000-0000-0000-0000-000000000000",
@@ -75,7 +106,7 @@ def generate(output: pathlib.Path) -> None:
             state="PREPARED",
             created_at=CREATED_AT,
         )
-        database.queue_task(beta["id"], project_slug="beta")
+        queue_fixture_task(database, beta)
 
 
 def main() -> int:

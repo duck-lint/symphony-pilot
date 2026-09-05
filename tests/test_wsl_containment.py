@@ -28,7 +28,7 @@ class SupervisorValidationTests(unittest.TestCase):
             with mock.patch.object(wsl_contained_exec, "WORKSPACE_ROOT", namespace):
                 storage_root, created = wsl_contained_exec._workspace_storage_root("symphony-pilot")
             self.assertTrue(created)
-            self.assertEqual(storage_root, namespace / "symphony-pilot")
+            self.assertEqual(storage_root, namespace)
             self.assertTrue(storage_root.is_dir())
             self.assertFalse((storage_root / "T-000001").exists())
 
@@ -56,7 +56,7 @@ class SupervisorValidationTests(unittest.TestCase):
 
         findmnt = mock.Mock(returncode=0, stdout=json.dumps({
             "filesystems": [{
-                "target": "/home/duck-lint/symphony-workspaces/symphony-pilot",
+                    "target": "/home/duck-lint/symphony-workspaces",
                 "source": "/dev/vdb",
                 "fstype": "ext4",
                 "options": "rw,relatime,prjquota",

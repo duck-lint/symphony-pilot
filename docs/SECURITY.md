@@ -75,8 +75,10 @@ The shared namespace runner applies a CPU-time limit and uses util-linux
 `--kill-child=SIGKILL`; timeout handling kills and reaps the namespace
 supervisor before reporting completion, and the fixture verifies that a
 grandchild can no longer modify a task-visible sentinel. Individual file size
-is bounded, but aggregate growth of the persistent task workspace is not: no
-total workspace disk quota is claimed or available in this cutover.
+is bounded. Aggregate admission now uses one shared pool reservation ledger,
+but the current root filesystem is rejected and no task is admitted until a
+dedicated kernel-enforced byte/inode domain and task-binding proof are
+available.
 
 This fixture proves the constructor, not live Codex behavior. The real launcher
 still fails closed because the accepted Codex App Server authentication path

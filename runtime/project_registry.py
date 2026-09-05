@@ -45,6 +45,7 @@ def validate_profiles(
     seen_repositories: dict[str, Profile] = {}
     seen_services: dict[str, Profile] = {}
     seen_ports: dict[int, Profile] = {}
+    shared_storage_policy = None
     for index, profile in enumerate(items):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", profile.slug):
             errors.append(f"unsafe slug: {profile.slug!r}")
@@ -64,6 +65,15 @@ def validate_profiles(
         if previous:
             errors.append(f"duplicate dashboard port: {profile.dashboard_port}")
         seen_ports[profile.dashboard_port] = profile
+        policy = profile.storage_policy
+        policy_values = (
+            policy.pool_bytes, policy.task_bytes, policy.task_inodes,
+            policy.emergency_reserve_bytes, policy.emergency_reserve_inodes,
+        )
+        if shared_storage_policy is None:
+            shared_storage_policy = policy_values
+        elif policy_values != shared_storage_policy:
+            errors.append("registered projects must use one shared storage-pool policy")
         if (not isinstance(profile.dashboard_port, int) or isinstance(profile.dashboard_port, bool) or
                 not DASHBOARD_PORT_MIN <= profile.dashboard_port <= DASHBOARD_PORT_MAX):
             errors.append(

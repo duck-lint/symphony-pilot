@@ -22,7 +22,8 @@ import prepare_workspace as pw
 import project
 import render_workflow
 import task
-from storage import VerifiedStorageDomain
+from storage import StorageAdmissionProof, VerifiedStorageDomain
+from tests.storage_support import admission_proof
 
 
 class Step5SchedulerCutoverTests(unittest.TestCase):
@@ -109,13 +110,16 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                             base_ref="main", base_sha="a" * 40, branch="operator-choice",
                         )
                 domain = VerifiedStorageDomain(
-                    project="alpha", source="/dev/vdb", target=str(profile.workspace_root),
+                    project="alpha", source="/dev/vdb", target="/home/duck-lint/symphony-workspaces",
                     fstype="ext4", options="rw,relatime,prjquota",
                     pool_bytes=64 * 1024 ** 3, pool_inodes=1_000_000,
                     free_bytes=60 * 1024 ** 3, free_inodes=900_000,
                     evidence_json='{"synthetic":true}',
                 )
-                with mock.patch.object(task, "verify_profile_storage", return_value=domain):
+                with mock.patch.object(
+                    task, "verify_profile_storage",
+                    return_value=admission_proof(domain, identifier="T-000001"),
+                ):
                     self.assertEqual(task.queue(Namespace(project="alpha", task="T-000001")), 0)
                 with self.assertRaises(control_db.StateConflict):
                     task.queue(Namespace(project="alpha", task="T-000001"))

@@ -22,7 +22,7 @@ from control_db import (ControlPlaneDatabase, ControlPlaneError,
                         default_database_path)  # noqa: E402
 from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
-from storage import StorageContractError, verify_storage_evidence  # noqa: E402
+from storage import StorageAdmissionProof, StorageContractError, verify_storage_evidence  # noqa: E402
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -119,7 +119,9 @@ def verify_profile_storage(profile):
     try:
         return verify_storage_evidence(
             profile.slug, evidence, profile.storage_policy,
-            expected_target=str(profile.workspace_root),
+            # The project and T-N paths are children of one shared physical
+            # pool; they are not independently mounted storage domains.
+            expected_target=str(profile.workspace_root.parent),
         )
     except StorageContractError as exc:
         raise TaskCommandError(f"storage admission failed closed: {exc}") from exc
@@ -136,12 +138,17 @@ def queue(args: argparse.Namespace) -> int:
         if task["state"] != "PREPARED":
             raise StateConflict("only PREPARED tasks may be queued")
         try:
-            domain = verify_profile_storage(profile)
+            admission = verify_profile_storage(profile)
+            if not isinstance(admission, StorageAdmissionProof):
+                raise TaskCommandError(
+                    "task-specific quota assignment proof is unavailable"
+                )
             task = database.queue_task_with_storage(
                 task["id"], project_slug=profile.slug,
-                domain=domain, policy=profile.storage_policy,
+                domain=admission.domain, policy=profile.storage_policy,
+                assignment=admission.binding,
             )
-        except (TaskCommandError, StateConflict) as exc:
+        except (TaskCommandError, StateConflict, StorageContractError) as exc:
             database.record_blocker(
                 task_id=task["id"], kind="infrastructure",
                 body=f"storage admission failed: {type(exc).__name__}: {exc}",
