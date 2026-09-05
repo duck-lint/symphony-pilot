@@ -24,12 +24,11 @@ $AttachmentStatePath = [IO.Path]::Combine($ExpectedParent, "symphony-storage.vhd
 $Distribution = "Ubuntu-24.04"
 $Wsl = [IO.Path]::Combine($env:SystemRoot, "System32", "wsl.exe")
 $StateSchema = "symphony-pilot-vhdx-attachment/v1"
+$OperatorAdminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+$OperatorSystemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
 
 if (-not (Test-Path -LiteralPath $Wsl -PathType Leaf)) {
     throw "the fixed Windows WSL executable is unavailable"
-}
-if ($Operation -eq "Attach" -and -not (Test-Path -LiteralPath $ExpectedParent -PathType Container)) {
-    New-Item -ItemType Directory -Path $ExpectedParent -Force | Out-Null
 }
 
 function Invoke-WslText {
@@ -41,10 +40,24 @@ function Invoke-WslText {
     }
 }
 
+function Get-LinuxDeviceIdentityKey {
+    param([object]$Device)
+    $path = [string]$Device.LinuxDevice
+    $type = [string]$Device.Type
+    $size = [int64]$Device.SizeBytes
+    $serial = [string]$Device.Serial
+    $wwn = [string]$Device.Wwn
+    $model = [string]$Device.Model
+    # The path is retained in the fingerprint.  Stable serial/WWN/model
+    # fields strengthen the comparison, but a path substitution is still a
+    # device-set change unless a reviewed direct attachment query proves it.
+    "path=$path|type=$type|size=$size|serial=$serial|wwn=$wwn|model=$model"
+}
+
 function Get-LinuxWholeDiskEvidence {
     $result = Invoke-WslText @(
         "--distribution", $Distribution, "--exec", "/bin/lsblk",
-        "--json", "--bytes", "--output", "NAME,PATH,TYPE,SIZE,PKNAME"
+        "--json", "--bytes", "--output", "NAME,PATH,TYPE,SIZE,PKNAME,SERIAL,WWN,MODEL"
     )
     if ($result.ExitCode -ne 0) {
         throw "Ubuntu-24.04 lsblk discovery failed: $($result.Output)"
@@ -57,26 +70,156 @@ function Get-LinuxWholeDiskEvidence {
         throw "Ubuntu-24.04 lsblk discovery returned malformed JSON"
     }
     $evidence = foreach ($device in $devices) {
-        if ($device.type -eq "disk" -and [int64]$device.size -eq $ExpectedBytes -and
-            $null -eq $device.pkname -and $device.path -match '^/dev/[A-Za-z0-9._-]+$') {
-            [pscustomobject]@{
-                LinuxDevice = [string]$device.path
-                Type = [string]$device.type
-                SizeBytes = [int64]$device.size
-                Parent = $null
-            }
+        if ($device.type -ne "disk") {
+            continue
         }
+        try {
+            $sizeBytes = [int64]$device.size
+        }
+        catch {
+            throw "Ubuntu-24.04 lsblk returned a disk with invalid size evidence"
+        }
+        if ($null -ne $device.pkname -or $device.path -notmatch '^/dev/[A-Za-z0-9._-]+$') {
+            throw "Ubuntu-24.04 lsblk returned an unsafe whole-disk identity"
+        }
+        $item = [pscustomobject]@{
+            LinuxDevice = [string]$device.path
+            Type = [string]$device.type
+            SizeBytes = $sizeBytes
+            Serial = [string]$device.serial
+            Wwn = [string]$device.wwn
+            Model = [string]$device.model
+            Parent = $null
+        }
+        $item | Add-Member -NotePropertyName IdentityKey -NotePropertyValue (Get-LinuxDeviceIdentityKey $item)
+        $item
     }
     @($evidence)
 }
 
+function ConvertTo-SidValue {
+    param([object]$Identity)
+    try {
+        if ($Identity -is [System.Security.Principal.SecurityIdentifier]) {
+            return $Identity.Value
+        }
+        return $Identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    catch {
+        throw "operator-state ACL contains an unresolvable identity"
+    }
+}
+
+function Assert-OperatorStateAcl {
+    param(
+        [string]$Path,
+        [bool]$Directory
+    )
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($Directory -and -not $item.PSIsContainer) -or
+        (-not $Directory -and $item.PSIsContainer)) {
+        throw "operator-state path is not the expected normal fixed object"
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) {
+        throw "operator-state ACL must disable inheritance"
+    }
+    if ((ConvertTo-SidValue $acl.Owner) -ne $OperatorAdminSid.Value) {
+        throw "operator-state owner must be local Administrators"
+    }
+    $rules = @($acl.Access)
+    if ($rules.Count -ne 2) {
+        throw "operator-state ACL must contain only SYSTEM and Administrators"
+    }
+    $expectedInheritance = if ($Directory) {
+        [int]([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+    } else {
+        [int][System.Security.AccessControl.InheritanceFlags]::None
+    }
+    $seen = @{}
+    foreach ($rule in $rules) {
+        $sid = ConvertTo-SidValue $rule.IdentityReference
+        if ($sid -ne $OperatorAdminSid.Value -and $sid -ne $OperatorSystemSid.Value) {
+            throw "operator-state ACL grants an unexpected identity"
+        }
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+            [int64]$rule.FileSystemRights -ne [int64][System.Security.AccessControl.FileSystemRights]::FullControl -or
+            [int]$rule.InheritanceFlags -ne $expectedInheritance -or
+            [int]$rule.PropagationFlags -ne [int][System.Security.AccessControl.PropagationFlags]::None) {
+            throw "operator-state ACL grants unexpected rights or inheritance"
+        }
+        $seen[$sid] = $true
+    }
+    if (-not $seen.ContainsKey($OperatorAdminSid.Value) -or
+        -not $seen.ContainsKey($OperatorSystemSid.Value)) {
+        throw "operator-state ACL is missing SYSTEM or Administrators"
+    }
+}
+
+function Set-OperatorStateAcl {
+    param(
+        [string]$Path,
+        [bool]$Directory
+    )
+    $security = if ($Directory) {
+        New-Object System.Security.AccessControl.DirectorySecurity
+    } else {
+        New-Object System.Security.AccessControl.FileSecurity
+    }
+    $security.SetOwner($OperatorAdminSid)
+    $security.SetAccessRuleProtection($true, $false)
+    $inheritance = if ($Directory) {
+        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    } else {
+        [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    foreach ($sid in @($OperatorSystemSid, $OperatorAdminSid)) {
+        $rule = New-Object -TypeName System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $security.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $security
+    Assert-OperatorStateAcl $Path $Directory
+}
+
+function Ensure-OperatorStateNamespace {
+    param([bool]$Create)
+    try {
+        $parent = Get-Item -LiteralPath $ExpectedParent -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        if (-not $Create) {
+            throw "fixed operator-state namespace is unavailable"
+        }
+        New-Item -ItemType Directory -Path $ExpectedParent -Force | Out-Null
+        Set-OperatorStateAcl $ExpectedParent $true
+        return
+    }
+    Assert-OperatorStateAcl $ExpectedParent $true
+}
+
 function Get-VhdEvidence {
     param([bool]$Create)
+    $created = $false
     if (-not (Test-Path -LiteralPath $ExpectedPath -PathType Leaf)) {
         if (-not $Create) {
             throw "the fixed Symphony VHDX does not exist"
         }
         New-VHD -Path $ExpectedPath -SizeBytes $ExpectedBytes -Fixed | Out-Null
+        $created = $true
+    }
+    if ($created) {
+        Set-OperatorStateAcl $ExpectedPath $false
+    } else {
+        Assert-OperatorStateAcl $ExpectedPath $false
     }
     $vhd = Get-VHD -Path $ExpectedPath
     if ([string]$vhd.VhdType -ne "Fixed") {
@@ -101,12 +244,40 @@ function Assert-WslVhdCapability {
     }
 }
 
+function Throw-ReconciliationRequired {
+    param([string]$Reason)
+    $exception = New-Object -TypeName System.InvalidOperationException -ArgumentList $Reason
+    $record = New-Object -TypeName System.Management.Automation.ErrorRecord -ArgumentList @(
+        $exception,
+        "VhdxReconciliationRequired",
+        [System.Management.Automation.ErrorCategory]::ResourceBusy,
+        $ExpectedPath
+    )
+    throw $record
+}
+
+function New-AttachmentCacheResult {
+    param(
+        [bool]$Present,
+        [bool]$Valid,
+        [AllowNull()][object]$State,
+        [AllowNull()][string]$Error
+    )
+    [pscustomobject]@{
+        Present = $Present
+        Valid = $Valid
+        State = $State
+        Error = $Error
+    }
+}
+
 function Read-AttachmentState {
+    param([switch]$AllowInvalid)
     try {
         $parent = Get-Item -LiteralPath $ExpectedParent -Force -ErrorAction Stop
     }
     catch [System.Management.Automation.ItemNotFoundException] {
-        return $null
+        return New-AttachmentCacheResult $false $true $null $null
     }
     if (-not $parent.PSIsContainer -or
         ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -118,44 +289,52 @@ function Read-AttachmentState {
             Where-Object { $_.Name -eq $stateName }
     )
     if ($items.Count -eq 0) {
-        return $null
+        return New-AttachmentCacheResult $false $true $null $null
     }
     if ($items.Count -ne 1) {
         throw "VHDX attachment state namespace is ambiguous"
     }
     $item = $items[0]
+    $invalidReason = $null
     if ($item.PSIsContainer -or
         ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "VHDX attachment state is not a normal non-reparse file"
+        $invalidReason = "VHDX attachment state is not a normal non-reparse file"
+    } else {
+        try {
+            $state = Get-Content -LiteralPath $AttachmentStatePath -Raw | ConvertFrom-Json
+            $expectedFields = @(
+                "Schema", "VhdPath", "VhdType", "VirtualSizeBytes",
+                "LinuxDevice", "Attached"
+            )
+            if ($null -eq $state) {
+                throw "VHDX attachment state is malformed"
+            }
+            # The sidecar is bounded cache/recovery evidence, not authority.
+            # Its fixed namespace, exact field set, and immutable contract
+            # values prevent it from widening the VHD object identity; an
+            # untrusted edit can only cause fail-closed reconciliation.
+            $actualFields = @($state.PSObject.Properties.Name)
+            if ($actualFields.Count -ne $expectedFields.Count -or
+                @($actualFields | Where-Object { $_ -notin $expectedFields }).Count -ne 0 -or
+                $state.Schema -ne $StateSchema -or
+                $state.VhdPath -ne $ExpectedPath -or $state.VhdType -ne "Fixed" -or
+                [int64]$state.VirtualSizeBytes -ne $ExpectedBytes -or
+                $state.Attached -ne $true -or
+                $state.LinuxDevice -notmatch '^/dev/[A-Za-z0-9._-]+$') {
+                throw "VHDX attachment state conflicts with the fixed contract"
+            }
+        }
+        catch {
+            $invalidReason = $_.Exception.Message
+        }
     }
-    try {
-        $state = Get-Content -LiteralPath $AttachmentStatePath -Raw | ConvertFrom-Json
+    if ($null -ne $invalidReason) {
+        if ($AllowInvalid) {
+            return New-AttachmentCacheResult $true $false $null $invalidReason
+        }
+        throw $invalidReason
     }
-    catch {
-        throw "VHDX attachment state is malformed"
-    }
-    $expectedFields = @(
-        "Schema", "VhdPath", "VhdType", "VirtualSizeBytes",
-        "LinuxDevice", "Attached"
-    )
-    if ($null -eq $state) {
-        throw "VHDX attachment state is malformed"
-    }
-    # The sidecar is bounded cache/recovery evidence, not authority.  Its
-    # fixed namespace, exact field set, and immutable contract values prevent
-    # it from widening the VHD object identity; an untrusted edit can only
-    # cause fail-closed reconciliation.
-    $actualFields = @($state.PSObject.Properties.Name)
-    if ($actualFields.Count -ne $expectedFields.Count -or
-        @($actualFields | Where-Object { $_ -notin $expectedFields }).Count -ne 0 -or
-        $state.Schema -ne $StateSchema -or
-        $state.VhdPath -ne $ExpectedPath -or $state.VhdType -ne "Fixed" -or
-        [int64]$state.VirtualSizeBytes -ne $ExpectedBytes -or
-        $state.Attached -ne $true -or
-        $state.LinuxDevice -notmatch '^/dev/[A-Za-z0-9._-]+$') {
-        throw "VHDX attachment state conflicts with the fixed contract"
-    }
-    $state
+    New-AttachmentCacheResult $true $true $state $null
 }
 
 function Resolve-DetachReconciliation {
@@ -164,18 +343,62 @@ function Resolve-DetachReconciliation {
         [object[]]$After,
         [int]$UnmountExitCode
     )
-    $beforeExact = @($Before | Where-Object { $_.SizeBytes -eq $ExpectedBytes })
-    $afterExact = @($After | Where-Object { $_.SizeBytes -eq $ExpectedBytes })
-    if ($afterExact.Count -ne 0) {
-        throw "WSL VHD detachment left contradictory exact-size Linux device evidence"
+    $beforeMap = @{}
+    foreach ($device in @($Before)) {
+        $key = Get-LinuxDeviceIdentityKey $device
+        if ($beforeMap.ContainsKey($key)) {
+            throw "before-detach Linux device evidence contains duplicate identities"
+        }
+        $beforeMap[$key] = $device
+    }
+    $afterMap = @{}
+    foreach ($device in @($After)) {
+        $key = Get-LinuxDeviceIdentityKey $device
+        if ($afterMap.ContainsKey($key)) {
+            throw "after-detach Linux device evidence contains duplicate identities"
+        }
+        $afterMap[$key] = $device
+    }
+    $missing = @(
+        foreach ($key in @($beforeMap.Keys)) {
+            if (-not $afterMap.ContainsKey($key)) {
+                $beforeMap[$key]
+            }
+        }
+    )
+    $unexpected = @(
+        foreach ($key in @($afterMap.Keys)) {
+            if (-not $beforeMap.ContainsKey($key)) {
+                $afterMap[$key]
+            }
+        }
+    )
+    if ($unexpected.Count -ne 0) {
+        throw "WSL VHD detachment produced unexpected new Linux device evidence"
+    }
+    if ($missing.Count -gt 1) {
+        throw "WSL VHD detachment removed more than one Linux device"
+    }
+    if ($missing.Count -eq 1 -and $missing[0].SizeBytes -ne $ExpectedBytes) {
+        throw "WSL VHD detachment removed an unrelated Linux device"
+    }
+    if ($missing.Count -eq 0) {
+        if (@($Before | Where-Object { $_.SizeBytes -eq $ExpectedBytes }).Count -ne 0) {
+            throw "WSL VHD detachment did not prove removal of an exact-size Linux device"
+        }
+        return [pscustomobject]@{
+            Action = "already-detached"
+            LinuxDevice = $null
+            UnmountExitCode = $UnmountExitCode
+        }
     }
     # The fixed VHD path is the detachment capability.  A nonzero result is
-    # recoverable only when post-command evidence proves no exact-size device
-    # remains; the evidence, not a stale sidecar or a guessed /dev name, closes
-    # the reconciliation.
+    # recoverable only when the structured delta proves exactly one exact-size
+    # device disappeared; the evidence, not a stale sidecar or a guessed
+    # /dev name, closes the reconciliation.
     [pscustomobject]@{
-        Action = if ($beforeExact.Count -eq 0) { "already-detached" } else { "reconciled-detached" }
-        LinuxDevice = if ($beforeExact.Count -eq 1) { $beforeExact[0].LinuxDevice } else { $null }
+        Action = "reconciled-detached"
+        LinuxDevice = [string]$missing[0].LinuxDevice
         UnmountExitCode = $UnmountExitCode
     }
 }
@@ -192,12 +415,40 @@ function Write-AttachmentState {
             LinuxDevice = $LinuxDevice
             Attached = $true
         } | ConvertTo-Json -Compress | Set-Content -LiteralPath $temporary -Encoding utf8
+        Set-OperatorStateAcl $temporary $false
         Move-Item -LiteralPath $temporary -Destination $AttachmentStatePath -Force
+        Assert-OperatorStateAcl $AttachmentStatePath $false
     }
     finally {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) {
             Remove-Item -LiteralPath $temporary -Force
         }
+    }
+}
+
+function Remove-AttachmentState {
+    try {
+        $item = Get-Item -LiteralPath $AttachmentStatePath -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return
+    }
+    if ($item.PSIsContainer) {
+        throw "VHDX attachment state leaf is unexpectedly a directory"
+    }
+    $isReparse = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    # LiteralPath deletion targets only this fixed leaf.  Reparse state is
+    # never opened or traversed; the postcondition proves the leaf vanished.
+    # This explicit branch documents that reparse cleanup is a leaf operation,
+    # not a followed path; if the platform cannot honor that contract,
+    # Remove-Item fails and the recovery state remains for bounded retry.
+    if ($isReparse) {
+        Remove-Item -LiteralPath $AttachmentStatePath -Force -ErrorAction Stop
+    } else {
+        [IO.File]::Delete($AttachmentStatePath)
+    }
+    if (Test-Path -LiteralPath $AttachmentStatePath) {
+        throw "VHDX attachment state leaf could not be removed"
     }
 }
 
@@ -208,7 +459,8 @@ function New-Evidence {
         [string]$Action,
         [string]$State,
         [object[]]$LinuxDevicesBefore = @(),
-        [object[]]$LinuxDevicesAfter = @()
+        [object[]]$LinuxDevicesAfter = @(),
+        [AllowNull()][object]$Cache = $null
     )
     [ordered]@{
         VhdPath = $Vhd.VhdPath
@@ -218,27 +470,33 @@ function New-Evidence {
         LinuxDevice = $LinuxDevice
         LinuxDevicesBefore = @($LinuxDevicesBefore | ForEach-Object { $_.LinuxDevice })
         LinuxDevicesAfter = @($LinuxDevicesAfter | ForEach-Object { $_.LinuxDevice })
+        AttachmentCacheState = if ($null -eq $Cache -or -not $Cache.Present) {
+            "absent"
+        } elseif ($Cache.Valid) {
+            "valid-cache"
+        } else {
+            "invalid-cache"
+        }
         WslAttachmentState = $State
         AttachmentAction = $Action
         Distribution = $Distribution
     } | ConvertTo-Json -Compress
 }
 
+Ensure-OperatorStateNamespace ($Operation -eq "Attach")
 Assert-WslVhdCapability
 
 if ($Operation -eq "Attach") {
     $vhd = Get-VhdEvidence $true
     $before = @(Get-LinuxWholeDiskEvidence)
-    $state = Read-AttachmentState
+    $cache = Read-AttachmentState
     $exactBefore = @($before | Where-Object { $_.SizeBytes -eq $ExpectedBytes })
 
-    if ($null -ne $state) {
-        if (@($exactBefore | Where-Object { $_.LinuxDevice -eq $state.LinuxDevice }).Count -ne 1 -or
-            $exactBefore.Count -ne 1) {
-            throw "tracked VHDX attachment is missing or conflicts with another 64-GiB Linux disk"
-        }
-        New-Evidence $vhd $state.LinuxDevice "already-attached" "attached" $before $before
-        exit 0
+    if ($cache.Present) {
+        # Reviewed WSL exposes no direct exact-VHD attachment-state query.
+        # A cached /dev path plus size is therefore never sufficient to bless
+        # already-attached; the bounded Detach path must reconcile it first.
+        Throw-ReconciliationRequired "attachment reconciliation required before Attach can proceed"
     }
     if ($exactBefore.Count -ne 0) {
         throw "an untracked exact-size Linux disk is a conflicting attachment"
@@ -250,8 +508,8 @@ if ($Operation -eq "Attach") {
     }
     $after = @(Get-LinuxWholeDiskEvidence)
     $new = @($after | Where-Object {
-        $candidate = $_.LinuxDevice
-        -not (@($before | Where-Object { $_.LinuxDevice -eq $candidate }).Count)
+        $candidate = $_.IdentityKey
+        -not (@($before | Where-Object { $_.IdentityKey -eq $candidate }).Count)
     })
     if ($new.Count -ne 1 -or $new[0].SizeBytes -ne $ExpectedBytes) {
         throw "direct VHD attachment did not produce exactly one new 64-GiB Linux disk"
@@ -263,16 +521,17 @@ if ($Operation -eq "Attach") {
 
 $vhd = Get-VhdEvidence $false
 $before = @(Get-LinuxWholeDiskEvidence)
-$state = Read-AttachmentState
+$cache = Read-AttachmentState -AllowInvalid
 $detached = Invoke-WslText @("--unmount", $ExpectedPath)
 $after = @(Get-LinuxWholeDiskEvidence)
 $reconciliation = Resolve-DetachReconciliation $before $after $detached.ExitCode
-if ($null -ne $state) {
-    Remove-Item -LiteralPath $AttachmentStatePath -Force
+if ($cache.Present) {
+    Remove-AttachmentState
 }
 $reconciliation.LinuxDevice = if ($null -ne $reconciliation.LinuxDevice) {
     [string]$reconciliation.LinuxDevice
 } else {
     $null
 }
-New-Evidence $vhd $reconciliation.LinuxDevice $reconciliation.Action "detached" $before $after
+New-Evidence $vhd $reconciliation.LinuxDevice $reconciliation.Action "detached" $before $after $cache
+exit 0

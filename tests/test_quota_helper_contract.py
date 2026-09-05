@@ -82,6 +82,7 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn('ValidateSet("Attach", "Detach")', recipe)
         self.assertIn('"--mount", $ExpectedPath, "--vhd", "--bare"', recipe)
         self.assertIn('"--unmount", $ExpectedPath', recipe)
+        self.assertIn("SERIAL,WWN,MODEL", recipe)
         self.assertIn("Get-LinuxWholeDiskEvidence", recipe)
         self.assertIn("exactly one new 64-GiB Linux disk", recipe)
         self.assertIn("malformed JSON", recipe)
@@ -92,6 +93,32 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertNotIn("FileSize -ne", recipe)
         self.assertNotIn("Resize-VHD", recipe)
         self.assertNotIn("Invoke-Expression", recipe)
+
+    def test_vhdx_operator_state_acl_contract_is_explicit(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        self.assertIn("Ensure-OperatorStateNamespace", recipe)
+        self.assertIn("Assert-OperatorStateAcl", recipe)
+        self.assertIn("Set-OperatorStateAcl", recipe)
+        self.assertIn("Get-Acl", recipe)
+        self.assertIn("Set-Acl", recipe)
+        self.assertIn("S-1-5-32-544", recipe)
+        self.assertIn("S-1-5-18", recipe)
+        self.assertIn("AreAccessRulesProtected", recipe)
+        self.assertIn("SetAccessRuleProtection($true, $false)", recipe)
+        self.assertIn("FileSystemRights]::FullControl", recipe)
+        self.assertIn("Throw-ReconciliationRequired", recipe)
+        self.assertIn("VhdxReconciliationRequired", recipe)
+        self.assertIn("attachment reconciliation required before Attach", recipe)
+        self.assertIn("Read-AttachmentState -AllowInvalid", recipe)
+        self.assertIn("Remove-AttachmentState", recipe)
+        self.assertIn("AttachmentCacheState", recipe)
+        self.assertIn("invalid-cache", recipe)
+        self.assertIn("[IO.File]::Delete($AttachmentStatePath)", recipe)
+        self.assertIn("$isReparse", recipe)
+        self.assertIn("VHDX attachment state is not a normal non-reparse file", recipe)
+        attach_body = recipe[recipe.index('if ($Operation -eq "Attach")'):]
+        self.assertNotIn('"already-attached"', attach_body)
+        self.assertIn("Move-Item -LiteralPath $temporary -Destination $AttachmentStatePath -Force", recipe)
 
     def test_fixed_vhdx_recovery_contract_is_bounded_and_evidence_driven(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
@@ -109,21 +136,24 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn('Invoke-WslText @("--unmount", $ExpectedPath)', recipe)
         self.assertLess(
             recipe.rfind("Resolve-DetachReconciliation"),
-            recipe.rfind("Remove-Item -LiteralPath $AttachmentStatePath -Force"),
+            recipe.rfind("Remove-AttachmentState"),
         )
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
     def test_vhdx_detach_reconciler_covers_recovery_and_conflict_evidence(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-LinuxDeviceIdentityKey")
+        helper_end = recipe.index("function Get-LinuxWholeDiskEvidence")
         start = recipe.index("function Resolve-DetachReconciliation")
         end = recipe.index("function Write-AttachmentState")
         reconciler = recipe[start:end]
-        prefix = "$ExpectedBytes = 64GB\n" + reconciler
+        identity_helper = recipe[helper_start:helper_end]
+        prefix = "$ExpectedBytes = 64GB\n" + identity_helper + reconciler
 
         def run(before, after, exit_code, expect_success):
             def evidence(devices):
                 return "@(" + ",".join(
-                    "[pscustomobject]@{SizeBytes=64GB; LinuxDevice='%s'}" % device
+                    "[pscustomobject]@{SizeBytes=64GB; LinuxDevice='%s'; Type='disk'; Serial=''; Wwn=''; Model=''}" % device
                     for device in devices
                 ) + ")"
 
@@ -142,11 +172,14 @@ class QuotaHelperContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout
 
-        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb"], [], 0, True))
+        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb", "/dev/sdc"], ["/dev/sdc"], 0, True))
+        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb", "/dev/sdc", "/dev/sde"], ["/dev/sdc", "/dev/sde"], 0, True))
         self.assertIn('"Action":"already-detached"', run([], [], 1, True))
         self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdc"], [], 1, True))
-        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb", "/dev/sdc"], [], 0, True))
+        run(["/dev/sdb", "/dev/sdc"], [], 0, False)
         run(["/dev/sdb"], ["/dev/sdc"], 0, False)
+        run(["/dev/sdc"], ["/dev/sdc"], 1, False)
+        run(["/dev/sdc"], ["/dev/sdc"], 0, False)
 
     def test_vhdx_operator_contract_is_in_source_digest(self):
         import deployment_contract
