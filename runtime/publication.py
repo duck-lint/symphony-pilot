@@ -309,7 +309,12 @@ def _publish_branch(profile: Profile, task: dict[str, object], bundle: pathlib.P
             update = _host_git(bare, "update-ref", branch_ref, str(task["current_head"]), "0" * 40, env=env)
             if update.returncode:
                 raise PublicationError("host publication branch lease was lost")
-            pushed = _host_git(bare, "push", remote, branch_ref + ":" + branch_ref, env=env)
+            # Empty expected value is an expected-absence CAS, not permission
+            # to overwrite an existing remote ref.
+            pushed = _host_git(
+                bare, "push", "--force-with-lease=" + branch_ref + ":",
+                remote, branch_ref + ":" + branch_ref, env=env,
+            )
             if pushed.returncode:
                 raise PublicationError("host publication push failed")
 
@@ -318,6 +323,7 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                          deployment_check=None, github_call=github, snapshot_fn=None) -> dict[str, object]:
     """Publish one exact ARCHIVIST task; all selectors and destinations are host-derived."""
     intent_started = False
+    eligibility_established = False
     task: dict[str, object] | None = None
     publication: dict[str, object] | None = None
     remote_branch: str | None = None
@@ -335,6 +341,10 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                     database.connection.execute("SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)).fetchone() or
                     database.connection.execute("SELECT 1 FROM role_runs WHERE task_id = ? AND role = 'ARCHITECT' AND status = 'started' LIMIT 1", (task["id"],)).fetchone()):
                 raise StateConflict("task is not eligible for publication")
+            # From this point the exact task identity and publication
+            # eligibility are known. Any handled failure must leave a durable
+            # blocker even if it occurs before publication intent is written.
+            eligibility_established = True
             remote_branch = str(task["branch"])
             workspace = require_physical_namespace(pathlib.Path(profile.workspace_root) / str(task["identifier"]))
             if process_owns_workspace(workspace):
@@ -358,11 +368,12 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
             token = read_secret(profile)
             temp_directory, bundle = _generate_bundle(workspace)
             try:
-                # Snapshot A is the last protection read before branch push.
-                snapshot_a = (snapshot_fn(profile, task, token) if snapshot_fn else
-                              _ruleset_snapshot(profile, task, token, github_call))
                 with verified_private_key(profile, token, github_call) as verified_key:
                     stable_key, key_evidence = verified_key
+                    # Deploy-key verification precedes Snapshot A; the stable
+                    # key remains live through the snapshot and branch push.
+                    snapshot_a = (snapshot_fn(profile, task, token) if snapshot_fn else
+                                  _ruleset_snapshot(profile, task, token, github_call))
                     _publish_branch(
                         profile, task, bundle, stable_key, remote,
                         allow_existing_remote=allow_existing_remote,
@@ -371,17 +382,23 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                     task_for_pr["current_head"] = task["current_head"]
                     pr = reconcile_pull_request(profile, task_for_pr, token, github_call)
                     pr_number = int(pr["number"])
-                    # Snapshot B is immediately before final SQLite recheck.
-                    snapshot_b = (snapshot_fn(profile, task, token) if snapshot_fn else
-                                  _ruleset_snapshot(profile, task, token, github_call))
-                    if snapshot_a["fingerprint"] != snapshot_b["fingerprint"]:
-                        raise PublicationError("default-branch protection changed during publication")
                     remote_head = _remote_head(remote, remote_branch, {
                         **sterile_environment(pathlib.Path.cwd()),
                         "GIT_SSH_COMMAND": "ssh -i " + str(stable_key) + " -o IdentitiesOnly=yes -o BatchMode=yes",
                         "GIT_SSH_VARIANT": "ssh",
                     })
-                    if remote_head != task["current_head"]:
+                    # Re-read the exact PR after the remote ref check. No
+                    # GitHub protection read occurs after Snapshot B.
+                    final_pr = _validate_pull_request(
+                        github_call(profile, token, "GET", f"/pulls/{pr_number}"),
+                        profile, task_for_pr,
+                    )
+                    snapshot_b = (snapshot_fn(profile, task, token) if snapshot_fn else
+                                  _ruleset_snapshot(profile, task, token, github_call))
+                    if snapshot_a["fingerprint"] != snapshot_b["fingerprint"]:
+                        raise PublicationError("default-branch protection changed during publication")
+                    if (remote_head != task["current_head"] or
+                            final_pr["head"].get("sha") != task["current_head"]):
                         raise PublicationError("remote task branch is not the exact current HEAD")
                     evidence = {
                         "ruleset_id": snapshot_b["ruleset_id"],
@@ -398,16 +415,27 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                     return {"task": finalized, "publication": database.read_publication(task["id"]), "idempotent": False}
             finally:
                 temp_directory.cleanup()
-    except (PublicationError, PublicationKeyError, RulesetError, ControlPlaneError, OSError, ValueError) as exc:
-        if intent_started and task is not None:
+    except Exception as exc:
+        # Exception (rather than BaseException) deliberately leaves
+        # KeyboardInterrupt/SystemExit/GeneratorExit as process-disappearance
+        # semantics, preserving a legitimate started intent for recovery.
+        if eligibility_established and task is not None:
             try:
                 with ControlPlaneDatabase.open(database_path) as database:
-                    database.fail_publication(
-                        task["id"], detail=str(exc), head_sha=str(task["current_head"]),
-                        remote_branch=remote_branch, github_pr_number=pr_number,
-                    )
-            except Exception:
-                pass
+                    if intent_started:
+                        database.fail_publication(
+                            task["id"], detail=str(exc), head_sha=str(task["current_head"]),
+                            remote_branch=remote_branch, github_pr_number=pr_number,
+                        )
+                    else:
+                        database.record_blocker(
+                            task_id=task["id"], kind="infrastructure",
+                            body="publication preflight failed: " + str(exc),
+                        )
+            except Exception as persistence_error:
+                raise PublicationError(
+                    "publication failure could not be persisted"
+                ) from persistence_error
         if isinstance(exc, PublicationError):
             raise
         raise PublicationError(str(exc)) from exc

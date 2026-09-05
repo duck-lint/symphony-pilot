@@ -18,6 +18,7 @@ import control_db
 import publication
 import publication_key
 import rulesets
+import provision_publication_key
 from prepare_workspace import Profile
 
 
@@ -115,6 +116,13 @@ class Step7PublicationTests(unittest.TestCase):
                 yield pathlib.Path(stream.name), {"id": 4, "fingerprint": "SHA256:key"}
 
         pr = {"number": 7}
+        exact_pr = {"number": 7, "state": "open", "draft": True,
+                    "head": {"ref": self.task_branch, "sha": self.head,
+                             "repo": {"full_name": self.profile.repository}},
+                    "base": {"ref": "master"}}
+        def api(_profile, _token, method, path, body=None):
+            self.assertEqual((method, path), ("GET", "/pulls/7"))
+            return exact_pr
         with mock.patch.object(publication, "canonical_publication_remote", return_value=str(self.remote)), \
              mock.patch.object(publication, "verified_private_key", side_effect=key), \
              mock.patch.object(publication, "read_secret", return_value="api-token"), \
@@ -123,6 +131,7 @@ class Step7PublicationTests(unittest.TestCase):
             result = publication.publish_task(
                 self.profile, self.task["id"], database_path=self.database_path,
                 deployment_check=lambda profile: None,
+                github_call=api,
             )
         self.assertEqual(result["task"]["state"], "READY_FOR_HUMAN_MERGE")
         self.assertEqual(self.git(self.remote, "rev-parse", self.task_branch), self.head)
@@ -155,6 +164,200 @@ class Step7PublicationTests(unittest.TestCase):
         excluded = dict(first, conditions={"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": ["~DEFAULT_BRANCH"]}})
         with self.assertRaises(rulesets.RulesetError):
             rulesets.require_default_branch_ruleset([excluded], "master")
+
+    def test_nonempty_ruleset_exclusions_are_rejected_as_patterns(self):
+        for exclusion in ("refs/heads/*", "refs/heads/**", "*", "~ALL", "refs/**"):
+            ruleset = {
+                "id": 1, "target": "branch", "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": [exclusion]}},
+                "bypass_actors": [], "rules": [{"type": "pull_request"}],
+            }
+            with self.subTest(exclusion=exclusion), self.assertRaises(rulesets.RulesetError):
+                rulesets.require_default_branch_ruleset([ruleset], "master")
+
+    def test_initial_branch_publish_uses_absence_compare_and_swap(self):
+        directory, bundle = publication._generate_bundle(self.workspace)
+        try:
+            with tempfile.NamedTemporaryFile() as key:
+                def race(_remote, _branch, _env):
+                    self.git(self.remote, "update-ref", "refs/heads/" + self.task_branch, self.base)
+                    return None
+                with mock.patch.object(publication, "_remote_head", side_effect=race):
+                    with self.assertRaises(publication.PublicationError):
+                        publication._publish_branch(
+                            self.profile, {"base_ref": "master", "base_sha": self.base,
+                                           "branch": self.task_branch, "current_head": self.head},
+                            bundle, pathlib.Path(key.name), str(self.remote),
+                            allow_existing_remote=False,
+                        )
+        finally:
+            directory.cleanup()
+        self.assertEqual(self.git(self.remote, "rev-parse", self.task_branch), self.base)
+
+    def test_publication_order_verifies_key_then_snapshot_then_push_then_rechecks(self):
+        order = []
+        exact_pr = {"number": 7, "state": "open", "draft": True,
+                    "head": {"ref": self.task_branch, "sha": self.head,
+                             "repo": {"full_name": self.profile.repository}},
+                    "base": {"ref": "master"}}
+
+        @contextlib.contextmanager
+        def key(*_args):
+            with tempfile.NamedTemporaryFile() as stream:
+                order.append("deploy-key")
+                yield pathlib.Path(stream.name), {"id": 4, "fingerprint": "SHA256:key"}
+
+        def snapshot(*_args):
+            order.append("snapshot")
+            return {"ruleset_id": 9, "fingerprint": "a" * 64}
+
+        def push(*_args, **_kwargs):
+            order.append("push")
+
+        def remote(*_args, **_kwargs):
+            order.append("remote")
+            return self.head
+
+        def api(_profile, _token, method, path, body=None):
+            self.assertEqual((method, path), ("GET", "/pulls/7"))
+            order.append("pr")
+            return exact_pr
+
+        with mock.patch.object(publication, "canonical_publication_remote", return_value="local"), \
+             mock.patch.object(publication, "verified_private_key", side_effect=key), \
+             mock.patch.object(publication, "read_secret", return_value="token"), \
+             mock.patch.object(publication, "_generate_bundle", return_value=(tempfile.TemporaryDirectory(), self.root / "unused.bundle")), \
+             mock.patch.object(publication, "_publish_branch", side_effect=push), \
+             mock.patch.object(publication, "_remote_head", side_effect=remote), \
+             mock.patch.object(publication, "reconcile_pull_request", return_value={"number": 7}):
+            # The mocked bundle path is not read because _publish_branch is mocked.
+            result = publication.publish_task(
+                self.profile, self.task["id"], database_path=self.database_path,
+                github_call=api, snapshot_fn=snapshot,
+            )
+        self.assertEqual(result["task"]["state"], "READY_FOR_HUMAN_MERGE")
+        self.assertEqual(order, ["deploy-key", "snapshot", "push", "remote", "pr", "snapshot"])
+
+    def test_final_pr_mutations_fail_closed_and_do_not_ready(self):
+        mutations = {
+            "non-draft": {"draft": False},
+            "closed": {"state": "closed"},
+            "wrong-base": {"base": {"ref": "other"}},
+            "wrong-head": {"head": {"ref": self.task_branch, "sha": "0" * 40,
+                                       "repo": {"full_name": self.profile.repository}}},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                database_path = self.root / (label + ".sqlite3")
+                # Copy the fixture database so each mutation is independent.
+                with control_db.open_database(database_path) as destination, \
+                     control_db.ControlPlaneDatabase.open_readonly(self.database_path) as source:
+                    source.connection.backup(destination.connection)
+                exact = {"number": 7, "state": "open", "draft": True,
+                         "head": {"ref": self.task_branch, "sha": self.head,
+                                  "repo": {"full_name": self.profile.repository}},
+                         "base": {"ref": "master"}}
+                for key, value in mutation.items():
+                    exact[key] = value
+                @contextlib.contextmanager
+                def key_context(*_args):
+                    with tempfile.NamedTemporaryFile() as stream:
+                        yield pathlib.Path(stream.name), {"id": 4, "fingerprint": "SHA256:key"}
+                def api(_profile, _token, method, path, body=None):
+                    return exact
+                with mock.patch.object(publication, "canonical_publication_remote", return_value=str(self.remote)), \
+                     mock.patch.object(publication, "verified_private_key", side_effect=key_context), \
+                     mock.patch.object(publication, "read_secret", return_value="token"), \
+                     mock.patch.object(publication, "reconcile_pull_request", return_value={"number": 7}), \
+                     mock.patch.object(publication, "_ruleset_snapshot", return_value={"ruleset_id": 9, "fingerprint": "a" * 64}):
+                    with self.assertRaises(publication.PublicationError):
+                        publication.publish_task(self.profile, self.task["id"], database_path=database_path,
+                                                 github_call=api)
+                with control_db.ControlPlaneDatabase.open_readonly(database_path) as database:
+                    self.assertEqual(database.read_task(self.task["id"])["state"], "ARCHIVIST")
+                    self.assertTrue(database.connection.execute(
+                        "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open'",
+                        (self.task["id"],),
+                    ).fetchone())
+
+    def test_handled_failures_compensate_and_keyboard_interrupt_retains_started(self):
+        database_path = self.root / "crash.sqlite3"
+        with control_db.open_database(database_path) as destination, \
+             control_db.ControlPlaneDatabase.open_readonly(self.database_path) as source:
+            source.connection.backup(destination.connection)
+
+        with mock.patch.object(publication, "read_secret", side_effect=RuntimeError("missing credential")):
+            with self.assertRaises(publication.PublicationError):
+                publication.publish_task(self.profile, self.task["id"], database_path=self.database_path)
+        with control_db.ControlPlaneDatabase.open_readonly(self.database_path) as database:
+            self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "failed")
+            self.assertTrue(database.connection.execute(
+                "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open'",
+                (self.task["id"],),
+            ).fetchone())
+
+        with mock.patch.object(publication, "read_secret", return_value="token"), \
+             mock.patch.object(publication, "_generate_bundle", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                publication.publish_task(self.profile, self.task["id"], database_path=database_path)
+        with control_db.ControlPlaneDatabase.open_readonly(database_path) as database:
+            self.assertEqual(database.read_publication(self.task["id"])["publication_status"], "started")
+
+    def test_pre_intent_failure_records_blocker_without_publication_intent(self):
+        with self.assertRaises(publication.PublicationError):
+            publication.publish_task(
+                self.profile, self.task["id"], database_path=self.database_path,
+                deployment_check=lambda _profile: (_ for _ in ()).throw(RuntimeError("coherence")),
+            )
+        with control_db.ControlPlaneDatabase.open_readonly(self.database_path) as database:
+            self.assertIsNone(database.read_publication(self.task["id"]))
+            self.assertTrue(database.connection.execute(
+                "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open'",
+                (self.task["id"],),
+            ).fetchone())
+
+    def test_key_adoption_uses_the_stable_private_key_boundary(self):
+        key_path = self.root / "publication-ssh-key"
+        key_path.write_bytes(b"existing-key")
+        stable_path = self.root / "stable-key"
+        with stable_path.open("wb") as stream:
+            stream.write(b"stable-key")
+        @contextlib.contextmanager
+        def stable(_profile):
+            yield stable_path
+        with mock.patch.object(provision_publication_key, "resolve_project", return_value=self.profile), \
+             mock.patch.object(provision_publication_key, "publication_key_path", return_value=key_path), \
+             mock.patch.object(provision_publication_key, "stable_private_key", side_effect=stable), \
+             mock.patch.object(provision_publication_key, "public_key_from_private", return_value="ssh-ed25519 AAAA") as derive, \
+             mock.patch.object(provision_publication_key, "public_key_fingerprint", return_value="SHA256:key"):
+            self.assertEqual(provision_publication_key.main(["--project", "demo", "--adopt"]), 0)
+        derive.assert_called_once_with(stable_path)
+
+    @unittest.skipUnless(os.name != "nt", "mode and special-file probes require POSIX semantics")
+    def test_key_boundary_rejects_unsafe_adoption_inputs(self):
+        key_path = self.root / "publication-ssh-key"
+        key_path.write_bytes(b"not-a-key")
+        with mock.patch.object(publication_key, "publication_key_path", return_value=key_path):
+            os.chmod(key_path, 0o644)
+            with self.assertRaises(publication_key.PublicationKeyError):
+                with publication_key.stable_private_key(self.profile):
+                    pass
+            os.chmod(key_path, 0o600)
+            with publication_key.stable_private_key(self.profile) as stable:
+                with self.assertRaises(publication_key.PublicationKeyError):
+                    publication_key.public_key_from_private(stable)
+            link_path = self.root / "symlink-key"
+            link_path.symlink_to(key_path)
+            with mock.patch.object(publication_key, "publication_key_path", return_value=link_path):
+                with self.assertRaises(publication_key.PublicationKeyError):
+                    with publication_key.stable_private_key(self.profile):
+                        pass
+            fifo_path = self.root / "fifo-key"
+            os.mkfifo(fifo_path)
+            with mock.patch.object(publication_key, "publication_key_path", return_value=fifo_path):
+                with self.assertRaises(publication_key.PublicationKeyError):
+                    with publication_key.stable_private_key(self.profile):
+                        pass
 
     def test_start_does_not_read_publication_api_credential(self):
         import project

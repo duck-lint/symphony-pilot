@@ -51,9 +51,10 @@ def ruleset_applies(ruleset: dict[str, object], default_branch: str) -> bool:
     exclude = refs.get("exclude") if isinstance(refs, dict) else None
     if not isinstance(include, list):
         return False
-    if not isinstance(exclude, list) or any(not isinstance(value, str) for value in exclude):
-        return False
-    if "~DEFAULT_BRANCH" in exclude or f"refs/heads/{default_branch}" in exclude:
+    # GitHub exclusions are pattern expressions. Step 7 deliberately supports
+    # no exclusions until a separately reviewed matcher exists; rejecting the
+    # entire non-empty field avoids pretending exact-string checks are safe.
+    if exclude != []:
         return False
     return "~DEFAULT_BRANCH" in include or f"refs/heads/{default_branch}" in include
 

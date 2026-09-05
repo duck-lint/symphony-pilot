@@ -14,7 +14,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
 from prepare_workspace import PreparationError, publication_key_path  # noqa: E402
-from publication_key import public_key_fingerprint, public_key_from_private  # noqa: E402
+from publication_key import (public_key_fingerprint, public_key_from_private,
+                             stable_private_key)  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
 
 
@@ -26,18 +27,22 @@ def main(argv=None) -> int:
     try:
         profile = resolve_project(args.project, ROOT / "projects")
         path = publication_key_path(profile)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
         if path.exists() or path.is_symlink():
             if not args.adopt:
                 raise PreparationError(
                     "publication_key",
                     "publication key already exists; use --adopt for explicit verification",
                 )
-            public = public_key_from_private(path)
+            # Adoption uses the same nofollow, regular-file, mode, size, and
+            # Ed25519 validation boundary as publication itself. ssh-keygen
+            # receives only the stable host-owned temporary copy.
+            with stable_private_key(profile) as stable:
+                public = public_key_from_private(stable)
             print(f"adopted publication key for {profile.slug}: {public}")
             print(f"fingerprint: {public_key_fingerprint(public)}")
             return 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
         executable = shutil.which("ssh-keygen")
         if not executable or not pathlib.Path(executable).is_absolute():
             raise PreparationError("publication_key", "host ssh-keygen is unavailable")
