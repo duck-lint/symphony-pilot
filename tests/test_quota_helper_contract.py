@@ -94,6 +94,71 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertNotIn("Resize-VHD", recipe)
         self.assertNotIn("Invoke-Expression", recipe)
 
+    def test_wsl_vhd_capability_uses_help_grammar_not_exit_status(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        capability_start = recipe.index("function Assert-WslVhdCapability")
+        parser_start = recipe.index("function Test-WslOptionToken")
+        capability = recipe[capability_start:parser_start]
+        self.assertIn('Invoke-WslText @("--help")', capability)
+        self.assertIn("Test-WslVhdHelpGrammar", capability)
+        self.assertNotIn("ExitCode -ne 0", capability)
+        attach_main = recipe[recipe.index('Ensure-OperatorStateNamespace ($Operation -eq "Attach")'):]
+        self.assertLess(
+            attach_main.index("Assert-WslVhdCapability"),
+            attach_main.index("Get-VhdEvidence $true"),
+        )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_wsl_vhd_help_parser_accepts_nonzero_help_and_rejects_ambiguous_grammar(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        parser_start = recipe.index("function Test-WslOptionToken")
+        parser_end = recipe.index("function Throw-ReconciliationRequired")
+        parser = recipe[parser_start:parser_end]
+        capability_start = recipe.index("function Assert-WslVhdCapability")
+        capability = recipe[capability_start:parser_start]
+        command = f'''$ErrorActionPreference = "Stop"
+function Invoke-WslText {{
+    [pscustomobject]@{{ ExitCode = -1; Output = $script:helpText }}
+}}
+{parser}
+{capability}
+$complete = @'
+Usage: wsl [options]
+  --mount <Disk>
+      --vhd
+      --bare
+  --unmount <Disk>
+  --import <Distribution> <InstallLocation> [options]
+      --vhd
+'@
+$script:helpText = -join ($complete.ToCharArray() | ForEach-Object {{ [string]$_ + [char]0 }})
+Assert-WslVhdCapability
+$script:helpText = $complete
+if (-not (Test-WslVhdHelpGrammar $complete)) {{ exit 1 }}
+if (Test-WslVhdHelpGrammar ($complete -replace '  --mount <Disk>', '  --mountx <Disk>')) {{ exit 1 }}
+if (Test-WslVhdHelpGrammar ($complete -replace '      --vhd', '      --vhx')) {{ exit 1 }}
+if (Test-WslVhdHelpGrammar ($complete -replace '      --bare', '      --barx')) {{ exit 1 }}
+if (Test-WslVhdHelpGrammar ($complete -replace '  --unmount <Disk>', '  --unmountx <Disk>')) {{ exit 1 }}
+$unrelated = @'
+Usage: wsl [options]
+  --mount <Disk>
+      attaches a disk
+  --unmount <Disk>
+  --import <Distribution> <InstallLocation> [options]
+      --vhd
+      --bare
+'@
+if (Test-WslVhdHelpGrammar $unrelated) {{ exit 1 }}
+if (Test-WslVhdHelpGrammar "") {{ exit 1 }}
+"WSL help grammar parser: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WSL help grammar parser: PASS", result.stdout)
+
     def test_vhdx_operator_state_acl_contract_is_explicit(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         self.assertIn("Ensure-OperatorStateNamespace", recipe)

@@ -253,10 +253,73 @@ function Get-VhdEvidence {
 
 function Assert-WslVhdCapability {
     $result = Invoke-WslText @("--help")
-    if ($result.ExitCode -ne 0 -or $result.Output -notmatch "--vhd" -or
-        $result.Output -notmatch "--unmount") {
+    # The help process exit status is not capability evidence: installed WSL
+    # versions can emit valid usage text while returning a nonzero status.
+    if (-not (Test-WslVhdHelpGrammar $result.Output)) {
         throw "installed WSL does not prove direct VHD attach/detach support"
     }
+}
+
+function Test-WslOptionToken {
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory)][string]$Option
+    )
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+    $pattern = "(?m)(?<!\S)" + [regex]::Escape($Option) + "(?!\S)"
+    return [regex]::IsMatch($Text, $pattern)
+}
+
+function Test-WslVhdHelpGrammar {
+    param([AllowNull()][string]$HelpText)
+
+    # PowerShell can expose native wsl.exe help as NUL-interleaved text when
+    # the executable reports UTF-16 output.  Normalize that representation
+    # before parsing option tokens; it does not add or infer any option.
+    $normalizedHelp = if ($null -eq $HelpText) {
+        $null
+    } else {
+        $HelpText.Replace([string][char]0, "")
+    }
+    if ([string]::IsNullOrWhiteSpace($normalizedHelp)) {
+        return $false
+    }
+    foreach ($option in @("--mount", "--vhd", "--bare", "--unmount")) {
+        if (-not (Test-WslOptionToken $normalizedHelp $option)) {
+            return $false
+        }
+    }
+
+    # Keep --vhd and --bare tied to the structured --mount option region when
+    # the help surface provides one.  This prevents an unrelated import/export
+    # option from being mistaken for direct VHD mount support.
+    $lines = @($normalizedHelp -split "`r?`n")
+    $mountIndex = -1
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if (Test-WslOptionToken $lines[$index] "--mount") {
+            $mountIndex = $index
+            break
+        }
+    }
+    if ($mountIndex -lt 0) {
+        return $false
+    }
+    $mountIndent = ([regex]::Match($lines[$mountIndex], '^\s*')).Value.Length
+    $mountRegion = @($lines[$mountIndex])
+    for ($index = $mountIndex + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        $optionMatch = [regex]::Match($line, '^\s*--[A-Za-z0-9-]+(?:\s|$)')
+        if ($optionMatch.Success -and
+            ([regex]::Match($line, '^\s*')).Value.Length -le $mountIndent) {
+            break
+        }
+        $mountRegion += $line
+    }
+    $mountText = $mountRegion -join "`n"
+    return (Test-WslOptionToken $mountText "--vhd") -and
+        (Test-WslOptionToken $mountText "--bare")
 }
 
 function Throw-ReconciliationRequired {
