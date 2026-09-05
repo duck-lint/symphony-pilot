@@ -76,8 +76,10 @@ The shared namespace runner applies a CPU-time limit and uses util-linux
 supervisor before reporting completion, and the fixture verifies that a
 grandchild can no longer modify a task-visible sentinel. Individual file size
 is bounded. Aggregate admission now uses one shared pool reservation ledger,
-but the current root filesystem is rejected and no task is admitted until a
-dedicated kernel-enforced byte/inode domain and task-binding proof are
+separates nominal backing from the filesystem-usable admission ceiling, and
+keeps reservations active until trusted cleanup proof shows that a task quota
+cannot grow. The current root filesystem is rejected and no task is admitted
+until a dedicated kernel-enforced byte/inode domain and task-binding proof are
 available.
 
 This fixture proves the constructor, not live Codex behavior. The real launcher

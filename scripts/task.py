@@ -22,7 +22,9 @@ from control_db import (ControlPlaneDatabase, ControlPlaneError,
                         default_database_path)  # noqa: E402
 from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
-from storage import StorageAdmissionProof, StorageContractError, verify_storage_evidence  # noqa: E402
+from storage import (StorageAdmissionProof, StorageContractError,
+                     task_quota_binding_from_evidence,
+                     verify_storage_evidence)  # noqa: E402
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -109,20 +111,33 @@ def create(args: argparse.Namespace) -> int:
     return 0
 
 
-def verify_profile_storage(profile):
-    """Obtain the fixed Linux proof; never inspect storage with host commands."""
+def verify_profile_storage(profile, identifier: str):
+    """Obtain pool and task proofs through the fixed Linux capability."""
     try:
-        from wsl_adapter import WslAdapterError, inspect_quota
-        evidence = inspect_quota(profile.slug, request_id=f"storage-{profile.slug}-admission")
+        from wsl_adapter import WslAdapterError, admit_task_quota
+        evidence = admit_task_quota(
+            profile.slug, identifier,
+            byte_limit=profile.storage_policy.task_bytes,
+            inode_limit=profile.storage_policy.task_inodes,
+            request_id=f"storage-{profile.slug}-{identifier}-admission",
+        )
     except WslAdapterError as exc:
         raise TaskCommandError(f"trusted storage capability is unavailable: {exc.kind}") from exc
     try:
-        return verify_storage_evidence(
-            profile.slug, evidence, profile.storage_policy,
+        pool_evidence = evidence.get("pool")
+        if not isinstance(pool_evidence, dict):
+            raise StorageContractError("task quota admission has no shared-pool proof")
+        domain = verify_storage_evidence(
+            profile.slug, pool_evidence, profile.storage_policy,
             # The project and T-N paths are children of one shared physical
             # pool; they are not independently mounted storage domains.
             expected_target=str(profile.workspace_root.parent),
         )
+        binding = task_quota_binding_from_evidence(
+            evidence, project=profile.slug, identifier=identifier,
+            policy=profile.storage_policy,
+        )
+        return StorageAdmissionProof(domain=domain, binding=binding)
     except StorageContractError as exc:
         raise TaskCommandError(f"storage admission failed closed: {exc}") from exc
 
@@ -138,11 +153,7 @@ def queue(args: argparse.Namespace) -> int:
         if task["state"] != "PREPARED":
             raise StateConflict("only PREPARED tasks may be queued")
         try:
-            admission = verify_profile_storage(profile)
-            if not isinstance(admission, StorageAdmissionProof):
-                raise TaskCommandError(
-                    "task-specific quota assignment proof is unavailable"
-                )
+            admission = verify_profile_storage(profile, str(task["identifier"]))
             task = database.queue_task_with_storage(
                 task["id"], project_slug=profile.slug,
                 domain=admission.domain, policy=profile.storage_policy,

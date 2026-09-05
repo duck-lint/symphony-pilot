@@ -37,7 +37,8 @@ def verify(args: argparse.Namespace) -> int:
         totals = database.storage_reservation_totals(profile.slug)
     values = capacity_snapshot(
         saved, totals["reserved_bytes"], totals["reserved_inodes"],
-        configured_pool_bytes=profile.storage_policy.pool_bytes,
+        configured_pool_bytes=profile.storage_policy.allocatable_pool_bytes,
+        configured_backing_bytes=profile.storage_policy.pool_bytes,
     )
     print(json.dumps({"project": profile.slug, "domain": saved, "capacity": values}, sort_keys=True))
     return 0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import pathlib
@@ -22,6 +23,7 @@ import prepare_workspace as pw
 import project
 import render_workflow
 import task
+import wsl_adapter
 from storage import StorageAdmissionProof, VerifiedStorageDomain
 from tests.storage_support import admission_proof
 
@@ -167,6 +169,44 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                 blockers = database.read_projection(record["id"])["blockers"]
                 self.assertEqual(len(blockers), 1)
                 self.assertEqual(blockers[0]["kind"], "infrastructure")
+
+    def test_production_storage_verifier_materializes_task_admission(self):
+        profile = dataclasses.replace(
+            self.profile(pathlib.Path("/tmp")),
+            workspace_root=pathlib.PurePosixPath("/home/duck-lint/symphony-workspaces/alpha"),
+        )
+        task_proof = {
+            "schema": "symphony-pilot-task-quota-proof/v1",
+            "identifier": "T-000001",
+            "workspace_path": "/home/duck-lint/symphony-workspaces/alpha/T-000001",
+            "project_id": 1_000_001, "workspace_project_id": 1_000_001,
+            "byte_hard_limit": 8 * 1024 ** 3, "inode_hard_limit": 250_000,
+            "usage": {"bytes": 0, "inodes": 1},
+            "byte_probe": {"attempted": True, "result": "EDQUOT"},
+            "inode_probe": {"attempted": True, "result": "EDQUOT"},
+        }
+        evidence = {
+            "schema": "symphony-pilot-task-quota-admission/v1",
+            "project": "alpha",
+            "pool": {
+                "schema": "symphony-pilot-quota-inspection/v1",
+                "project": "alpha", "scope": "persistent_symphony_workspace_pool",
+                "filesystem": {
+                    "target": "/home/duck-lint/symphony-workspaces", "source": "/dev/vdb",
+                    "fstype": "ext4", "options": "rw,relatime,prjquota",
+                    "statvfs": {"block_size": 4096, "blocks": 16_777_216,
+                                 "free_blocks": 16_000_000, "inodes": 1_000_000,
+                                 "free_inodes": 900_000},
+                },
+                "quota": {"backend": "ext4-project-quota", "mount_support": True},
+                "ownership": {"trusted": True},
+            },
+            "task_quota": task_proof,
+        }
+        with mock.patch.object(wsl_adapter, "admit_task_quota", return_value=evidence):
+            admission = task.verify_profile_storage(profile, "T-000001")
+        self.assertIsInstance(admission, StorageAdmissionProof)
+        self.assertEqual(admission.binding.quota_id, 1_000_001)
 
     def test_rendered_workflow_has_sqlite_scheduler_and_no_github_scheduler_surface(self):
         profile = self.profile(pathlib.Path("/home/operator"))

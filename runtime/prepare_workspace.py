@@ -177,6 +177,7 @@ def load_profile(path: pathlib.Path) -> Profile:
                "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
                "prevent_host_sleep", "notifications_enabled", "display_name",
                "notification_backend", "dashboard_port", "storage_pool_bytes",
+               "storage_allocatable_pool_bytes",
                "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes",
                "storage_emergency_reserve_inodes"}
     unknown = sorted(set(raw) - allowed)
@@ -185,7 +186,8 @@ def load_profile(path: pathlib.Path) -> Profile:
     required = ["slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels", "blocked_label",
                 "max_concurrent_agents", "max_turns", "dashboard_port",
                 "poll_interval_ms", "max_retry_backoff_ms", "codex_model",
-                "codex_reasoning_effort", "storage_pool_bytes", "task_storage_bytes",
+                "codex_reasoning_effort", "storage_pool_bytes", "storage_allocatable_pool_bytes",
+                "task_storage_bytes",
                 "task_storage_inodes", "storage_emergency_reserve_bytes",
                 "storage_emergency_reserve_inodes"]
     missing = [key for key in required if key not in raw]
@@ -232,6 +234,7 @@ def load_profile(path: pathlib.Path) -> Profile:
     try:
         storage_policy = StoragePolicy(
             pool_bytes=raw["storage_pool_bytes"],
+            allocatable_pool_bytes=raw["storage_allocatable_pool_bytes"],
             task_bytes=raw["task_storage_bytes"],
             task_inodes=raw["task_storage_inodes"],
             emergency_reserve_bytes=raw["storage_emergency_reserve_bytes"],

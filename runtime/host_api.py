@@ -179,6 +179,7 @@ class HostControlApplication:
                 "reason": "dedicated kernel quota domain is not verified",
                 "policy": {
                     "pool_bytes": policy.pool_bytes,
+                    "allocatable_pool_bytes": policy.allocatable_pool_bytes,
                     "task_bytes": policy.task_bytes,
                     "task_inodes": policy.task_inodes,
                     "emergency_reserve_bytes": policy.emergency_reserve_bytes,
@@ -189,7 +190,8 @@ class HostControlApplication:
             }
         values = capacity_snapshot(
             domain, reservations["reserved_bytes"], reservations["reserved_inodes"],
-            configured_pool_bytes=policy.pool_bytes,
+            configured_pool_bytes=policy.allocatable_pool_bytes,
+            configured_backing_bytes=policy.pool_bytes,
         )
         return {
             "state": "verified",
@@ -199,6 +201,7 @@ class HostControlApplication:
             "mount_options": domain["mount_options"],
             "policy": {
                 "pool_bytes": policy.pool_bytes,
+                "allocatable_pool_bytes": policy.allocatable_pool_bytes,
                 "task_bytes": policy.task_bytes,
                 "task_inodes": policy.task_inodes,
                 "emergency_reserve_bytes": policy.emergency_reserve_bytes,

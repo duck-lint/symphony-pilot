@@ -131,7 +131,13 @@ grandchild stop modifying a task sentinel. CPU time, process count, address
 space, open files, individual file size, task tmpfs, and wall clock are
 bounded. The managed queue now reserves full task capacity against one shared
 pool and rejects admission unless task-specific kernel byte/inode proof is
-supplied. The current root filesystem is rejected, so unattended activation
-remains blocked pending dedicated-domain provisioning. The constructor is
+supplied. The canary policy distinguishes nominal 64-GiB backing from a
+63-GiB allocatable filesystem ceiling. The fixed adapter's task admission
+operation requires a root-owned, capability-specific quota helper to bind the
+host-derived task project and prove byte/inode `EDQUOT` behavior.
+Reservations cannot be released without trusted proof that the
+exact workspace and quota can no longer grow. The current root filesystem is
+rejected, so unattended activation remains blocked pending dedicated-domain
+and helper provisioning. The constructor is
 exercised independently of Codex; the auth blocker still stops the real
 launcher before App Server start.

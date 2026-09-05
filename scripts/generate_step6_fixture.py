@@ -44,10 +44,12 @@ def queue_fixture_task(database: ControlPlaneDatabase, task: dict[str, object]) 
         quota_id=quota_id, byte_limit=8 * GIB, inode_limit=250_000,
         proof_json=json.dumps({
             "schema": "symphony-pilot-task-quota-proof/v1",
+            "identifier": str(task["identifier"]),
             "project_id": quota_id, "workspace_project_id": quota_id,
             "byte_hard_limit": 8 * GIB, "inode_hard_limit": 250_000,
-            "byte_probe": {"result": "EDQUOT"},
-            "inode_probe": {"result": "EDQUOT"},
+            "usage": {"bytes": 0, "inodes": 1},
+            "byte_probe": {"attempted": True, "result": "EDQUOT"},
+            "inode_probe": {"attempted": True, "result": "EDQUOT"},
         }),
     )
     database.queue_task_with_storage(

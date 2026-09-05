@@ -67,7 +67,7 @@ def validate_profiles(
         seen_ports[profile.dashboard_port] = profile
         policy = profile.storage_policy
         policy_values = (
-            policy.pool_bytes, policy.task_bytes, policy.task_inodes,
+            policy.pool_bytes, policy.allocatable_pool_bytes, policy.task_bytes, policy.task_inodes,
             policy.emergency_reserve_bytes, policy.emergency_reserve_inodes,
         )
         if shared_storage_policy is None:

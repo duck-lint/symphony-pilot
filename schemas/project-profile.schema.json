@@ -3,7 +3,7 @@
   "title": "symphony-pilot project profile",
   "type": "object",
   "additionalProperties": false,
-  "required": ["slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels", "blocked_label", "dashboard_port", "max_concurrent_agents", "max_turns", "poll_interval_ms", "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "storage_pool_bytes", "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes", "storage_emergency_reserve_inodes"],
+  "required": ["slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels", "blocked_label", "dashboard_port", "max_concurrent_agents", "max_turns", "poll_interval_ms", "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "storage_pool_bytes", "storage_allocatable_pool_bytes", "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes", "storage_emergency_reserve_inodes"],
   "properties": {
     "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
     "repository": {"type": "string"},
@@ -25,6 +25,7 @@
     "display_name": {"type": "string"},
     "notification_backend": {"type": "string", "enum": ["windows-toast"]},
     "storage_pool_bytes": {"type": "integer", "minimum": 1},
+    "storage_allocatable_pool_bytes": {"type": "integer", "minimum": 1},
     "task_storage_bytes": {"type": "integer", "minimum": 1},
     "task_storage_inodes": {"type": "integer", "minimum": 1},
     "storage_emergency_reserve_bytes": {"type": "integer", "minimum": 1},

@@ -101,6 +101,37 @@ class SupervisorValidationTests(unittest.TestCase):
             self.assertTrue(evidence["probe_created"])
             self.assertFalse((root / wsl_contained_exec.QUOTA_PROBE_NAME).exists())
 
+    def test_task_quota_admission_returns_fixed_helper_proof(self):
+        pool = {
+            "schema": "symphony-pilot-quota-inspection/v1",
+            "project": "symphony-pilot",
+            "scope": "persistent_symphony_workspace_pool",
+            "filesystem": {"target": "/home/duck-lint/symphony-workspaces"},
+            "ownership": {"trusted": True},
+            "quota": {"backend": "ext4-project-quota", "mount_support": True},
+        }
+        helper = {
+            "schema": "symphony-pilot-task-quota-proof/v1",
+            "identifier": "T-000001",
+            "workspace_path": "/home/duck-lint/symphony-workspaces/symphony-pilot/T-000001",
+            "project_id": 1_000_001, "workspace_project_id": 1_000_001,
+            "byte_hard_limit": 8 * 1024 ** 3, "inode_hard_limit": 250_000,
+            "usage": {"bytes": 0, "inodes": 1},
+            "byte_probe": {"attempted": True, "result": "EDQUOT"},
+            "inode_probe": {"attempted": True, "result": "EDQUOT"},
+        }
+        completed = mock.Mock(returncode=0, stdout=json.dumps(helper))
+        with mock.patch.object(wsl_contained_exec, "_quota_inspection", return_value=pool), \
+             mock.patch.object(wsl_contained_exec, "_quota_helper_fd", return_value=7), \
+             mock.patch("wsl_contained_exec.os.close"), \
+             mock.patch.object(wsl_contained_exec.subprocess, "run", return_value=completed):
+            evidence = wsl_contained_exec._quota_task_admission(
+                "symphony-pilot", "T-000001", 8 * 1024 ** 3, 250_000,
+            )
+        self.assertEqual(evidence["schema"], "symphony-pilot-task-quota-admission/v1")
+        self.assertEqual(evidence["pool"], pool)
+        self.assertEqual(evidence["task_quota"], helper)
+
     def test_writable_mountpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory)

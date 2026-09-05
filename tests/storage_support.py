@@ -15,10 +15,13 @@ def admission_proof(domain: VerifiedStorageDomain, *, identifier: str) -> Storag
         quota_id=quota_id, byte_limit=8 * GIB, inode_limit=250_000,
         proof_json=json.dumps({
             "schema": "symphony-pilot-task-quota-proof/v1",
+            "identifier": identifier,
+            "workspace_path": f"/home/duck-lint/symphony-workspaces/{project}/{identifier}",
             "project_id": quota_id, "workspace_project_id": quota_id,
             "byte_hard_limit": 8 * GIB, "inode_hard_limit": 250_000,
-            "byte_probe": {"result": "EDQUOT"},
-            "inode_probe": {"result": "EDQUOT"},
+            "usage": {"bytes": 0, "inodes": 1},
+            "byte_probe": {"attempted": True, "result": "EDQUOT"},
+            "inode_probe": {"attempted": True, "result": "EDQUOT"},
         }),
     )
     return StorageAdmissionProof(domain=domain, binding=binding)

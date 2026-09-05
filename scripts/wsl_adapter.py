@@ -51,6 +51,7 @@ CONTAINED_ENTRYPOINT = (
 )
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
+_TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
 _WINDOWS_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
 _WINDOWS_EXECUTABLE = re.compile(r"(?i)^(?:cmd|powershell|pwsh|wsl|docker)(?:\.exe)?$")
 
@@ -423,6 +424,54 @@ def inspect_quota(
         raise WslAdapterError("quota_inspection", "trusted Linux quota inspection returned malformed JSON") from exc
     if not isinstance(value, dict) or value.get("schema") != "symphony-pilot-quota-inspection/v1":
         raise WslAdapterError("quota_inspection", "trusted Linux quota inspection returned an unsupported shape")
+    return value
+
+
+def admit_task_quota(
+    project: str, identifier: str, *, byte_limit: int, inode_limit: int,
+    timeout_seconds: float = 30, request_id: str | None = None,
+) -> dict[str, object]:
+    """Use only the fixed Linux task-quota admission capability.
+
+    The capability-specific helper performs the privileged filesystem
+    binding and EDQUOT probes.  This adapter never exposes a general command
+    or provisioning surface and never accepts a caller-selected quota ID.
+    """
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        raise WslAdapterError("invalid_timeout", "timeout is outside the bounded adapter range")
+    _validate_storage_project(project)
+    if not isinstance(identifier, str) or not _TASK_IDENTIFIER.fullmatch(identifier):
+        raise WslAdapterError("invalid_task_identity", "task identifier is malformed")
+    if (isinstance(byte_limit, bool) or not isinstance(byte_limit, int) or byte_limit <= 0 or
+            isinstance(inode_limit, bool) or not isinstance(inode_limit, int) or inode_limit <= 0):
+        raise WslAdapterError("invalid_quota_policy", "task quota limits are malformed")
+    request_id = request_id or uuid.uuid4().hex
+    _validate_request_id(request_id)
+    wsl = _host_wsl_executable()
+    command = _raw_command(wsl, [
+        "/usr/bin/env", "-i",
+        "HOME=/home/duck-lint", "USER=duck-lint", "LOGNAME=duck-lint",
+        "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
+        "/usr/bin/python3", "-B", CONTAINED_ENTRYPOINT,
+        "--control", "quota-admit-task", "--project", project,
+        "--identifier", identifier, "--byte-limit", str(byte_limit),
+        "--inode-limit", str(inode_limit),
+    ], "/")
+    result = _bounded_process(
+        command, float(timeout_seconds), cwd="/", metadata=(request_id, project, FIXED_DISTRO)
+    )
+    _raise_if_wsl_transport_failed(result)
+    if result.returncode != 0 or result.timed_out:
+        raise WslAdapterError("quota_admission", "trusted Linux task quota admission failed")
+    try:
+        value = json.loads(result.stdout)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise WslAdapterError("quota_admission", "trusted task quota admission returned malformed JSON") from exc
+    if (not isinstance(value, dict) or
+            set(value) != {"schema", "project", "pool", "task_quota"} or
+            value.get("schema") != "symphony-pilot-task-quota-admission/v1" or
+            value.get("project") != project):
+        raise WslAdapterError("quota_admission", "trusted task quota admission returned an unsupported shape")
     return value
 
 

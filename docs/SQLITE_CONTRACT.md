@@ -55,10 +55,27 @@ An absent database is created and migrated transactionally. A newer version,
 partial migration, missing table/column, unexpected persistent object, or invalid
 migration history fails closed. Reopening an accepted database is idempotent.
 Version 2 adds the host-owned verified shared-pool snapshot and per-task
-full-capacity reservation ledger. A reservation is admission accounting only;
-the task cannot queue unless the fixed Linux capability has already supplied
-both a task-specific identity/limit binding and proof of kernel-enforced byte
-and inode hard limits.
+full-capacity reservation ledger. `storage_pool_bytes` is the nominal fixed
+backing capacity; `storage_allocatable_pool_bytes` is the deliberately lower
+filesystem-usable admission ceiling. A reservation is admission accounting
+only; the task cannot queue unless the fixed Linux capability has already
+supplied both a task-specific identity/limit binding and proof of
+kernel-enforced byte and inode hard limits.
+
+The initial canary policy is a nominal 64-GiB backing domain with a 63-GiB
+allocatable filesystem ceiling. The one-GiB difference is explicit policy
+headroom for ext4 metadata and is not permission to expand the backing domain.
+The fixed adapter's task admission operation calls only the reviewed,
+root-owned capability-specific quota helper at
+`/usr/libexec/symphony-pilot/quota-admit-task`; absence or unsafe identity of
+that helper fails closed.
+
+Reservations remain active while a retained workspace or quota can grow.
+The trusted database release primitive therefore requires capability-produced
+proof that the exact workspace is destroyed, its project quota is removed, and
+zero further growth is possible. Physical usage observed after a release is
+still an admission constraint; releasing a ledger row never erases bytes that
+remain on the shared pool.
 
 Every writable connection explicitly enables:
 

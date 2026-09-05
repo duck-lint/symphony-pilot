@@ -18,6 +18,7 @@ notifications_enabled = true
 display_name = "CLEANROOM"
 notification_backend = "windows-toast"
 storage_pool_bytes = 68719476736
+storage_allocatable_pool_bytes = 67645734912
 task_storage_bytes = 8589934592
 task_storage_inodes = 250000
 storage_emergency_reserve_bytes = 8589934592

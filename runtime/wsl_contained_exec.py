@@ -33,7 +33,16 @@ COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_PROFILE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 WORKSPACE_ROOT = pathlib.PurePosixPath("/home/duck-lint/symphony-workspaces")
 QUOTA_INSPECTION_SCHEMA = "symphony-pilot-quota-inspection/v1"
+QUOTA_ADMISSION_SCHEMA = "symphony-pilot-task-quota-admission/v1"
 QUOTA_PROBE_NAME = ".symphony-quota-inspection-probe"
+TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
+# This is a capability-specific, operator-installed executable.  It is not a
+# command broker: it accepts one host-derived task identity and fixed policy
+# limits, binds the workspace to that project quota, and returns bounded
+# kernel evidence.  Missing or unsafe installation fails closed.
+QUOTA_HELPER_PATH = pathlib.PurePosixPath(
+    "/usr/libexec/symphony-pilot/quota-admit-task"
+)
 
 
 class ContainmentError(RuntimeError):
@@ -297,9 +306,7 @@ def _quota_inspection(project: str) -> dict[str, object]:
             # require the separate trusted provisioning/verifier proof.
             "quota": {
                 "backend": "ext4-project-quota" if project_quota else None,
-                "identity_applicable": False,
-                "byte_hard_limit_enforced": False,
-                "inode_hard_limit_enforced": False,
+                "mount_support": project_quota,
             },
         }
     finally:
@@ -308,6 +315,99 @@ def _quota_inspection(project: str) -> dict[str, object]:
                 os.rmdir(probe)
             except OSError as exc:
                 raise ContainmentError("quota_workspace", "inert quota inspection probe could not be removed") from exc
+
+
+def _quota_helper_fd() -> int:
+    """Open the fixed root-owned helper without following a replacement link."""
+    try:
+        fd = os.open(
+            str(QUOTA_HELPER_PATH),
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise ContainmentError("quota_provisioning", "task quota helper is unavailable") from exc
+    try:
+        metadata = os.fstat(fd)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
+                metadata.st_mode & 0o022 or not metadata.st_mode & 0o111):
+            raise ContainmentError("quota_provisioning", "task quota helper is not a trusted executable")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _validate_task_quota_result(
+    result: object, *, project: str, identifier: str,
+    byte_limit: int, inode_limit: int,
+) -> dict[str, object]:
+    """Validate only the fixed helper's task-proof wire shape."""
+    if not isinstance(result, dict) or result.get("schema") != "symphony-pilot-task-quota-proof/v1":
+        raise ContainmentError("quota_provisioning", "task quota helper returned unsupported evidence")
+    required = {
+        "schema", "identifier", "workspace_path", "project_id", "workspace_project_id",
+        "byte_hard_limit", "inode_hard_limit", "usage", "byte_probe", "inode_probe",
+    }
+    if set(result) != required:
+        raise ContainmentError("quota_provisioning", "task quota helper returned incomplete evidence")
+    expected_id = 1_000_000 + int(identifier[2:])
+    expected_path = f"/home/duck-lint/symphony-workspaces/{project}/{identifier}"
+    if (result["identifier"] != identifier or result["workspace_path"] != expected_path or
+            result["project_id"] != expected_id or result["workspace_project_id"] != expected_id or
+            result["byte_hard_limit"] != byte_limit or result["inode_hard_limit"] != inode_limit):
+        raise ContainmentError("quota_provisioning", "task quota helper returned mismatched identity or limits")
+    usage = result["usage"]
+    if (not isinstance(usage, dict) or set(usage) != {"bytes", "inodes"} or
+            any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in usage.values())):
+        raise ContainmentError("quota_provisioning", "task quota usage evidence is malformed")
+    for field in ("byte_probe", "inode_probe"):
+        probe = result[field]
+        if (not isinstance(probe, dict) or set(probe) != {"attempted", "result"} or
+                probe["attempted"] is not True or probe["result"] != "EDQUOT"):
+            raise ContainmentError("quota_provisioning", "task quota hard-limit probe is not proven")
+    return result
+
+
+def _quota_task_admission(
+    project: str, identifier: str, byte_limit: int, inode_limit: int,
+) -> dict[str, object]:
+    """Bind one task through the fixed privileged quota capability."""
+    if not TASK_IDENTIFIER.fullmatch(identifier):
+        raise ContainmentError("quota_identity", "task identifier is malformed")
+    if (isinstance(byte_limit, bool) or not isinstance(byte_limit, int) or byte_limit <= 0 or
+            isinstance(inode_limit, bool) or not isinstance(inode_limit, int) or inode_limit <= 0):
+        raise ContainmentError("quota_policy", "task quota limits are malformed")
+    pool = _quota_inspection(project)
+    fd = _quota_helper_fd()
+    try:
+        try:
+            result = subprocess.run(
+                [f"/proc/self/fd/{fd}", "--project", project, "--identifier", identifier,
+                 "--byte-limit", str(byte_limit), "--inode-limit", str(inode_limit)],
+                capture_output=True, text=True, timeout=10, check=False,
+                pass_fds=(fd,), executable=f"/proc/self/fd/{fd}",
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ContainmentError("quota_provisioning", "task quota helper did not complete") from exc
+    finally:
+        os.close(fd)
+    if result.returncode or len(result.stdout.encode("utf-8")) > 1024 * 1024:
+        raise ContainmentError("quota_provisioning", "task quota helper failed")
+    try:
+        helper_evidence = json.loads(result.stdout)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ContainmentError("quota_provisioning", "task quota helper returned malformed JSON") from exc
+    task = _validate_task_quota_result(
+        helper_evidence, project=project, identifier=identifier,
+        byte_limit=byte_limit, inode_limit=inode_limit,
+    )
+    return {
+        "schema": QUOTA_ADMISSION_SCHEMA,
+        "project": project,
+        "pool": pool,
+        "task_quota": task,
+    }
 
 
 def _contained_cwd(project_root: pathlib.Path, cwd: str) -> str:
@@ -445,24 +545,39 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--cwd")
-    parser.add_argument("--control", choices=("quota-inspect-root",))
+    parser.add_argument("--control", choices=("quota-inspect-root", "quota-admit-task"))
+    parser.add_argument("--identifier")
+    parser.add_argument("--byte-limit", type=int)
+    parser.add_argument("--inode-limit", type=int)
     parser.add_argument("--wall-seconds", type=float, default=30 * 60)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
         if args.control == "quota-inspect-root":
-            if args.cwd is not None or command:
+            if (args.cwd is not None or command or args.identifier is not None or
+                    args.byte_limit is not None or args.inode_limit is not None):
                 raise ContainmentError("control", "quota inspection arguments are malformed")
             # Control operations are still trusted deployment operations.  Do
             # not let their fixed nature bypass the manifest and inventory
             # gate that protects normal contained execution.
             deployment_root = _deployment_root()
             _validate_deployment(deployment_root)
+        elif args.control == "quota-admit-task":
+            if (args.cwd is not None or command or args.identifier is None or
+                    args.byte_limit is None or args.inode_limit is None):
+                raise ContainmentError("control", "quota admission arguments are malformed")
+            deployment_root = _deployment_root()
+            _validate_deployment(deployment_root)
         elif args.cwd is None or not command:
             raise ContainmentError("command", "contained command is required")
         if args.control == "quota-inspect-root":
             print(json.dumps(_quota_inspection(args.project), sort_keys=True))
+            return 0
+        if args.control == "quota-admit-task":
+            print(json.dumps(_quota_task_admission(
+                args.project, args.identifier, args.byte_limit, args.inode_limit,
+            ), sort_keys=True))
             return 0
         return run(args.project, args.cwd, command, args.wall_seconds)
     except Exception as exc:

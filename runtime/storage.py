@@ -18,6 +18,8 @@ GIB = 1024 ** 3
 STORAGE_INSPECTION_SCHEMA = "symphony-pilot-quota-inspection/v1"
 STORAGE_SCOPE = "persistent_symphony_workspace_pool"
 STORAGE_POOL_ROOT = "/home/duck-lint/symphony-workspaces"
+TASK_QUOTA_ADMISSION_SCHEMA = "symphony-pilot-task-quota-admission/v1"
+TASK_QUOTA_RELEASE_SCHEMA = "symphony-pilot-task-quota-release/v1"
 STORAGE_BYTES_MIN = 1
 STORAGE_INODES_MIN = 1
 
@@ -36,6 +38,7 @@ class StoragePolicy:
     """
 
     pool_bytes: int = 64 * GIB
+    allocatable_pool_bytes: int = 63 * GIB
     task_bytes: int = 8 * GIB
     task_inodes: int = 250_000
     emergency_reserve_bytes: int = 8 * GIB
@@ -43,7 +46,8 @@ class StoragePolicy:
 
     def validate(self) -> "StoragePolicy":
         byte_values = (
-            self.pool_bytes, self.task_bytes, self.emergency_reserve_bytes,
+            self.pool_bytes, self.allocatable_pool_bytes, self.task_bytes,
+            self.emergency_reserve_bytes,
         )
         inode_values = (self.task_inodes, self.emergency_reserve_inodes)
         if any(isinstance(value, bool) or not isinstance(value, int) or value < STORAGE_BYTES_MIN
@@ -54,12 +58,14 @@ class StoragePolicy:
             raise StorageContractError("storage inode policy values must be positive integers")
         if self.task_bytes > self.pool_bytes:
             raise StorageContractError("task storage bytes exceed the fixed storage pool")
+        if self.allocatable_pool_bytes > self.pool_bytes:
+            raise StorageContractError("allocatable storage exceeds nominal backing capacity")
         if self.emergency_reserve_bytes < self.task_bytes:
             raise StorageContractError("emergency byte reserve must cover one full task")
         if self.emergency_reserve_inodes < self.task_inodes:
             raise StorageContractError("emergency inode reserve must cover one full task")
-        if self.task_bytes + self.emergency_reserve_bytes > self.pool_bytes:
-            raise StorageContractError("task plus emergency reserve exceeds the fixed storage pool")
+        if self.task_bytes + self.emergency_reserve_bytes > self.allocatable_pool_bytes:
+            raise StorageContractError("task plus emergency reserve exceeds allocatable capacity")
         return self
 
 
@@ -106,6 +112,17 @@ class StorageAdmissionProof:
     binding: TaskQuotaBinding
 
 
+@dataclasses.dataclass(frozen=True)
+class StorageReleaseProof:
+    """Trusted evidence that a task can no longer grow in the pool."""
+
+    project: str
+    identifier: str
+    workspace_path: str
+    quota_id: int
+    proof_json: str
+
+
 def _positive_integer(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise StorageContractError(f"storage evidence field {field} is not a non-negative integer")
@@ -125,7 +142,7 @@ def verify_storage_evidence(
     *,
     expected_target: str,
 ) -> VerifiedStorageDomain:
-    """Accept only the shared pool with demonstrated hard quota limits."""
+    """Accept only the shared pool mount and its bounded physical evidence."""
     policy.validate()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", project):
         raise StorageContractError("storage project identity is malformed")
@@ -161,8 +178,10 @@ def verify_storage_evidence(
         raise StorageContractError("storage statvfs capacities are inconsistent")
     pool_bytes = block_size * blocks
     free_bytes = block_size * free_blocks
-    if pool_bytes < policy.pool_bytes:
-        raise StorageContractError("dedicated storage pool is smaller than its configured policy")
+    if pool_bytes > policy.pool_bytes:
+        raise StorageContractError("filesystem usable capacity exceeds nominal backing capacity")
+    if pool_bytes < policy.allocatable_pool_bytes:
+        raise StorageContractError("filesystem usable capacity is below allocatable policy capacity")
     if inodes < policy.task_inodes + policy.emergency_reserve_inodes:
         raise StorageContractError("dedicated storage pool lacks inode headroom")
 
@@ -171,12 +190,8 @@ def verify_storage_evidence(
         raise StorageContractError("storage evidence has no quota enforcement proof")
     if quota.get("backend") != "ext4-project-quota":
         raise StorageContractError("unsupported storage quota backend")
-    if quota.get("identity_applicable") is not True:
-        raise StorageContractError("task project quota identity is not proven applicable")
-    if quota.get("byte_hard_limit_enforced") is not True:
-        raise StorageContractError("task byte hard-limit enforcement is not proven")
-    if quota.get("inode_hard_limit_enforced") is not True:
-        raise StorageContractError("task inode hard-limit enforcement is not proven")
+    if quota.get("mount_support") is not True:
+        raise StorageContractError("storage project-quota mount support is not proven")
     ownership = evidence.get("ownership")
     if not isinstance(ownership, Mapping) or ownership.get("trusted") is not True:
         raise StorageContractError("storage-domain ownership is not trusted")
@@ -240,9 +255,85 @@ def validate_task_quota_binding(
     return binding
 
 
+def task_quota_binding_from_evidence(
+    evidence: Mapping[str, object], *, project: str, identifier: str,
+    policy: StoragePolicy,
+) -> TaskQuotaBinding:
+    """Construct a binding only from the fixed adapter's bounded proof."""
+    policy.validate()
+    if evidence.get("schema") != TASK_QUOTA_ADMISSION_SCHEMA:
+        raise StorageContractError("task quota admission evidence schema is unsupported")
+    if evidence.get("project") != project:
+        raise StorageContractError("task quota admission belongs to another project")
+    task = evidence.get("task_quota")
+    if not isinstance(task, Mapping):
+        raise StorageContractError("task quota admission evidence is missing task proof")
+    binding = TaskQuotaBinding(
+        project=project,
+        identifier=identifier,
+        workspace_path=task.get("workspace_path", ""),
+        quota_id=task.get("project_id", -1),
+        byte_limit=task.get("byte_hard_limit", -1),
+        inode_limit=task.get("inode_hard_limit", -1),
+        proof_json=json.dumps(dict(task), sort_keys=True, separators=(",", ":")),
+    )
+    if task.get("identifier") != identifier:
+        raise StorageContractError("task quota admission identifier is not host-derived")
+    return validate_task_quota_binding(binding, project=project, identifier=identifier, policy=policy)
+
+
+def validate_storage_release_proof(
+    proof: object, *, project: str, identifier: str,
+) -> StorageReleaseProof:
+    """Require destruction/sealing evidence before releasing commitment."""
+    if not isinstance(proof, StorageReleaseProof):
+        raise StorageContractError("storage reservation release requires trusted cleanup proof")
+    expected_id = derive_quota_id(identifier)
+    expected_path = f"{STORAGE_POOL_ROOT}/{project}/{identifier}"
+    if (proof.project != project or proof.identifier != identifier or
+            proof.workspace_path != expected_path or proof.quota_id != expected_id):
+        raise StorageContractError("storage cleanup proof identity is not host-derived")
+    try:
+        evidence = json.loads(proof.proof_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StorageContractError("storage cleanup proof is malformed") from exc
+    if not isinstance(evidence, Mapping) or evidence.get("schema") != TASK_QUOTA_RELEASE_SCHEMA:
+        raise StorageContractError("storage cleanup proof schema is unsupported")
+    if (evidence.get("workspace_state") != "destroyed" or
+            evidence.get("quota_state") != "removed" or
+            evidence.get("growth_possible") is not False or
+            evidence.get("remaining_bytes") != 0 or
+            evidence.get("remaining_inodes") != 0):
+        raise StorageContractError("storage cleanup proof does not stop future growth")
+    if evidence.get("project_id") != expected_id or evidence.get("workspace_path") != expected_path:
+        raise StorageContractError("storage cleanup proof does not match the task")
+    return proof
+
+
+def storage_release_proof_from_evidence(
+    evidence: Mapping[str, object], *, project: str, identifier: str,
+) -> StorageReleaseProof:
+    """Materialize cleanup authority only from fixed-capability evidence."""
+    if evidence.get("schema") != TASK_QUOTA_RELEASE_SCHEMA or evidence.get("project") != project:
+        raise StorageContractError("storage cleanup evidence is unsupported")
+    expected_id = derive_quota_id(identifier)
+    expected_path = f"{STORAGE_POOL_ROOT}/{project}/{identifier}"
+    proof = StorageReleaseProof(
+        project=project,
+        identifier=identifier,
+        workspace_path=evidence.get("workspace_path", ""),
+        quota_id=evidence.get("project_id", -1),
+        proof_json=json.dumps(dict(evidence), sort_keys=True, separators=(",", ":")),
+    )
+    if proof.quota_id != expected_id or proof.workspace_path != expected_path:
+        raise StorageContractError("storage cleanup evidence identity is not host-derived")
+    return proof
+
+
 def capacity_snapshot(
     domain: Mapping[str, object], reserved_bytes: int, reserved_inodes: int,
     *, configured_pool_bytes: int | None = None,
+    configured_backing_bytes: int | None = None,
 ) -> dict[str, int | str]:
     """Calculate non-overlapping physical and reservation capacity values.
 
@@ -253,6 +344,7 @@ def capacity_snapshot(
     """
     observed_pool_bytes = int(domain["pool_bytes"])
     pool_bytes = observed_pool_bytes if configured_pool_bytes is None else configured_pool_bytes
+    backing_bytes = observed_pool_bytes if configured_backing_bytes is None else configured_backing_bytes
     pool_inodes = int(domain["pool_inodes"])
     free_bytes = int(domain["free_bytes"])
     free_inodes = int(domain["free_inodes"])
@@ -262,6 +354,9 @@ def capacity_snapshot(
     uncommitted_inodes = max(0, pool_inodes - reserved_inodes)
     return {
         "pool_bytes": pool_bytes,
+        "backing_pool_bytes": backing_bytes,
+        "filesystem_usable_bytes": observed_pool_bytes,
+        "allocatable_pool_bytes": pool_bytes,
         "pool_inodes": pool_inodes,
         "used_bytes": used_bytes,
         "used_inodes": used_inodes,

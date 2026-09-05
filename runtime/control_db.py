@@ -1042,13 +1042,15 @@ class ControlPlaneDatabase:
             ).fetchone()
             used_bytes = domain.pool_bytes - domain.free_bytes
             used_inodes = domain.pool_inodes - domain.free_inodes
-            if used_bytes > policy.pool_bytes:
-                raise StateConflict("observed storage usage exceeds the configured fixed pool")
+            if used_bytes > policy.allocatable_pool_bytes:
+                # Physical usage outside the reservation ledger remains an
+                # admission constraint; release cannot make it disappear.
+                raise StateConflict("observed storage usage exceeds allocatable pool capacity")
             # statvfs free space already reflects bytes/inodes used by
             # reserved tasks. Compare physical free capacity with the
             # uncommitted reservation capacity instead of subtracting both.
             available_bytes = min(
-                domain.free_bytes, policy.pool_bytes - int(reserved[0])
+                domain.free_bytes, policy.allocatable_pool_bytes - int(reserved[0])
             ) - policy.task_bytes
             available_inodes = min(
                 domain.free_inodes, domain.pool_inodes - int(reserved[1])
@@ -1132,9 +1134,12 @@ class ControlPlaneDatabase:
         }
 
     def release_storage_reservation(
-        self, task_id: str | uuid.UUID, *, released_at: str | None = None
+        self, task_id: str | uuid.UUID, *, proof: object,
+        released_at: str | None = None,
     ) -> dict[str, object]:
-        """Release one reservation through an explicit trusted host action."""
+        """Release only after trusted cleanup stops further task growth."""
+        from storage import StorageContractError, validate_storage_release_proof
+
         task_id = _uuid(task_id, "task_id")
         timestamp = _timestamp(released_at, "released_at")
         with self._transaction():
@@ -1145,6 +1150,14 @@ class ControlPlaneDatabase:
                 raise ControlPlaneError(f"storage reservation does not exist: {task_id}")
             if row["status"] == "released":
                 return dict(row)
+            task = self.read_task(task_id)
+            try:
+                validate_storage_release_proof(
+                    proof, project=str(task["project_slug"]),
+                    identifier=str(task["identifier"]),
+                )
+            except StorageContractError:
+                raise
             self.connection.execute(
                 "UPDATE storage_reservations SET status = 'released', released_at = ? WHERE task_id = ?",
                 (timestamp, task_id),
