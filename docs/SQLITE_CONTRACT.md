@@ -1,9 +1,10 @@
 # SQLite control-plane contract
 
-Step 2 established the host-owned persistence contract. Step 5 now cuts the
-managed scheduler and workspace admission over to that contract; full
-role/workpad/lifecycle persistence and publication narrowing remain later
-steps.
+Step 2 established the host-owned persistence contract. Step 5 established
+that SQLite determines what work exists. Step 6 makes SQLite determine what
+has happened to that work: lifecycle state, current HEAD, workpad version,
+role rounds, findings, adjudications, blockers, and exact-head acceptance
+evidence.
 
 ## Authority and location
 
@@ -22,10 +23,9 @@ remains the only project registration/configuration authority. Database rows
 store `project_slug` as a semantic reference; there is deliberately no
 SQLite `projects` table and no SQLite project registry.
 
-The existing GitHub issue, label, comment, task-record, and JSONL-shaped
-mechanisms are deferred lifecycle/publication seams. They do not create or
-queue local tasks after Step 5, and no GitHub compatibility path is part of the
-managed scheduler.
+GitHub issues, labels, comments, and draft PRs are not lifecycle authority.
+The contained task reports one strict lifecycle result; only trusted Pilot
+host code reconciles it into SQLite.
 
 ## Baseline inventory
 
@@ -38,7 +38,7 @@ kept distinct:
 | `task_admission.py` task records and server-derived GitHub facts | Retired scheduler admission seam; retained only as non-deployed legacy source pending lifecycle/publication cleanup |
 | `workflow/architect_policy.md` and role-policy files | Accepted lifecycle and role semantics; generated policy payload, not durable state |
 | Workpad comments, task outboxes, task JSON, logs, and process markers | Current integration/transient or generated state; not copied wholesale into relational tables |
-| `broker.py` blockers and publication/draft-PR handling | Accepted blocker/publication concepts with GitHub-specific mechanisms deferred to later cutover |
+| `runtime/lifecycle.py` and the rendered hooks | Step-6 host lifecycle broker; no GitHub lifecycle API |
 | Runtime locks, containment probes, credential ordering, and sterile publication boundaries | PR #4 security/runtime invariants; this module does not alter them |
 
 The genuinely new Step 2 choices are a host-owned local UUID plus deterministic
@@ -103,12 +103,21 @@ HUMAN_BLOCKED
 INFRASTRUCTURE_BLOCKED
 ```
 
-The database constrains the vocabulary but does not invent a complete future
-scheduler transition graph. Callers supply an expected current state to the
-compare-and-set transition primitive. The `ARCHITECT` role is represented in
+The database constrains the vocabulary; trusted `runtime/lifecycle.py` licenses
+the Step-6 transition graph and derives the next state from an accepted
+result outcome. The contained task never writes SQLite and never chooses the
+next state. The `ARCHITECT` role is represented in
 `role_runs` and event provenance; the specialized worker role set remains
 `PROJECT-MANAGER`, `PLANNER`, `IMPLEMENTER`, `REVIEWER`, `ADVERSARY`, and
 `ARCHIVIST`.
+
+Step-6 result findings carry the finite `blocker_kind` value `human`,
+`project`, `infrastructure`, or `null`. `unresolved project decision` requires
+`human` or `project`; `infrastructure condition` requires `infrastructure`;
+licensed and rejected findings require `null`. Descriptive finding text never
+selects escalation authority. A canonical `BLOCKED` role verdict is distinct
+from a reviewer `REQUEST_CHANGES` report, which the strict result normalizes to
+`FINDINGS`.
 
 Database-enforceable identity, uniqueness, foreign-key, shape, and timestamp
 relationships belong to SQLite. Project-slug resolution, permission to
@@ -190,9 +199,13 @@ in the inspected WSL host state root when this correction was made. Therefore
 the physical-schema and authority corrections modify schema v1 in place; no
 compatibility migration was added for disposable pre-acceptance test state.
 
-## Deferred boundaries
+## Step-6 and later boundaries
 
-This contract does not define full role/workpad/lifecycle persistence, GitHub
-publication narrowing, project-registry duplication, or App Server
-authentication changes. Step 5 deliberately leaves those seams for Steps 6
-and 7 (and the existing activation gates).
+Runtime remains an observation/read-only consumer. The host reconciliation
+operation is the only lifecycle writer; `after_run` exit status is not the
+barrier because SQLite blocker side effects govern later routing. Role-run
+records are lifecycle records of accepted orchestrator results, not proof of
+real custom-agent invocation. ARCHIVIST is the Step-6 endpoint. Step 7 owns
+publication and the final READY transition. Existing Step-8
+credential-isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live
+WSL containment blockers remain open.

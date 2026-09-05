@@ -146,7 +146,13 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertIn("database_path: /home/operator/state/control.sqlite3", rendered)
         self.assertIn("project_slug: alpha", rendered)
         self.assertIn("- QUEUED", rendered)
+        self.assertIn("- PLANNED", rendered)
+        self.assertIn("- IMPLEMENTED", rendered)
+        self.assertIn("- REVIEW", rendered)
+        self.assertIn("- ADVERSARIAL_REVIEW", rendered)
+        self.assertIn("- FINAL_MECHANICAL_ACCEPTANCE", rendered)
         self.assertIn("- READY_FOR_HUMAN_MERGE", rendered)
+        self.assertIn("max_turns: 1", rendered)
         for forbidden in (
             "kind: github", "SYMPHONY_PILOT_GITHUB_TOKEN", "required_labels", "- open", "- closed",
             "admit_task.py", "GH-", "/issues?",
@@ -160,15 +166,17 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertNotIn('env["SYMPHONY_PILOT_GITHUB_TOKEN"]', source)
         self.assertNotIn("dispatchable issues exceed", source)
 
-    def test_after_run_reports_step6_boundary(self):
+    def test_after_run_reconciles_step6_and_fails_closed_without_a_result(self):
         import after_run
 
-        with mock.patch.object(after_run, "load_profile"):
+        with mock.patch.object(after_run, "load_profile"), mock.patch.object(
+                after_run, "reconcile", side_effect=RuntimeError), mock.patch.object(
+                after_run, "fail_attempt_for_workspace"):
             with mock.patch.object(after_run, "print") as output:
                 result = after_run.main(["--profile", "profile.toml", "--workspace", "T-000001"])
         self.assertEqual(result, 78)
         output.assert_called_once()
-        self.assertIn("Step 6", output.call_args.args[0])
+        self.assertIn("after_run stopped", output.call_args.args[0])
         after_run_source = (ROOT / "runtime/after_run.py").read_text(encoding="utf-8")
         architecture = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
         findings = (ROOT / "docs/SECURITY_FINDINGS.md").read_text(encoding="utf-8")
@@ -176,7 +184,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertIn("not an activation barrier", " ".join(architecture.split()))
         self.assertIn("STEP-6-BEFORE-ACTIVATION", findings)
         self.assertIn("not a substitute for this ordering", findings)
-        self.assertNotIn("after_run hook fails\nclosed", architecture)
+        self.assertIn("not an activation barrier", " ".join(after_run_source.split()))
 
     def test_deployment_generator_and_verifier_share_exact_runtime_inventory(self):
         def clean_git_result(args, **kwargs):
@@ -232,6 +240,58 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                     with self.assertRaises(pw.PreparationError) as raised:
                         project.verify_deployment(profile)
         self.assertIn("operator/runtime contract differs", str(raised.exception))
+
+    def test_policy_and_launcher_changes_invalidate_existing_deployment(self):
+        self.assertEqual(
+            deployment_contract.POLICY_FILES,
+            (
+                "workflow/architect_policy.md",
+                "workflow/agents/adversary.toml",
+                "workflow/agents/archivist.toml",
+                "workflow/agents/implementer.toml",
+                "workflow/agents/planner.toml",
+                "workflow/agents/project-manager.toml",
+                "workflow/agents/reviewer.toml",
+            ),
+        )
+        self.assertIn("runtime/launch_codex.sh", deployment_contract.CONTRACT_FILES)
+
+        def clean_git_result(args, **kwargs):
+            stdout = "a" * 40 + "\n" if args[1:3] == ["rev-parse", "HEAD"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                deploy.subprocess, "run", side_effect=clean_git_result):
+            target = deploy.deploy(
+                ROOT / "projects/symphony-canary/profile.toml",
+                pathlib.Path(directory) / "deployment",
+                False,
+            )
+            profile = pw.load_profile(ROOT / "projects/symphony-canary/profile.toml")
+            with mock.patch.object(project, "install_root", return_value=target):
+                project.verify_deployment(profile)
+                docs_path = (ROOT / "docs" / "ARCHITECTURE.md").resolve()
+                original_read_bytes = pathlib.Path.read_bytes
+
+                def mutate_path(path):
+                    data = original_read_bytes(path)
+                    return data + b"\n# temporary documentation mutation\n" if path.resolve() == docs_path else data
+
+                with mock.patch.object(pathlib.Path, "read_bytes", mutate_path):
+                    project.verify_deployment(profile)
+                for relative in ("workflow/architect_policy.md", "workflow/agents/reviewer.toml"):
+                    changed_path = (ROOT / relative).resolve()
+
+                    def mutate_policy(path, changed_path=changed_path):
+                        data = original_read_bytes(path)
+                        return data + b"\n# temporary constitutive policy mutation\n" \
+                            if path.resolve() == changed_path else data
+
+                    with self.subTest(relative=relative), mock.patch.object(
+                            pathlib.Path, "read_bytes", mutate_policy):
+                        with self.assertRaises(pw.PreparationError) as raised:
+                            project.verify_deployment(profile)
+                        self.assertIn("operator/runtime contract differs", str(raised.exception))
 
     def test_runtime_environment_scrubs_all_retired_tracker_credentials(self):
         seeded = {
@@ -307,22 +367,17 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                 pw.prepare(profile, workspace)
             self.assertEqual(raised.exception.kind, "base_history_rewritten")
 
-    def test_continuation_requires_exact_host_owned_head(self):
+    def test_continuation_requires_retained_host_owned_branch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            source, remote, base_sha = self.local_remote(root)
-            (source / "README.md").write_text("A\nB\n", encoding="utf-8")
-            self.git(source, "add", "README.md")
-            self.git(source, "commit", "-m", "B")
-            continuation_tip = self.git(source, "rev-parse", "HEAD")
+            _, remote, base_sha = self.local_remote(root)
             profile, workspace, record = self.task_workspace(
                 root, remote, base_sha, current_head=base_sha,
             )
-            self.git(source, "push", str(remote), f"HEAD:refs/heads/{record['branch']}")
             with self.assertRaises(pw.PreparationError) as raised:
                 pw.prepare(profile, workspace)
-            self.assertEqual(raised.exception.kind, "server_ref_changed")
-            self.assertNotEqual(continuation_tip, base_sha)
+            self.assertEqual(raised.exception.kind, "continuation_branch")
+            self.assertEqual(self.git(workspace, "branch", "--show-current"), "main")
 
 
 if __name__ == "__main__":

@@ -8,11 +8,24 @@ lifecycle or architectural authority.
 
 ## Authority topology
 
+Step 5: SQLite determines what work exists. Step 6: SQLite determines what
+has happened to that work. Pilot is the lifecycle authority; Runtime only
+observes the database through its read-only adapter. The Architect result is
+an untrusted report, and host code derives identities, rounds, paths, Git
+truth, and the next state before one atomic reconciliation.
+
 The host owns the canonical registry, SQLite task rows, local task identity,
 publication deploy key, runtime locks, process state, and publication. Issue
 prose, workpad prose, task Git metadata, task output, and task filesystem state
 are untrusted payload. GitHub remains a deferred publication/lifecycle
 integration, not scheduler authority.
+
+Review correction routing is phase-specific: reviewer and adversary corrections
+require their specialized `FINDINGS` packet; mechanical-validation correction is
+top-level Architect evidence and requires no specialized packet. A `BLOCKED`
+result may contain only the bounded role evidence available before the stop, but
+must produce an open SQLite blocker. Human/project/infrastructure escalation is
+carried by finite `blocker_kind`, never inferred from finding prose.
 
 The profile supplies project onboarding data: repository, clone remote, any
 currently retained host-secret/publication settings, model settings, and
@@ -29,11 +42,13 @@ closed. The database transaction derives the UUID, next unique `T-000001`
 identifier, and `codex/t-000001-<12-hex-character-UUID-prefix>` branch.
 
 Creation produces `PREPARED`. A separate `task.py queue` command performs the
-accepted compare-and-set transition `PREPARED -> QUEUED` and appends the
-`queued` event in the same transaction. Runtime reads SQLite in read-only mode,
-scoped to the rendered project slug, and dispatches only unblocked `QUEUED`
-rows. No GitHub issue, issue number, dispatch label, or `GH-N` identity is
-required or accepted in this causal chain.
+accepted compare-and-set transition `PREPARED -> QUEUED`, creates the first
+host-generated workpad, and appends the `queued` event in the same transaction.
+Runtime reads SQLite in read-only mode, scoped to the rendered project slug;
+its adapter routing gate is no open blocker, while the configured
+`active_states` set is the scheduler gate. No GitHub issue, issue number,
+dispatch label, or `GH-N` identity is required or accepted in this causal
+chain.
 
 The workspace sequence is:
 
@@ -56,20 +71,17 @@ Publication uses the deterministic host secret
 `~/.config/symphony-pilot/secrets/<slug>/publication-ssh-key`, mode 0600. It is
 separate from the Issues/PR tracker token, human account, and task domain.
 
-The prior task outbox and broker remain deferred lifecycle/publication source
-code. Step 5 does not activate them: the rendered `after_run` script returns
-78 and performs no legacy GitHub lifecycle mapping, so no local `T-N` task is
-mapped to a GitHub issue or publication record here. Frozen Runtime treats
-after_run hook failures as best-effort; this return code is not an activation
-barrier.
+Step 6 deploys the strict local lifecycle result broker. A bounded
+`before_run` allocates one host Architect attempt and run namespace; the
+rendered `after_run` independently verifies Git truth and atomically
+reconciles accepted results into SQLite. Since Frozen Runtime treats
+`after_run` failures as best-effort, exit 78 is not an activation barrier; the
+SQLite blocker side effect is the routing barrier.
 
-The prior ready_for_human_merge bundle/publication path remains a deferred
-Step-6/Step-7 seam. Step 5 does not persist full lifecycle state, publish
-branches, create draft PRs, or map local tasks to GitHub records. The rendered
-after_run script only signals that reconciliation is unavailable. Actual
-Step-5 safety depends on the existing execution-capability gate. Step 6 must
-establish lifecycle reconciliation before Step 8 may authorize unattended
-execution.
+The prior ready_for_human_merge bundle/publication path remains a Step-7 seam.
+Step 6 does not publish branches, create draft PRs, or map local tasks to
+GitHub records. Actual safety still depends on the existing execution-
+capability gate; Step 6 does not authorize unattended execution.
 
 ## Execution truth states
 
@@ -82,7 +94,8 @@ execution.
 | Local SQLite task intake / queue authority | TARGETED / FIXTURE-VERIFIED | trusted task CLI, transactionally allocated identity, and PREPARED-to-QUEUED CAS tests |
 | Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
 | Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
-| Host broker and publication transfer | DEFERRED / NOT ACTIVE | source-only lifecycle/publication seam reserved for Steps 6 and 7 |
+| SQLite lifecycle reconciliation | TARGETED / FIXTURE-VERIFIED | strict result, trusted Git checks, and atomic Step-6 synthetic E2E |
+| Host publication transfer | DEFERRED / NOT ACTIVE | Step-7 publication seam; no Step-6 branch push or draft PR |
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
 | Codex App Server activation | BLOCKED | existing execution-capability gate and launch boundary remain fail-closed |
 | Live Codex task containment | NOT YET PROVEN | no Codex task was started |

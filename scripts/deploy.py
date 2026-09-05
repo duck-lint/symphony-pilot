@@ -14,11 +14,11 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 from prepare_workspace import Profile, PreparationError, deployment_path, load_profile
-from deployment_contract import DEPLOYED_RUNTIME_FILES, contract_digest, deployment_identity
+from deployment_contract import (DEPLOYED_RUNTIME_FILES, POLICY_FILES, ROLE_POLICY_FILES,
+                                 contract_digest, deployment_identity)
 from project_registry import resolve_project
 from render_workflow import render
 
-ROLE_POLICY_FILES = tuple(sorted((ROOT / "workflow" / "agents").glob("*.toml")))
 EXPECTED_ROLE_NAMES = {"project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"}
 
 def file_digest(path: pathlib.Path) -> str:
@@ -30,7 +30,7 @@ def selected_deployment(profile: Profile):
 
 def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run: bool) -> pathlib.Path:
     profile = load_profile(profile_path)
-    role_names = {path.stem for path in ROLE_POLICY_FILES}
+    role_names = {pathlib.PurePosixPath(relative).stem for relative in ROLE_POLICY_FILES}
     if role_names != EXPECTED_ROLE_NAMES:
         raise SystemExit("role policy pack must contain exactly the six generic roles")
     raw_target = destination or selected_deployment(profile)
@@ -69,9 +69,9 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         # the Windows adapter never executes its mutable source copy.
         for relative in DEPLOYED_RUNTIME_FILES:
             shutil.copy2(ROOT / relative, stage / relative)
-        shutil.copy2(ROOT / "workflow" / "architect_policy.md", stage / "workflow/architect_policy.md")
-        for policy in ROLE_POLICY_FILES:
-            shutil.copy2(policy, stage / "workflow" / "agents" / policy.name)
+        shutil.copy2(ROOT / POLICY_FILES[0], stage / POLICY_FILES[0])
+        for relative in ROLE_POLICY_FILES:
+            shutil.copy2(ROOT / relative, stage / relative)
         shutil.copy2(profile_path, stage / "profile.toml")
         (stage / "runtime/launch_codex.sh").chmod(0o755)
         workflow = stage / "projects" / profile.slug / "WORKFLOW.md"

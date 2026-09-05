@@ -26,6 +26,22 @@ query GitHub Issues, count dispatch labels, or inject a tracker credential into
 Runtime. Any failed check is an infrastructure block; no old execution path is
 selected.
 
+## Step-6 lifecycle operations
+
+The managed lifecycle workflow renders `agent.max_turns: 1`: one Runtime
+dispatch is one bounded Architect attempt, followed by host reconciliation.
+The profile's historical `max_turns` value is not the lifecycle continuation
+mechanism. Inspect lifecycle state, workpad, role runs, findings, blockers, and
+events with `task show`; inspect only open blockers with `task blockers`.
+
+Malformed or missing results, stale attempts, dirty workspaces, and failed
+Git-truth checks are fail-closed. When SQLite is available, reconciliation
+finishes the Architect attempt and records an infrastructure blocker. Resolve
+one inspected blocker with the exact project-scoped `task resolve-blocker`
+command, then the retained active lifecycle state becomes routable naturally.
+Do not delete lifecycle evidence or repair a task by manually setting its
+state. A task at ARCHIVIST is intentionally parked until Step 7 publication.
+
 ## Ordinary controls
 
     python3 scripts/validate_profile.py
