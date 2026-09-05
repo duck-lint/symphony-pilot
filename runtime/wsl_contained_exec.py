@@ -31,9 +31,9 @@ REQUIRED_AUTHORITY_FILES = (
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_PROFILE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
-TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
 WORKSPACE_ROOT = pathlib.PurePosixPath("/home/duck-lint/symphony-workspaces")
 QUOTA_INSPECTION_SCHEMA = "symphony-pilot-quota-inspection/v1"
+QUOTA_PROBE_NAME = ".symphony-quota-inspection-probe"
 
 
 class ContainmentError(RuntimeError):
@@ -168,80 +168,116 @@ def _project_root(project: str) -> pathlib.Path:
     return resolved
 
 
-def _task_workspace(project: str, identifier: str) -> pathlib.Path:
+def _plain_directory(path: pathlib.Path, kind: str) -> pathlib.Path:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ContainmentError(kind, "persistent workspace storage path cannot be inspected") from exc
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise ContainmentError(kind, "persistent workspace storage path must be a real directory")
+    return path
+
+
+def _ensure_plain_directory(path: pathlib.Path, kind: str) -> tuple[pathlib.Path, bool]:
+    created = False
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        _plain_directory(path.parent, kind)
+        try:
+            os.mkdir(path, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ContainmentError(kind, "persistent workspace storage directory cannot be created") from exc
+    return _plain_directory(path, kind), created
+
+
+def _workspace_storage_root(project: str) -> tuple[pathlib.Path, bool]:
     if project not in PROJECT_ROOTS:
         raise ContainmentError("project", "project is not admitted to the WSL quota domain")
-    if not isinstance(identifier, str) or not TASK_IDENTIFIER.fullmatch(identifier):
-        raise ContainmentError("task_identifier", "task identifier is malformed")
-    root = pathlib.Path(WORKSPACE_ROOT) / project
-    try:
-        resolved_root = root.resolve(strict=True)
-        resolved = (resolved_root / identifier).resolve(strict=True)
-    except OSError as exc:
-        raise ContainmentError("quota_workspace", "persistent task workspace cannot be resolved") from exc
-    if resolved_root != root or resolved.parent != resolved_root or not resolved.is_dir():
-        raise ContainmentError("quota_workspace", "persistent task workspace leaves its derived namespace")
-    if root.is_symlink() or (resolved_root / identifier).is_symlink():
-        raise ContainmentError("quota_workspace", "persistent task workspace must not be a symlink")
-    return resolved
+    namespace = pathlib.Path(WORKSPACE_ROOT)
+    namespace, _ = _ensure_plain_directory(namespace, "quota_workspace")
+    return _ensure_plain_directory(namespace / project, "quota_workspace")
 
 
-def _quota_inspection(project: str, identifier: str) -> dict[str, object]:
-    """Return bounded evidence for the derived persistent task filesystem.
+def _quota_inspection(project: str) -> dict[str, object]:
+    """Return bounded evidence for the persistent task-storage filesystem.
 
     This is deliberately inspection-only.  It never selects a quota backend,
-    changes mounts, assigns project IDs, or launches a caller-supplied command.
+    assigns project IDs, creates lifecycle state, or launches a caller-supplied
+    command.  When the storage root is absent, the root itself is created as a
+    host-owned namespace and an inert probe directory supplies the pathname
+    required by ``findmnt``; no task-shaped directory is created.
     """
-    workspace = _task_workspace(project, identifier)
+    storage_root, root_created = _workspace_storage_root(project)
+    probe = storage_root / QUOTA_PROBE_NAME
+    probe_created = False
+    target = storage_root
+    if root_created:
+        try:
+            os.mkdir(probe, 0o700)
+            probe_created = True
+        except OSError as exc:
+            raise ContainmentError("quota_workspace", "inert quota inspection probe cannot be created") from exc
+        target = probe
     try:
-        result = subprocess.run(
-            ["/bin/findmnt", "--json", "--target", str(workspace),
-             "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ContainmentError("quota_inspection", "trusted mount inspection did not complete") from exc
-    if result.returncode:
-        raise ContainmentError("quota_inspection", "trusted mount inspection failed")
-    try:
-        payload = json.loads(result.stdout)
-        entries = payload["filesystems"]
-        entry = entries[0]
-        target = entry["target"]
-        source = entry["source"]
-        fstype = entry["fstype"]
-        options = entry["options"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise ContainmentError("quota_inspection", "trusted mount inspection returned malformed evidence") from exc
-    if (not isinstance(target, str) or not isinstance(source, str) or
-            not isinstance(fstype, str) or not isinstance(options, str)):
-        raise ContainmentError("quota_inspection", "trusted mount inspection fields are malformed")
-    try:
-        usage = os.statvfs(workspace)
-    except OSError as exc:
-        raise ContainmentError("quota_inspection", "persistent task filesystem statistics are unavailable") from exc
-    option_set = frozenset(options.split(","))
-    project_quota = fstype in {"ext4", "xfs"} and bool(option_set & {"prjquota", "pquota"})
-    return {
-        "schema": QUOTA_INSPECTION_SCHEMA,
-        "project": project,
-        "identifier": identifier,
-        "workspace": str(workspace),
-        "filesystem": {
-            "target": target,
-            "source": source,
-            "fstype": fstype,
-            "options": options,
-            "project_quota_mount": project_quota,
-            "statvfs": {
-                "block_size": usage.f_frsize or usage.f_bsize,
-                "blocks": usage.f_blocks,
-                "free_blocks": usage.f_bfree,
-                "inodes": usage.f_files,
-                "free_inodes": usage.f_ffree,
+        try:
+            result = subprocess.run(
+                ["/bin/findmnt", "--json", "--target", str(target),
+                 "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ContainmentError("quota_inspection", "trusted mount inspection did not complete") from exc
+        if result.returncode:
+            raise ContainmentError("quota_inspection", "trusted mount inspection failed")
+        try:
+            payload = json.loads(result.stdout)
+            entries = payload["filesystems"]
+            entry = entries[0]
+            mount_target = entry["target"]
+            source = entry["source"]
+            fstype = entry["fstype"]
+            options = entry["options"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise ContainmentError("quota_inspection", "trusted mount inspection returned malformed evidence") from exc
+        if (not isinstance(mount_target, str) or not isinstance(source, str) or
+                not isinstance(fstype, str) or not isinstance(options, str)):
+            raise ContainmentError("quota_inspection", "trusted mount inspection fields are malformed")
+        try:
+            usage = os.statvfs(target)
+        except OSError as exc:
+            raise ContainmentError("quota_inspection", "persistent task filesystem statistics are unavailable") from exc
+        option_set = frozenset(options.split(","))
+        project_quota = fstype in {"ext4", "xfs"} and bool(option_set & {"prjquota", "pquota"})
+        return {
+            "schema": QUOTA_INSPECTION_SCHEMA,
+            "project": project,
+            "scope": "persistent_project_workspace_root",
+            "probe_created": probe_created,
+            "filesystem": {
+                "target": mount_target,
+                "source": source,
+                "fstype": fstype,
+                "options": options,
+                "project_quota_mount": project_quota,
+                "statvfs": {
+                    "block_size": usage.f_frsize or usage.f_bsize,
+                    "blocks": usage.f_blocks,
+                    "free_blocks": usage.f_bfree,
+                    "inodes": usage.f_files,
+                    "free_inodes": usage.f_ffree,
+                },
             },
-        },
-    }
+        }
+    finally:
+        if probe_created:
+            try:
+                os.rmdir(probe)
+            except OSError as exc:
+                raise ContainmentError("quota_workspace", "inert quota inspection probe could not be removed") from exc
 
 
 def _contained_cwd(project_root: pathlib.Path, cwd: str) -> str:
@@ -379,15 +415,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--cwd")
-    parser.add_argument("--control", choices=("quota-inspect",))
-    parser.add_argument("--identifier")
+    parser.add_argument("--control", choices=("quota-inspect-root",))
     parser.add_argument("--wall-seconds", type=float, default=30 * 60)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
-        if args.control == "quota-inspect":
-            if args.cwd is not None or command or args.identifier is None:
+        if args.control == "quota-inspect-root":
+            if args.cwd is not None or command:
                 raise ContainmentError("control", "quota inspection arguments are malformed")
             # Control operations are still trusted deployment operations.  Do
             # not let their fixed nature bypass the manifest and inventory
@@ -396,8 +431,8 @@ def main() -> int:
             _validate_deployment(deployment_root)
         elif args.cwd is None or not command:
             raise ContainmentError("command", "contained command is required")
-        if args.control == "quota-inspect":
-            print(json.dumps(_quota_inspection(args.project, args.identifier), sort_keys=True))
+        if args.control == "quota-inspect-root":
+            print(json.dumps(_quota_inspection(args.project), sort_keys=True))
             return 0
         return run(args.project, args.cwd, command, args.wall_seconds)
     except Exception as exc:

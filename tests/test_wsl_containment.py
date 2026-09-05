@@ -18,9 +18,19 @@ import wsl_contained_exec
 
 
 class SupervisorValidationTests(unittest.TestCase):
-    def test_quota_inspection_selector_is_host_derived(self):
-        with self.assertRaisesRegex(wsl_contained_exec.ContainmentError, "task identifier"):
-            wsl_contained_exec._task_workspace("symphony-pilot", "../../etc")
+    def test_quota_inspection_rejects_untrusted_project(self):
+        with self.assertRaisesRegex(wsl_contained_exec.ContainmentError, "not admitted"):
+            wsl_contained_exec._workspace_storage_root("../../etc")
+
+    def test_quota_storage_root_creation_does_not_create_task_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            namespace = pathlib.Path(directory) / "symphony-workspaces"
+            with mock.patch.object(wsl_contained_exec, "WORKSPACE_ROOT", namespace):
+                storage_root, created = wsl_contained_exec._workspace_storage_root("symphony-pilot")
+            self.assertTrue(created)
+            self.assertEqual(storage_root, namespace / "symphony-pilot")
+            self.assertTrue(storage_root.is_dir())
+            self.assertFalse((storage_root / "T-000001").exists())
 
     def test_quota_inspection_requires_deployment_validation(self):
         with mock.patch.object(wsl_contained_exec, "_deployment_root", return_value=pathlib.Path("/trusted")), \
@@ -28,7 +38,7 @@ class SupervisorValidationTests(unittest.TestCase):
              mock.patch.object(wsl_contained_exec, "_quota_inspection", return_value={"schema": "test"}), \
              mock.patch.object(sys, "argv", [
                  "wsl_contained_exec.py", "--project", "symphony-pilot",
-                 "--control", "quota-inspect", "--identifier", "T-000001",
+                 "--control", "quota-inspect-root",
              ]), \
              mock.patch("builtins.print") as output:
             self.assertEqual(wsl_contained_exec.main(), 0)
@@ -46,16 +56,16 @@ class SupervisorValidationTests(unittest.TestCase):
 
         findmnt = mock.Mock(returncode=0, stdout=json.dumps({
             "filesystems": [{
-                "target": "/home/duck-lint/symphony-workspaces/symphony-pilot/T-000001",
+                "target": "/home/duck-lint/symphony-workspaces/symphony-pilot",
                 "source": "/dev/vdb",
                 "fstype": "ext4",
                 "options": "rw,relatime,prjquota",
             }],
         }))
-        with mock.patch.object(wsl_contained_exec, "_task_workspace", return_value=pathlib.PurePosixPath("/workspace")), \
+        with mock.patch.object(wsl_contained_exec, "_workspace_storage_root", return_value=(pathlib.PurePosixPath("/workspace"), False)), \
              mock.patch.object(wsl_contained_exec.subprocess, "run", return_value=findmnt) as run, \
              mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True):
-            evidence = wsl_contained_exec._quota_inspection("symphony-pilot", "T-000001")
+            evidence = wsl_contained_exec._quota_inspection("symphony-pilot")
         self.assertTrue(evidence["filesystem"]["project_quota_mount"])
         self.assertEqual(evidence["filesystem"]["statvfs"]["inodes"], 200)
         run.assert_called_once_with(
@@ -63,6 +73,33 @@ class SupervisorValidationTests(unittest.TestCase):
              "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
             capture_output=True, text=True, timeout=5, check=False,
         )
+
+    def test_quota_inspection_uses_and_removes_inert_probe_for_new_root(self):
+        class Usage:
+            f_frsize = 4096
+            f_bsize = 4096
+            f_blocks = 100
+            f_bfree = 40
+            f_files = 200
+            f_ffree = 150
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "project-root"
+            root.mkdir()
+            findmnt = mock.Mock(returncode=0, stdout=json.dumps({
+                "filesystems": [{
+                    "target": str(root / wsl_contained_exec.QUOTA_PROBE_NAME),
+                    "source": "/dev/vdb",
+                    "fstype": "ext4",
+                    "options": "rw,relatime,prjquota",
+                }],
+            }))
+            with mock.patch.object(wsl_contained_exec, "_workspace_storage_root", return_value=(root, True)), \
+                 mock.patch.object(wsl_contained_exec.subprocess, "run", return_value=findmnt), \
+                 mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True):
+                evidence = wsl_contained_exec._quota_inspection("symphony-pilot")
+            self.assertTrue(evidence["probe_created"])
+            self.assertFalse((root / wsl_contained_exec.QUOTA_PROBE_NAME).exists())
 
     def test_writable_mountpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

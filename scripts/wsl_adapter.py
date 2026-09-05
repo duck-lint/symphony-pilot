@@ -48,7 +48,6 @@ CONTAINED_ENTRYPOINT = (
 )
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
-_TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
 _WINDOWS_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
 _WINDOWS_EXECUTABLE = re.compile(r"(?i)^(?:cmd|powershell|pwsh|wsl|docker)(?:\.exe)?$")
 
@@ -137,11 +136,6 @@ def _validate_project(project: str) -> None:
 def _validate_request_id(request_id: str) -> None:
     if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
         raise WslAdapterError("invalid_request_id", "request identity is malformed")
-
-
-def _validate_task_identifier(identifier: str) -> None:
-    if not isinstance(identifier, str) or not _TASK_IDENTIFIER.fullmatch(identifier):
-        raise WslAdapterError("invalid_task_identifier", "task identifier is malformed")
 
 
 def _lexical_cwd(project: str, cwd: str) -> str:
@@ -391,16 +385,14 @@ def execute(
 
 def inspect_quota(
     project: str,
-    identifier: str,
     *,
     timeout_seconds: float = 30,
     request_id: str | None = None,
 ) -> dict[str, object]:
-    """Inspect one derived persistent task domain through the fixed supervisor."""
+    """Inspect one derived persistent project-storage domain through the fixed supervisor."""
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
         raise WslAdapterError("invalid_timeout", "timeout is outside the bounded adapter range")
     _validate_project(project)
-    _validate_task_identifier(identifier)
     request_id = request_id or uuid.uuid4().hex
     _validate_request_id(request_id)
     wsl = _host_wsl_executable()
@@ -409,8 +401,7 @@ def inspect_quota(
         "HOME=/home/duck-lint", "USER=duck-lint", "LOGNAME=duck-lint",
         "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
         "/usr/bin/python3", "-B", CONTAINED_ENTRYPOINT,
-        "--control", "quota-inspect", "--project", project,
-        "--identifier", identifier,
+        "--control", "quota-inspect-root", "--project", project,
     ], "/")
     result = _bounded_process(
         command, float(timeout_seconds), cwd="/", metadata=(request_id, project, FIXED_DISTRO)
