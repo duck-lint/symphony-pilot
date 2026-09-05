@@ -183,6 +183,34 @@ def list_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def bind_publication_key(args: argparse.Namespace) -> int:
+    """Bind one already registered writable deploy key to the local key."""
+    from publication_key import bind_server_key
+    from prepare_workspace import github, read_secret
+
+    profile = _profile(args.project)
+    token = read_secret(profile)
+    _emit(bind_server_key(profile, token, github))
+    return 0
+
+
+def publish(args: argparse.Namespace) -> int:
+    """Publish one exact ARCHIVIST head through the trusted host broker."""
+    from project import verify_deployment
+    from publication import publish_task
+
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+    result = publish_task(
+        profile, str(task["id"]), database_path=default_database_path(),
+        deployment_check=verify_deployment,
+    )
+    _emit(result)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="task.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -223,10 +251,19 @@ def main(argv: list[str] | None = None) -> int:
     list_parser.add_argument("--project", required=True)
     list_parser.set_defaults(handler=list_tasks)
 
+    bind_parser = subparsers.add_parser("bind-publication-key", help="bind the registered GitHub deploy key")
+    bind_parser.add_argument("--project", required=True)
+    bind_parser.set_defaults(handler=bind_publication_key)
+
+    publish_parser = subparsers.add_parser("publish", help="publish one exact ARCHIVIST task head")
+    publish_parser.add_argument("--project", required=True)
+    publish_parser.add_argument("--task", required=True)
+    publish_parser.set_defaults(handler=publish)
+
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (TaskCommandError, ControlPlaneError, OSError, ValueError) as exc:
+    except (TaskCommandError, ControlPlaneError, OSError, ValueError, RuntimeError) as exc:
         print(f"symphony-pilot task command stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 78
 

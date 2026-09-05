@@ -34,9 +34,9 @@ tool network.
 ## Current status
 
 Host-side local-task intake, SQLite scheduler configuration, local workspace
-preparation, Step-6 lifecycle persistence, ruleset protection checks, runtime
-identity locks, and fail-closed containment gates are implemented and
-fixture-tested. Publication narrowing remains deferred to Step 7.
+preparation, and Step-7 exact-head publication are implemented and
+fixture-tested. Publication remains a host-only operation; it does not
+authorize unattended execution or human merge.
 Persistent task-workspace aggregate disk growth is explicitly unbounded in this
 cutover, and the exact current Codex App Server authentication path has no
 proven way to keep its credential out of hostile tool children. Unattended
@@ -78,7 +78,8 @@ invocation form.
     python3 -m unittest discover -s tests -v
     python3 -m compileall -q runtime scripts tests
     python3 scripts/validate_profile.py
-    python3 scripts/provision_publication_key.py --project cleanroom < publication-key.pem
+    python3 scripts/provision_publication_key.py --project cleanroom
+    python3 scripts/task.py bind-publication-key --project cleanroom
     python3 scripts/deploy.py --project cleanroom --dry-run
     python3 scripts/project.py --project cleanroom start
 

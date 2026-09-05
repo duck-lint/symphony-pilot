@@ -13,7 +13,7 @@ Provision two separate host secrets under WSL/Linux:
 ~/.config/symphony-pilot/secrets/<slug>/publication-ssh-key
 ```
 
-The retained host token is for deferred GitHub publication/lifecycle API calls;
+The retained host token is for the trusted host GitHub publication API calls;
 it is not passed to Runtime's SQLite scheduler. The publication key is a
 repository-scoped write deploy key used only for derived branch pushes. Do not
 reuse a personal key or SSH agent, and never print either secret.

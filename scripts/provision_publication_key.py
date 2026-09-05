@@ -1,40 +1,69 @@
 #!/usr/bin/env python3
-"""Provision the deterministic project publication deploy-key file."""
+"""Provision or explicitly adopt the host-only Ed25519 publication key."""
 from __future__ import annotations
 
+import argparse
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
-from prepare_workspace import publication_key_path  # noqa: E402
+
+from prepare_workspace import PreparationError, publication_key_path  # noqa: E402
+from publication_key import (public_key_fingerprint, public_key_from_private,
+                             stable_private_key)  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
 
 
-def main() -> int:
-    import argparse
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", required=True)
-    args = parser.parse_args()
+    parser.add_argument("--project", required=True, help="registered project slug")
+    parser.add_argument("--adopt", action="store_true", help="explicitly verify and retain an existing key")
+    args = parser.parse_args(argv)
     try:
         profile = resolve_project(args.project, ROOT / "projects")
         path = publication_key_path(profile)
-    except Exception as exc:
-        print(f"publication-key provisioning stopped: {type(exc).__name__}", file=sys.stderr)
+        if path.exists() or path.is_symlink():
+            if not args.adopt:
+                raise PreparationError(
+                    "publication_key",
+                    "publication key already exists; use --adopt for explicit verification",
+                )
+            # Adoption uses the same nofollow, regular-file, mode, size, and
+            # Ed25519 validation boundary as publication itself. ssh-keygen
+            # receives only the stable host-owned temporary copy.
+            with stable_private_key(profile) as stable:
+                public = public_key_from_private(stable)
+            print(f"adopted publication key for {profile.slug}: {public}")
+            print(f"fingerprint: {public_key_fingerprint(public)}")
+            return 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        executable = shutil.which("ssh-keygen")
+        if not executable or not pathlib.Path(executable).is_absolute():
+            raise PreparationError("publication_key", "host ssh-keygen is unavailable")
+        with tempfile.TemporaryDirectory(prefix="symphony-pilot-key-", dir=path.parent) as directory:
+            temporary = pathlib.Path(directory) / "publication-ssh-key"
+            result = subprocess.run(
+                [executable, "-q", "-t", "ed25519", "-N", "", "-f", str(temporary)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if result.returncode:
+                raise PreparationError("publication_key", "host ssh-keygen could not create an Ed25519 key")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        public = public_key_from_private(path)
+        print(f"provisioned publication key for {profile.slug}: {public}")
+        print(f"fingerprint: {public_key_fingerprint(public)}")
+        return 0
+    except (PreparationError, OSError, ValueError, RuntimeError) as exc:
+        print(f"symphony-pilot publication-key provisioning stopped: {exc}", file=sys.stderr)
         return 78
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    print(f"Paste publication deploy key for {profile.slug}, then signal EOF (input is not echoed):")
-    value = sys.stdin.read().strip()
-    if not value or not value.startswith("-----BEGIN ") or "PRIVATE KEY-----" not in value:
-        raise SystemExit("publication key must be a PEM private key")
-    temporary = path.with_name(path.name + ".new")
-    temporary.write_text(value + "\n", encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-    print(f"provisioned {path} with mode 0600")
-    return 0
 
 
 if __name__ == "__main__":

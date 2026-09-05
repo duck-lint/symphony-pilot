@@ -2,6 +2,9 @@
 """Strict parser for the one supported GitHub protection contract: rulesets."""
 from __future__ import annotations
 
+import hashlib
+import json
+
 
 class RulesetError(RuntimeError):
     pass
@@ -45,7 +48,13 @@ def ruleset_applies(ruleset: dict[str, object], default_branch: str) -> bool:
     conditions = ruleset.get("conditions")
     refs = conditions.get("ref_name") if isinstance(conditions, dict) else None
     include = refs.get("include") if isinstance(refs, dict) else None
+    exclude = refs.get("exclude") if isinstance(refs, dict) else None
     if not isinstance(include, list):
+        return False
+    # GitHub exclusions are pattern expressions. Step 7 deliberately supports
+    # no exclusions until a separately reviewed matcher exists; rejecting the
+    # entire non-empty field avoids pretending exact-string checks are safe.
+    if exclude != []:
         return False
     return "~DEFAULT_BRANCH" in include or f"refs/heads/{default_branch}" in include
 
@@ -57,6 +66,9 @@ def require_default_branch_ruleset(rulesets: object, default_branch: str) -> dic
     if len(applicable) != 1:
         raise RulesetError("exactly one active ruleset must target the default branch")
     selected = applicable[0]
+    if (not isinstance(selected.get("id"), int) or isinstance(selected.get("id"), bool)
+            or selected["id"] < 1):
+        raise RulesetError("default-branch ruleset ID is malformed")
     bypass = selected.get("bypass_actors")
     if bypass != []:
         raise RulesetError("default-branch ruleset has bypass actors; automation bypass is not accepted")
@@ -67,3 +79,23 @@ def require_default_branch_ruleset(rulesets: object, default_branch: str) -> dic
     if len(pull_requests) != 1:
         raise RulesetError("default-branch ruleset must require pull requests")
     return selected
+
+
+def security_fingerprint(ruleset: dict[str, object]) -> str:
+    """Hash only the protection facts that affect publication safety."""
+    conditions = ruleset.get("conditions")
+    refs = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    pull_request = next(
+        rule for rule in ruleset["rules"]
+        if isinstance(rule, dict) and rule.get("type") == "pull_request"
+    )
+    relevant = {
+        "id": ruleset.get("id"),
+        "target": ruleset.get("target"),
+        "enforcement": ruleset.get("enforcement"),
+        "ref_name": refs,
+        "bypass_actors": ruleset.get("bypass_actors"),
+        "pull_request": pull_request,
+    }
+    encoded = json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

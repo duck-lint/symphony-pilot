@@ -23,7 +23,7 @@ def main(argv=None) -> int:
         return 78
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    value = getpass.getpass(f"Enter tracker credential for {profile.slug} (hidden): ")
+    value = getpass.getpass(f"Enter GitHub API credential for {profile.slug} (hidden): ")
     if not value or "\n" in value or "\r" in value:
         raise SystemExit("credential must be a non-empty single line")
     temporary = path.with_name(path.name + ".new")

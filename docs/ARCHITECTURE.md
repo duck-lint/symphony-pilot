@@ -17,8 +17,8 @@ truth, and the next state before one atomic reconciliation.
 The host owns the canonical registry, SQLite task rows, local task identity,
 publication deploy key, runtime locks, process state, and publication. Issue
 prose, workpad prose, task Git metadata, task output, and task filesystem state
-are untrusted payload. GitHub remains a deferred publication/lifecycle
-integration, not scheduler authority.
+are untrusted payload. GitHub is publication-only and is not scheduler or
+lifecycle authority.
 
 Review correction routing is phase-specific: reviewer and adversary corrections
 require their specialized `FINDINGS` packet; mechanical-validation correction is
@@ -78,10 +78,27 @@ reconciles accepted results into SQLite. Since Frozen Runtime treats
 `after_run` failures as best-effort, exit 78 is not an activation barrier; the
 SQLite blocker side effect is the routing barrier.
 
-The prior ready_for_human_merge bundle/publication path remains a Step-7 seam.
-Step 6 does not publish branches, create draft PRs, or map local tasks to
-GitHub records. Actual safety still depends on the existing execution-
-capability gate; Step 6 does not authorize unattended execution.
+Step 7 publication is a separate trusted operator operation:
+
+```text
+SQLite ARCHIVIST
+      |
+      v
+Pilot exact-head publication broker
+      |-- retained trusted workspace evidence
+      |-- host-generated bundle and sterile Git
+      |-- exact deploy-key proof
+      |-- fresh ruleset Snapshot A/B
+      |-- exact task branch and draft PR
+      v
+SQLite atomic finalization -> READY_FOR_HUMAN_MERGE -> HUMAN ONLY
+```
+
+The model cannot request publication and GitHub cannot create lifecycle
+authority. Publication failures preserve branch/PR evidence and create an
+infrastructure blocker. Step 7 does not merge, approve, un-draft, or enable
+auto-merge. Ruleset state can change after READY, so a human must recheck
+protection and the exact PR head before merging.
 
 ## Execution truth states
 
@@ -95,7 +112,7 @@ capability gate; Step 6 does not authorize unattended execution.
 | Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
 | Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
 | SQLite lifecycle reconciliation | TARGETED / FIXTURE-VERIFIED | strict result, trusted Git checks, and atomic Step-6 synthetic E2E |
-| Host publication transfer | DEFERRED / NOT ACTIVE | Step-7 publication seam; no Step-6 branch push or draft PR |
+| Host publication transfer | TARGETED / FIXTURE-VERIFIED | Step-7 exact-head host publication; no model or Runtime publication path |
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
 | Codex App Server activation | BLOCKED | existing execution-capability gate and launch boundary remain fail-closed |
 | Live Codex task containment | NOT YET PROVEN | no Codex task was started |

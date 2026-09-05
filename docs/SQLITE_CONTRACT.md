@@ -153,13 +153,27 @@ event authority.
 
 `tasks.current_head` is the latest host-accepted task HEAD. `tasks.published_head`
 is the last successful publication HEAD and is a projection maintained by the
-successful `record_publication()` operation; it is not independently writable
-through `update_heads()`. `publications.head_sha` is the HEAD named by the
-current/last publication record. When a publication is marked `published`, its
-HEAD must equal `tasks.current_head`, and that publication row plus
-`tasks.published_head` plus `publication_finished` are committed in one
-transaction. An in-progress or failed publication may name a candidate HEAD
-without changing the last successful `published_head`.
+managed Step-7 `start_publication()` / `finalize_publication()` transaction;
+it is not independently writable through `update_heads()`. `publications.head_sha`
+is the HEAD named by the current/last publication record. When a publication is
+marked `published`, its HEAD must equal `tasks.current_head`, and that
+publication row plus `tasks.published_head` plus `publication_finished` and the
+READY transition are committed in one transaction. An in-progress or failed
+publication may name a candidate HEAD without changing the last successful
+`published_head`.
+
+Step 7 persists a durable `started` intent before external branch or PR
+mutation. A handled failure changes that intent to `failed`, retains known
+branch/PR evidence, and records an infrastructure blocker; a later attempt may
+move `failed` back to `started`. Successful finalization is monotonic: a
+`published` publication and READY task cannot be downgraded to `started`,
+`failed`, or an absent publication. A process disappearance may leave
+`started` for explicit crash recovery. `finalize_publication()` returns both
+the task and publication snapshots materialized inside its transaction, so no
+post-commit read is needed to establish the result.
+
+The lower-level `record_publication()` primitive remains only as a legacy/test
+persistence seam; it is not the managed Step-7 publication authority.
 
 Changing `current_head` does not rewrite the last successful `published_head`.
 Omitting a HEAD argument preserves its current value; explicit `None` clears

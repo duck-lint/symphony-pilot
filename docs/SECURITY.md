@@ -18,8 +18,9 @@ state. Runtime receives no tracker credential and reads only the project-scoped
 SQLite projection.
 
 GitHub issue labels and event history are not scheduler trust inputs after Step
-5. They survive only in deferred legacy/publication code and cannot create a
-local task or authorize a workspace.
+5. Legacy issue code may remain as historical source, but it cannot create a
+local task, authorize a workspace, or replace the trusted Step-7 publication
+operation.
 
 ## SQLite lifecycle trust
 
@@ -41,20 +42,22 @@ containment findings remain open activation blockers.
 
 ## GitHub trust
 
-The tracker token is API-only. The publication deploy key is project-scoped,
-host-owned, mode 0600, agent-free, and used only by a sterile host repository.
-The task receives neither credential. The default branch must have one active
-repository ruleset requiring pull requests and no bypass actors. Human merge
-authority is the actual GitHub account operating the merge; it is not a field
-invented by the client parser.
+The profile secret reference is a host-only GitHub API credential. The
+publication deploy key is project-scoped, host-owned, mode 0600, agent-free,
+and used only by a sterile host repository. Its public key, repository, and
+GitHub deploy-key ID are bound in a restrictive host manifest and re-proven
+before every push. The task receives neither credential. The default branch
+must have one active repository ruleset requiring pull requests and no bypass
+actors. Human merge authority is the actual GitHub account operating the
+merge; it is not a field invented by the client parser.
 
 The host never uses task `origin`, `remote.*`, `core.hooksPath`,
 `credential.helper`, `include.path`, alternates, or SSH settings as publication
-authority. The fixed bundle is opened once with no-follow descriptor semantics,
-bounded-copied to host-owned temporary storage, and closed; Git never reopens
-the task pathname. Only the staged regular file is imported into a fresh bare
-repository, verified, checked for exact commit type and ancestry, and pushed
-with explicit host SSH identity.
+authority. The retained workspace is checked through the shared trusted
+boundary. The host then generates a temporary bundle outside the task
+workspace, imports it into a fresh bare repository, verifies strict object
+integrity and ancestry, and pushes with an exact host SSH identity. The legacy
+model-produced outbox bundle is not consumed by Step 7.
 
 ## Task domain
 
