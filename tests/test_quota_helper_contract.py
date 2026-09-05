@@ -175,7 +175,7 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb", "/dev/sdc"], ["/dev/sdc"], 0, True))
         self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb", "/dev/sdc", "/dev/sde"], ["/dev/sdc", "/dev/sde"], 0, True))
         self.assertIn('"Action":"already-detached"', run([], [], 1, True))
-        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdc"], [], 1, True))
+        run(["/dev/sdc"], [], 1, False)
         run(["/dev/sdb", "/dev/sdc"], [], 0, False)
         run(["/dev/sdb"], ["/dev/sdc"], 0, False)
         run(["/dev/sdc"], ["/dev/sdc"], 1, False)

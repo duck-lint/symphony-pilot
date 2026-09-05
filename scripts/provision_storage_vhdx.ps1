@@ -394,8 +394,11 @@ function Resolve-DetachReconciliation {
     }
     # The fixed VHD path is the detachment capability.  A nonzero result is
     # recoverable only when the structured delta proves exactly one exact-size
-    # device disappeared; the evidence, not a stale sidecar or a guessed
-    # /dev name, closes the reconciliation.
+    # device disappeared and the exact-path mutation succeeded; the evidence,
+    # not a stale sidecar or a guessed /dev name, closes the reconciliation.
+    if ($UnmountExitCode -ne 0) {
+        throw "WSL VHD detachment did not succeed before device attribution"
+    }
     [pscustomobject]@{
         Action = "reconciled-detached"
         LinuxDevice = [string]$missing[0].LinuxDevice
