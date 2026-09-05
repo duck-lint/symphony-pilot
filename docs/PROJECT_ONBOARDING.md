@@ -11,7 +11,8 @@ $EDITOR projects/example-four/profile.toml
 python3 scripts/validate_profile.py
 python3 scripts/list_projects.py
 python3 scripts/provision_secret.py --project example-four
-python3 scripts/provision_publication_key.py --project example-four < publication-key.pem
+python3 scripts/provision_publication_key.py --project example-four
+python3 scripts/task.py bind-publication-key --project example-four
 python3 scripts/deploy.py --project example-four --dry-run
 python3 scripts/deploy.py --project example-four
 python3 scripts/project.py --project example-four test

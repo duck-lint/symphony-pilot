@@ -71,8 +71,8 @@ class StructuralCutoverTests(unittest.TestCase):
             outbox.validate_request(dict(request, disposition="publish"), task)
 
     def test_ruleset_contract_is_real_shape_and_fail_closed(self):
-        good = {"target": "branch", "enforcement": "active",
-                "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"]}},
+        good = {"id": 7, "target": "branch", "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
                 "bypass_actors": [], "rules": [{"type": "pull_request"}]}
         self.assertEqual(rulesets.require_default_branch_ruleset([good], "master"), good)
         for bad in (dict(good, enforcement="disabled"),
@@ -124,81 +124,11 @@ class StructuralCutoverTests(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
-    @unittest.skipIf(os.name == "nt", "descriptor publication ingestion is a native Linux/WSL contract")
-    def test_publication_ingestion_rejects_symlink_fifo_and_oversize(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            regular = root / "regular.bundle"
-            regular.write_bytes(b"bundle")
-            link = root / "publication.bundle"
-            link.symlink_to(regular)
-            with self.assertRaises(publication.PublicationError):
-                with publication.ingest_bundle(link):
-                    pass
-            fifo = root / "fifo.bundle"
-            os.mkfifo(fifo)
-            with self.assertRaises(publication.PublicationError):
-                with publication.ingest_bundle(fifo):
-                    pass
-            oversized = root / "oversized.bundle"
-            with oversized.open("wb") as stream:
-                stream.truncate(publication.MAX_BUNDLE_BYTES + 1)
-            with self.assertRaises(publication.PublicationError):
-                with publication.ingest_bundle(oversized):
-                    pass
-
-    @unittest.skipIf(os.name == "nt", "descriptor publication ingestion is a native Linux/WSL contract")
-    def test_publication_staging_survives_task_path_replacement(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            bundle = root / "publication.bundle"
-            bundle.write_bytes(b"original-bundle")
-            with publication.ingest_bundle(bundle) as staged:
-                bundle.unlink()
-                bundle.write_bytes(b"attacker-bundle")
-                self.assertEqual(staged.read_bytes(), b"original-bundle")
-
-    @unittest.skipIf(os.name == "nt", "descriptor publication ingestion is a native Linux/WSL contract")
-    def test_publication_ingestion_cleans_staging_after_metadata_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bundle = pathlib.Path(directory) / "publication.bundle"
-            bundle.write_bytes(b"bundle")
-            created: list[pathlib.Path] = []
-            temp_root = pathlib.Path(tempfile.gettempdir())
-            staging_before = set(temp_root.glob("symphony-pilot-bundle-*"))
-            real_named_temporary_file = tempfile.NamedTemporaryFile
-            real_fstat = publication.os.fstat
-            fstat_calls = 0
-
-            def track_staging(*args, **kwargs):
-                target = real_named_temporary_file(*args, **kwargs)
-                created.append(pathlib.Path(target.name))
-                return target
-
-            def mutate_metadata(fd):
-                nonlocal fstat_calls
-                fstat_calls += 1
-                result = real_fstat(fd)
-                if fstat_calls == 2:
-                    return mock.Mock(
-                        st_dev=result.st_dev,
-                        st_ino=result.st_ino,
-                        st_size=result.st_size,
-                        st_mtime_ns=result.st_mtime_ns + 1,
-                        st_ctime_ns=result.st_ctime_ns,
-                    )
-                return result
-
-            with mock.patch.object(publication.tempfile, "NamedTemporaryFile", side_effect=track_staging), \
-                 mock.patch.object(publication.os, "fstat", side_effect=mutate_metadata):
-                with self.assertRaises(publication.PublicationError):
-                    with publication.ingest_bundle(bundle):
-                        self.fail("metadata mutation should fail before yield")
-
-            self.assertEqual(fstat_calls, 2)
-            self.assertEqual(len(created), 1)
-            self.assertFalse(created[0].exists())
-            self.assertEqual(set(temp_root.glob("symphony-pilot-bundle-*")), staging_before)
+    def test_publication_does_not_consume_legacy_model_bundle(self):
+        source = (ROOT / "runtime/publication.py").read_text(encoding="utf-8")
+        self.assertNotIn("from outbox", source)
+        self.assertNotIn("task_bundle_path", source)
+        self.assertNotIn("ready_for_human_merge", source)
 
     def test_runtime_lock_is_strict(self):
         lock = {"schema": runtime_lock.LOCK_SCHEMA, **self.runtime_identity()}
@@ -235,45 +165,12 @@ class StructuralCutoverTests(unittest.TestCase):
         self.assertEqual(lifecycle.RESULT_SCHEMA, "symphony-pilot-lifecycle-result/v1")
         self.assertIn("requested_resolved_finding_ids", source)
 
-    @unittest.skipIf(os.name == "nt", "publication deploy-key mode is a native WSL contract")
-    def test_publication_imports_fixed_bundle_into_sterile_repo(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            source = root / "source"
-            remote = root / "remote.git"
-            source.mkdir()
-            self.git(source, "init", "-b", "master")
-            self.git(source, "config", "user.email", "fixture@example.test")
-            self.git(source, "config", "user.name", "fixture")
-            (source / "README").write_text("base\n", encoding="utf-8")
-            self.git(source, "add", "README")
-            self.git(source, "commit", "-m", "base")
-            base = self.git(source, "rev-parse", "HEAD")
-            self.git(root, "clone", "--bare", str(source), str(remote))
-            self.git(source, "switch", "-c", "task")
-            (source / "README").write_text("task\n", encoding="utf-8")
-            self.git(source, "commit", "-am", "task")
-            head = self.git(source, "rev-parse", "HEAD")
-            bundle = root / "publication.bundle"
-            self.git(source, "bundle", "create", str(bundle), "HEAD")
-            task = dict(self.task(), base_sha=base)
-            profile = mock.Mock(git_remote=str(remote))
-            key = root / "publication-ssh-key"
-            key.write_text("synthetic-key", encoding="utf-8")
-            key.chmod(0o600)
-            original_git = publication._git
-            replaced = False
-            def replace_task_path(*args, **kwargs):
-                nonlocal replaced
-                if not replaced:
-                    bundle.write_bytes(b"attacker-replacement")
-                    replaced = True
-                return original_git(*args, **kwargs)
-            with mock.patch.object(publication, "publication_key_path", return_value=key), \
-                 mock.patch.object(publication, "_git", side_effect=replace_task_path):
-                self.assertEqual(publication.publish_bundle(profile, task, bundle, head), head)
-            self.assertTrue(replaced)
-            self.assertEqual(self.git(remote, "rev-parse", task["issue_branch"]), head)
+    def test_publication_remote_is_registered_repository_derived(self):
+        profile = mock.Mock(repository="owner/project")
+        self.assertEqual(
+            publication.canonical_publication_remote(profile),
+            "git@github.com:owner/project.git",
+        )
 
 
 if __name__ == "__main__":

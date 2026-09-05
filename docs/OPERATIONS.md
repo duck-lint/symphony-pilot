@@ -5,9 +5,11 @@ All physical lifecycle operations run in the WSL/Linux operator environment. Nat
 ## Before start
 
 1. Validate the complete project registry, including `trusted_dispatchers`.
-2. Provision any currently retained host-side publication credential and the
-   derived publication deploy key. The Runtime scheduler does not receive a
-   tracker token.
+2. Provision or explicitly adopt the host-side Ed25519 publication key, then
+   bind its public key to exactly one writable GitHub deploy key:
+   `python3 scripts/provision_publication_key.py --project <slug>` followed by
+   `python3 scripts/task.py bind-publication-key --project <slug>`. The Runtime
+   scheduler does not receive a GitHub API credential.
 3. Deploy from a clean reviewed source checkout.
 4. Build the reviewed `symphony-runtime` repository, then pin and review the owned Symphony runtime, Codex, and unshare executable identities with `scripts/pin_runtime.py --project <slug>`.
 5. Configure one active GitHub repository ruleset targeting `~DEFAULT_BRANCH`, with a `pull_request` rule and no `bypass_actors`.
@@ -19,6 +21,7 @@ Task mutation is explicit and host-only:
     python3 scripts/task.py queue --project <slug> --task T-000001
     python3 scripts/task.py list --project <slug>
     python3 scripts/task.py show --project <slug> --task T-000001
+    python3 scripts/task.py publish --project <slug> --task T-000001
 
 Start verifies deployment coherence, runtime lock, containment capability, and
 the host-side protection preflight before launching a process. It does not
@@ -40,7 +43,11 @@ finishes the Architect attempt and records an infrastructure blocker. Resolve
 one inspected blocker with the exact project-scoped `task resolve-blocker`
 command, then the retained active lifecycle state becomes routable naturally.
 Do not delete lifecycle evidence or repair a task by manually setting its
-state. A task at ARCHIVIST is intentionally parked until Step 7 publication.
+state. A task at ARCHIVIST is intentionally parked until the explicit Step-7
+publication command. Publication derives repository, branch, base, HEAD,
+credentials, ruleset evidence, and PR identity from host state; it never
+consumes model publication prose. A failed publication preserves external
+recovery evidence and records an infrastructure blocker.
 
 ## Ordinary controls
 

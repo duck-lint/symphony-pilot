@@ -1211,6 +1211,186 @@ class ControlPlaneDatabase:
         task_id = _uuid(task_id, "task_id")
         return _row(self.connection.execute("SELECT * FROM publications WHERE task_id = ?", (task_id,)).fetchone())
 
+    def start_publication(
+        self,
+        task_id: str | uuid.UUID,
+        *,
+        head_sha: str,
+        remote_branch: str,
+        started_at: str | None = None,
+    ) -> dict[str, object]:
+        """Persist the exact publication intent before external mutation."""
+        task_id = _uuid(task_id, "task_id")
+        head_sha = _sha(head_sha, "head_sha")
+        remote_branch = _text(remote_branch, "remote_branch")
+        timestamp = _timestamp(started_at, "started_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            if task["state"] != "ARCHIVIST" or task["current_head"] != head_sha:
+                raise StateConflict("publication requires the exact current ARCHIVIST head")
+            if self.connection.execute(
+                "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task_id,)
+            ).fetchone():
+                raise StateConflict("publication requires no open blocker")
+            if self.connection.execute(
+                "SELECT 1 FROM role_runs WHERE task_id = ? AND role = 'ARCHITECT' AND status = 'started' LIMIT 1",
+                (task_id,),
+            ).fetchone():
+                raise StateConflict("publication requires no started Architect attempt")
+            for event_type in ("review_accepted", "adversary_accepted", "validation_passed"):
+                accepted = False
+                for event in self.connection.execute(
+                    "SELECT payload_json FROM task_events WHERE task_id = ? AND event_type = ?",
+                    (task_id, event_type),
+                ).fetchall():
+                    try:
+                        payload = json.loads(event[0])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict) and payload.get("head_sha") == head_sha:
+                        accepted = True
+                        break
+                if not accepted:
+                    raise StateConflict("publication requires the complete exact-current-HEAD acceptance chain")
+            if not self.connection.execute(
+                "SELECT 1 FROM role_runs WHERE task_id = ? AND role = 'ARCHIVIST' "
+                "AND status = 'finished' AND head_sha = ? LIMIT 1",
+                (task_id, head_sha),
+            ).fetchone():
+                raise StateConflict("publication requires archival closeout for the exact current HEAD")
+            current = self.read_publication(task_id)
+            if current and current["publication_status"] == "published":
+                raise StateConflict("publication is already finalized")
+            if current and current["publication_status"] == "started":
+                if current["head_sha"] != head_sha or current["remote_branch"] != remote_branch:
+                    raise StateConflict("started publication intent does not match the exact task identity")
+                return current
+            self.connection.execute(
+                """
+                INSERT INTO publications(task_id, head_sha, remote_branch, github_pr_number,
+                                         publication_status, published_at)
+                VALUES (?, ?, ?, NULL, 'started', NULL)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    head_sha = excluded.head_sha,
+                    remote_branch = excluded.remote_branch,
+                    github_pr_number = publications.github_pr_number,
+                    publication_status = 'started',
+                    published_at = NULL
+                """,
+                (task_id, head_sha, remote_branch),
+            )
+            self._insert_event(
+                task_id, "publication_started",
+                {"head_sha": head_sha, "remote_branch": remote_branch},
+                occurred_at=timestamp,
+            )
+        return self.read_publication(task_id)
+
+    def finalize_publication(
+        self,
+        task_id: str | uuid.UUID,
+        *,
+        head_sha: str,
+        remote_branch: str,
+        github_pr_number: int,
+        evidence: dict[str, object],
+        published_at: str | None = None,
+    ) -> dict[str, object]:
+        """Atomically publish and move ARCHIVIST to READY_FOR_HUMAN_MERGE."""
+        task_id = _uuid(task_id, "task_id")
+        head_sha = _sha(head_sha, "head_sha")
+        remote_branch = _text(remote_branch, "remote_branch")
+        if not isinstance(github_pr_number, int) or isinstance(github_pr_number, bool) or github_pr_number < 1:
+            raise ValueError("github_pr_number must be positive")
+        if not isinstance(evidence, dict):
+            raise ValueError("publication evidence must be an object")
+        timestamp = _timestamp(published_at, "published_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            if task["state"] != "ARCHIVIST" or task["current_head"] != head_sha:
+                raise StateConflict("publication finalization requires the exact current ARCHIVIST head")
+            if self.connection.execute(
+                "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task_id,)
+            ).fetchone():
+                raise StateConflict("publication finalization requires no open blocker")
+            intent = self.read_publication(task_id)
+            if not intent or intent["publication_status"] != "started" or intent["head_sha"] != head_sha or intent["remote_branch"] != remote_branch:
+                raise StateConflict("matching started publication intent is missing")
+            self.connection.execute(
+                "UPDATE publications SET head_sha = ?, remote_branch = ?, github_pr_number = ?, "
+                "publication_status = 'published', published_at = ? WHERE task_id = ? AND publication_status = 'started'",
+                (head_sha, remote_branch, github_pr_number, timestamp, task_id),
+            )
+            self.connection.execute(
+                "UPDATE tasks SET published_head = ?, updated_at = ? WHERE id = ?",
+                (head_sha, timestamp, task_id),
+            )
+            payload = dict(evidence)
+            payload.update({"head": head_sha, "branch": remote_branch, "pr_number": github_pr_number})
+            self._insert_event(task_id, "publication_finished", payload, occurred_at=timestamp)
+            changed = self.connection.execute(
+                "UPDATE tasks SET state = 'READY_FOR_HUMAN_MERGE', updated_at = ? "
+                "WHERE id = ? AND state = 'ARCHIVIST'",
+                (timestamp, task_id),
+            ).rowcount
+            if changed != 1:
+                raise StateConflict("ARCHIVIST state changed during publication finalization")
+            self._insert_event(
+                task_id, "ready_for_human_merge", payload, occurred_at=timestamp,
+            )
+        return self.read_task(task_id)
+
+    def fail_publication(
+        self,
+        task_id: str | uuid.UUID,
+        *,
+        detail: str,
+        head_sha: str | None = None,
+        remote_branch: str | None = None,
+        github_pr_number: int | None = None,
+    ) -> dict[str, object]:
+        """Record a publication failure without deleting external recovery evidence."""
+        task_id = _uuid(task_id, "task_id")
+        detail = _text(detail, "publication failure detail")
+        head_sha = _sha(head_sha, "head_sha")
+        if remote_branch is not None:
+            remote_branch = _text(remote_branch, "remote_branch")
+        if github_pr_number is not None and (not isinstance(github_pr_number, int) or isinstance(github_pr_number, bool) or github_pr_number < 1):
+            raise ValueError("github_pr_number must be positive")
+        timestamp = _timestamp(None, "created_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            current = self.read_publication(task_id)
+            retained_head = head_sha or (current["head_sha"] if current else None)
+            retained_branch = remote_branch or (current["remote_branch"] if current else None)
+            retained_pr = github_pr_number or (current["github_pr_number"] if current else None)
+            self.connection.execute(
+                """
+                INSERT INTO publications(task_id, head_sha, remote_branch, github_pr_number,
+                                         publication_status, published_at)
+                VALUES (?, ?, ?, ?, 'failed', NULL)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    head_sha = excluded.head_sha,
+                    remote_branch = excluded.remote_branch,
+                    github_pr_number = excluded.github_pr_number,
+                    publication_status = 'failed',
+                    published_at = NULL
+                """,
+                (task_id, retained_head, retained_branch, retained_pr),
+            )
+            blocker_id = str(uuid.uuid4())
+            self.connection.execute(
+                "INSERT INTO blockers(id, task_id, kind, body, status, created_at, resolved_at) "
+                "VALUES (?, ?, 'infrastructure', ?, 'open', ?, NULL)",
+                (blocker_id, task_id, detail, timestamp),
+            )
+            self._insert_event(
+                task_id, "infrastructure_blocked",
+                {"blocker_id": blocker_id, "kind": "infrastructure"},
+                occurred_at=timestamp,
+            )
+        return self.read_publication(task_id)
+
     def update_heads(
         self,
         task_id: str | uuid.UUID,

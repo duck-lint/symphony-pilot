@@ -40,6 +40,12 @@ CONTRACT_FILES = (
     "runtime/control_db.py",
     "runtime/runtime_lock.py",
     "runtime/launch_codex.sh",
+    # Step-7 publication remains host-only, but its source is authority-
+    # relevant and must invalidate a reviewed deployment when it changes.
+    "runtime/publication.py",
+    "runtime/publication_key.py",
+    "runtime/rulesets.py",
+    "scripts/provision_publication_key.py",
     *POLICY_FILES,
 )
 

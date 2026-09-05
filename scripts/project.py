@@ -352,7 +352,7 @@ def start(profile):
     except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError, ContainmentError) as exc:
         print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
         return 78
-    # This gate runs before tracker credential acquisition or process launch.
+    # This gate runs before any host process launch or publication operation.
     # It is intentionally not a fallback to the old same-user architecture.
     try:
         require_execution_capability()
@@ -367,19 +367,8 @@ def start(profile):
             return 78
         print("Cannot start Symphony: stale process state requires explicit recovery before cutover")
         return 78
-    # This credential is used only for the host-side branch-protection
-    # preflight. It is not tracker configuration and never enters Runtime's
-    # scheduler environment.
-    try:
-        token = read_secret(profile)
-    except PreparationError as exc:
-        print(f"Cannot verify protected default branch: {exc}")
-        return 1
-    try:
-        branch_protection_preflight(profile, token)
-    except (RulesetError, PreparationError) as exc:
-        print(f"Cannot start Symphony: protected default-branch preflight failed: {exc}")
-        return 78
+    # GitHub publication authorization is a Step-7 task operation.  Runtime
+    # startup must not read the API credential or make a publication preflight.
     try:
         establish_awake_guard(profile)
     except (RuntimeError, PreparationError) as exc:

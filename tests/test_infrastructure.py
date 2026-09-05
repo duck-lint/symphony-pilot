@@ -183,7 +183,7 @@ class InfrastructureTests(unittest.TestCase):
         import project
         profile = self.profile(pathlib.Path("/tmp"))
         ruleset = {"id": 7, "target": "branch", "enforcement": "active",
-                   "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"]}},
+                   "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
                    "bypass_actors": [], "rules": [{"type": "pull_request"}]}
         with mock.patch.object(project, "github", side_effect=[{"default_branch": "master"}, [{"id": 7}], ruleset]) as api:
             self.assertEqual(project.branch_protection_preflight(profile, "token"), ruleset)
@@ -223,8 +223,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(outbox.validate_request(request, task), request)
         with self.assertRaises(outbox.OutboxError):
             outbox.validate_request(dict(request, branch="master"), task)
-        good = {"target": "branch", "enforcement": "active",
-                "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"]}},
+        good = {"id": 7, "target": "branch", "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
                 "bypass_actors": [], "rules": [{"type": "pull_request"}]}
         self.assertEqual(rulesets.require_default_branch_ruleset([good], "master"), good)
         with self.assertRaises(rulesets.RulesetError):

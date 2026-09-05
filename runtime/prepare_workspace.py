@@ -283,9 +283,9 @@ def read_secret(profile: Profile) -> str:
             raise PreparationError("secret_permissions", "project secret file must have mode 0600")
         value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError as exc:
-        raise PreparationError("credential_missing", "project tracker credential is unavailable") from exc
+        raise PreparationError("credential_missing", "project GitHub API credential is unavailable") from exc
     if not value or "\n" in value or "\r" in value:
-        raise PreparationError("credential_invalid", "project tracker credential file is invalid")
+        raise PreparationError("credential_invalid", "project GitHub API credential file is invalid")
     return value
 
 
@@ -304,6 +304,7 @@ def github(profile: Profile, token: str, method: str, path: str, body: object | 
         url, data=data, method=method,
         headers={"Authorization": "Bearer " + token,
                  "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28",
                  "Content-Type": "application/json",
                  "User-Agent": "symphony-pilot-host"})
     try:
