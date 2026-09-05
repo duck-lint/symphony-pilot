@@ -50,6 +50,7 @@ CONTRACT_FILES = (
     "scripts/provision_publication_key.py",
     "provisioning/quota-admit-task.c",
     "scripts/provision_storage_domain.sh",
+    "scripts/provision_storage_vhdx.ps1",
     *POLICY_FILES,
 )
 

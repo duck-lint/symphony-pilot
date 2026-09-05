@@ -39,6 +39,60 @@ class WorkspaceBoundaryTests(unittest.TestCase):
             with self.assertRaises(boundary.WorkspaceBoundaryError):
                 boundary.create_empty_task_workspace(project_root, "T-000001")
 
+    def test_reclaim_task_workspace_removes_only_the_exact_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = pathlib.Path(directory) / "symphony-workspaces"
+            task = pool / "demo" / "T-000001"
+            (task / "nested").mkdir(parents=True)
+            (task / "nested" / "file").write_text("task", encoding="utf-8")
+            sentinel = pool / "demo" / "sentinel"
+            sentinel.write_text("retain", encoding="utf-8")
+
+            reclaimed = boundary.reclaim_task_workspace(pool, "demo", "T-000001")
+
+            self.assertEqual(reclaimed, task)
+            self.assertFalse(task.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "retain")
+
+    def test_reclaim_rejects_symlink_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = pathlib.Path(directory) / "symphony-workspaces"
+            task = pool / "demo" / "T-000001"
+            task.mkdir(parents=True)
+            outside = pathlib.Path(directory) / "outside"
+            outside.mkdir()
+            try:
+                (task / "escape").symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are unavailable on this host")
+            with self.assertRaisesRegex(boundary.WorkspaceBoundaryError, "symlink"):
+                boundary.reclaim_task_workspace(pool, "demo", "T-000001")
+            self.assertTrue(task.exists())
+            self.assertTrue(outside.exists())
+
+    def test_reclaim_rejects_mounted_descendant_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = pathlib.Path(directory) / "symphony-workspaces"
+            mounted = pool / "demo" / "T-000001" / "mounted"
+            mounted.mkdir(parents=True)
+            (mounted / "keep").write_text("keep", encoding="utf-8")
+            with mock.patch.object(boundary.os.path, "ismount",
+                                   side_effect=lambda path: pathlib.Path(path).name == "mounted"):
+                with self.assertRaisesRegex(boundary.WorkspaceBoundaryError, "mountpoint"):
+                    boundary.reclaim_task_workspace(pool, "demo", "T-000001")
+            self.assertTrue(mounted.exists())
+
+    def test_reclaim_rejects_process_owned_workspace_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = pathlib.Path(directory) / "symphony-workspaces"
+            task = pool / "demo" / "T-000001"
+            task.mkdir(parents=True)
+            (task / "keep").write_text("keep", encoding="utf-8")
+            with mock.patch.object(boundary, "_workspace_is_process_owned", return_value=True):
+                with self.assertRaisesRegex(boundary.WorkspaceBoundaryError, "live process"):
+                    boundary.reclaim_task_workspace(pool, "demo", "T-000001")
+            self.assertTrue(task.exists())
+
     def case(self):
         case = fixtures.Step6LifecycleTests("runTest")
         case.setUp()

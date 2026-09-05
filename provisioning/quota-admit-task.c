@@ -251,7 +251,8 @@ static int release_task(const char *project, const char *identifier) {
     project_fd = openat(root, project, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (project_fd < 0 || !fstatat(project_fd, identifier, &st, AT_SYMLINK_NOFOLLOW)) goto fail;
     if (errno != ENOENT || quota_get(root, id, &quota) || quota.dqb_curspace || quota.dqb_curinodes ||
-        quota_set(root, id, 0, 0) || quota_get(root, id, &quota) || quota.dqb_curspace || quota.dqb_curinodes) goto fail;
+        quota_set(root, id, 0, 0) || quota_get(root, id, &quota) || quota.dqb_curspace || quota.dqb_curinodes ||
+        quota.dqb_bhardlimit || quota.dqb_ihardlimit) goto fail;
     printf("{\"schema\":\"symphony-pilot-task-quota-release/v1\",\"project\":\"%s\",\"identifier\":\"%s\",\"workspace_path\":\"%s\",\"project_id\":%u,\"workspace_state\":\"destroyed\",\"quota_state\":\"removed\",\"growth_possible\":false,\"remaining_bytes\":0,\"remaining_inodes\":0}\n", project, identifier, path, id);
     close(project_fd); close(root); return 0;
 fail:

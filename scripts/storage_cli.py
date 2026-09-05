@@ -3,8 +3,9 @@
 
 Linux work is restricted to fixed quota capabilities exposed by the WSL
 adapter. This command never provisions devices, selects quota IDs, or accepts
-paths and limits from the caller. Release accepts only proof that the exact
-task workspace and quota cannot grow.
+paths and limits from the caller. Release is a trusted PREPARED-admission
+recovery route: it destroys the exact task tree before asking the fixed helper
+to prove that the quota identity is empty and removed.
 """
 from __future__ import annotations
 
@@ -16,8 +17,11 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
-from control_db import ControlPlaneDatabase, ControlPlaneError, default_database_path  # noqa: E402
+from control_db import (ControlPlaneDatabase, ControlPlaneError, StateConflict,
+                        default_database_path)  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
+from workspace_boundary import (WorkspaceBoundaryError,
+                                reclaim_task_workspace)  # noqa: E402
 from storage import (StorageContractError, capacity_snapshot,
                      storage_release_proof_from_evidence,
                      verify_storage_evidence)  # noqa: E402
@@ -53,7 +57,22 @@ def release(args: argparse.Namespace) -> int:
 
     with ControlPlaneDatabase.open(default_database_path()) as database:
         task = database.read_task_by_identifier(args.task, project_slug=profile.slug)
+        reservation = database.read_storage_reservation(task["id"])
+        if task["state"] != "PREPARED":
+            raise StateConflict(
+                "storage reclamation is authorized only for PREPARED admission recovery; "
+                "post-QUEUED reservations are retained"
+            )
+        if reservation is None or reservation["status"] != "reserved":
+            raise ControlPlaneError("PREPARED task has no reserved storage to reclaim")
         try:
+            # SQLite/profile identity is the only source of the project/T-N.
+            # The producer is unprivileged and never accepts a caller path.
+            reclaim_task_workspace(
+                pathlib.Path(profile.workspace_root).parent,
+                profile.slug,
+                str(task["identifier"]),
+            )
             evidence = release_task_quota(
                 profile.slug, str(task["identifier"]),
                 request_id=f"storage-{profile.slug}-{task['identifier']}-release",
@@ -62,7 +81,7 @@ def release(args: argparse.Namespace) -> int:
                 evidence, project=profile.slug, identifier=str(task["identifier"]),
             )
             released = database.release_storage_reservation(task["id"], proof=proof)
-        except (WslAdapterError, StorageContractError) as exc:
+        except (WslAdapterError, StorageContractError, WorkspaceBoundaryError) as exc:
             raise ControlPlaneError(f"storage cleanup failed closed: {exc}") from exc
     print(json.dumps({"project": profile.slug, "task": task["identifier"],
                       "reservation": released}, sort_keys=True))

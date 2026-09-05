@@ -255,7 +255,9 @@ class StorageContractTests(unittest.TestCase):
                     project_slug="demo", title="Storage", objective="Cleanup proof",
                     base_ref="main", base_sha="a" * 40, identifier="T-000001",
                 )
-                self.queue_with_reservation(database, task)
+                database.reserve_storage_capacity(
+                    task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                )
                 with self.assertRaisesRegex(StorageContractError, "cleanup proof"):
                     database.release_storage_reservation(task["id"], proof=None)
                 evidence = {
@@ -281,7 +283,9 @@ class StorageContractTests(unittest.TestCase):
                     project_slug="demo", title="Storage", objective="Retained usage",
                     base_ref="main", base_sha="a" * 40, identifier="T-000001",
                 )
-                self.queue_with_reservation(database, first, constrained)
+                database.reserve_storage_capacity(
+                    first["id"], project_slug="demo", domain=constrained, policy=self.policy(),
+                )
                 evidence = {
                     "schema": "symphony-pilot-task-quota-release/v1",
                     "project_id": derive_quota_id("T-000001"),

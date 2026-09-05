@@ -7,6 +7,7 @@ not licensed by this boundary (the Step-8 execution gate remains mandatory).
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import pathlib
 import re
@@ -24,6 +25,7 @@ class WorkspaceBoundaryError(RuntimeError):
 MAX_METADATA_BYTES = 128 * 1024
 GIT_EXECUTABLE = shutil.which("git")
 TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
+PROJECT_IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 
 
 def physical_directory(path: pathlib.Path) -> pathlib.Path:
@@ -71,6 +73,220 @@ def create_empty_task_workspace(workspace_root: pathlib.Path, identifier: str) -
     # Keep the variable in the contract: the task path must be physically
     # below the pool we validated, not merely textually below a profile path.
     task_root.relative_to(pool_root)
+    return task_root
+
+
+def _workspace_is_process_owned(workspace: pathlib.Path) -> bool:
+    """Conservatively reject a task whose cwd belongs to any live process.
+
+    The release route has no authority to identify an arbitrary task process
+    by executable name.  A live ``/proc/<pid>/cwd`` below the exact task tree
+    is therefore sufficient evidence to retain the reservation.  Missing
+    process entries are normal races while scanning /proc; an unavailable
+    /proc is not proof of safety and fails closed on Linux.
+    """
+    if os.name != "posix":
+        return False
+    proc = pathlib.Path("/proc")
+    if not proc.is_dir():
+        raise WorkspaceBoundaryError("managed task process ownership cannot be checked")
+    workspace_text = os.path.abspath(workspace).rstrip(os.sep)
+    try:
+        entries = list(proc.iterdir())
+    except OSError as exc:
+        raise WorkspaceBoundaryError("managed task process ownership cannot be checked") from exc
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            cwd = os.readlink(entry / "cwd")
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        cwd = cwd.removesuffix(" (deleted)").rstrip(os.sep)
+        if cwd == workspace_text or cwd.startswith(workspace_text + os.sep):
+            return True
+    return False
+
+
+def _validate_reclamation_entry(path: pathlib.Path, root_device: int) -> os.stat_result:
+    """Admit only ordinary files/directories on the task's filesystem."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise WorkspaceBoundaryError("task workspace cannot be inspected") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise WorkspaceBoundaryError("task workspace contains a symlink")
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise WorkspaceBoundaryError("task workspace contains a special filesystem entry")
+    if info.st_dev != root_device:
+        raise WorkspaceBoundaryError("task workspace crosses a filesystem boundary")
+    if os.path.ismount(path):
+        raise WorkspaceBoundaryError("task workspace contains an unexpected mountpoint")
+    return info
+
+
+def _inspect_reclamation_tree(path: pathlib.Path, root_device: int) -> None:
+    """Preflight one tree without following links or crossing mounts."""
+    info = _validate_reclamation_entry(path, root_device)
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    try:
+        entries = list(os.scandir(path))
+    except OSError as exc:
+        raise WorkspaceBoundaryError("task workspace cannot be enumerated") from exc
+    for entry in entries:
+        _inspect_reclamation_tree(path / entry.name, root_device)
+
+
+def _remove_reclamation_tree(path: pathlib.Path) -> None:
+    """Remove a preflighted Windows/test fallback tree without link traversal."""
+    for entry in list(os.scandir(path)):
+        child = path / entry.name
+        info = _validate_reclamation_entry(child, os.lstat(path).st_dev)
+        if stat.S_ISDIR(info.st_mode):
+            _remove_reclamation_tree(child)
+        else:
+            os.unlink(child)
+    os.rmdir(path)
+
+
+def _inspect_reclamation_fd(fd: int, path: pathlib.Path, root_device: int) -> None:
+    """Descriptor-based Linux preflight for the exact task directory."""
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_dev != root_device or os.path.ismount(path):
+        raise WorkspaceBoundaryError("task workspace is not a plain directory on the pool")
+    try:
+        entries = list(os.scandir(fd))
+    except OSError as exc:
+        raise WorkspaceBoundaryError("task workspace cannot be enumerated") from exc
+    for entry in entries:
+        child = path / entry.name
+        try:
+            child_info = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise WorkspaceBoundaryError("task workspace entry cannot be inspected") from exc
+        if stat.S_ISLNK(child_info.st_mode):
+            raise WorkspaceBoundaryError("task workspace contains a symlink")
+        if not (stat.S_ISDIR(child_info.st_mode) or stat.S_ISREG(child_info.st_mode)):
+            raise WorkspaceBoundaryError("task workspace contains a special filesystem entry")
+        if child_info.st_dev != root_device or os.path.ismount(child):
+            raise WorkspaceBoundaryError("task workspace crosses a filesystem boundary")
+        if stat.S_ISDIR(child_info.st_mode):
+            try:
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except OSError as exc:
+                raise WorkspaceBoundaryError("task workspace directory cannot be pinned") from exc
+            try:
+                _inspect_reclamation_fd(child_fd, child, root_device)
+            finally:
+                os.close(child_fd)
+
+
+def _remove_reclamation_fd(fd: int) -> None:
+    """Delete children through directory descriptors opened without links."""
+    try:
+        entries = list(os.scandir(fd))
+    except OSError as exc:
+        raise WorkspaceBoundaryError("task workspace cannot be enumerated for removal") from exc
+    for entry in entries:
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise WorkspaceBoundaryError("task workspace changed to an unsafe entry")
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except OSError as exc:
+                raise WorkspaceBoundaryError("task workspace directory cannot be pinned for removal") from exc
+            try:
+                _remove_reclamation_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(entry.name, dir_fd=fd)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("task workspace directory could not be removed") from exc
+        else:
+            try:
+                os.unlink(entry.name, dir_fd=fd)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("task workspace file could not be removed") from exc
+
+
+def reclaim_task_workspace(
+    pool_root: pathlib.Path, project: str, identifier: str,
+) -> pathlib.Path:
+    """Destroy exactly one host-derived task tree before quota release.
+
+    The project and T-N are supplied by trusted SQLite/profile resolution;
+    callers never supply an arbitrary path.  Linux uses descriptor-relative
+    operations so a replacement ancestor cannot redirect deletion.  The
+    preflight rejects links, special files, mountpoints, and foreign devices
+    before any child is removed.
+    """
+    if not PROJECT_IDENTIFIER.fullmatch(project) or not TASK_IDENTIFIER.fullmatch(identifier):
+        raise WorkspaceBoundaryError("reclamation identity is malformed")
+    pool = physical_directory(pathlib.Path(pool_root))
+    project_root = pool / project
+    try:
+        project_info = project_root.lstat()
+    except FileNotFoundError:
+        return project_root / identifier
+    except OSError as exc:
+        raise WorkspaceBoundaryError("reclamation project root cannot be inspected") from exc
+    if (not stat.S_ISDIR(project_info.st_mode) or stat.S_ISLNK(project_info.st_mode) or
+            project_info.st_dev != pool.stat().st_dev or os.path.ismount(project_root)):
+        raise WorkspaceBoundaryError("reclamation project root is not a plain pool directory")
+    task_root = project_root / identifier
+    if not os.path.lexists(task_root):
+        return task_root
+    task_info = _validate_reclamation_entry(task_root, project_info.st_dev)
+    if not stat.S_ISDIR(task_info.st_mode):
+        raise WorkspaceBoundaryError("task workspace is not a directory")
+    if _workspace_is_process_owned(task_root):
+        raise WorkspaceBoundaryError("task workspace is owned by a live process")
+
+    if os.name == "posix":
+        with _parent_descriptor(project_root) as (_, project_fd):
+            try:
+                task_fd = os.open(
+                    identifier,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=project_fd,
+                )
+            except OSError as exc:
+                raise WorkspaceBoundaryError("task workspace could not be pinned") from exc
+            try:
+                _inspect_reclamation_fd(task_fd, task_root, project_info.st_dev)
+                if _workspace_is_process_owned(task_root):
+                    raise WorkspaceBoundaryError("task workspace became owned by a live process")
+                _remove_reclamation_fd(task_fd)
+            finally:
+                os.close(task_fd)
+            try:
+                os.rmdir(identifier, dir_fd=project_fd)
+            except OSError as exc:
+                raise WorkspaceBoundaryError("task workspace root could not be removed") from exc
+            try:
+                os.stat(identifier, dir_fd=project_fd, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    return task_root
+                raise WorkspaceBoundaryError("task workspace remained after removal") from exc
+    else:
+        _inspect_reclamation_tree(task_root, project_info.st_dev)
+        if _workspace_is_process_owned(task_root):
+            raise WorkspaceBoundaryError("task workspace became owned by a live process")
+        _remove_reclamation_tree(task_root)
+        if os.path.lexists(task_root):
+            raise WorkspaceBoundaryError("task workspace remained after removal")
     return task_root
 
 

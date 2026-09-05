@@ -82,40 +82,39 @@ ACTUAL_SOURCE_SHA256=$(sha256sum "$HELPER_SOURCE" | awk '{print $1}')
     fail "quota helper source differs from the reviewed supervisor digest"
 
 DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE" 2>/dev/null || true)
-if [ -z "$DEVICE_TYPE" ]; then
-    mountpoint -q "$POOL_ROOT" && fail "storage pool mount target is already occupied"
-else
+POOL_DEVICE_REAL=$(readlink -f -- "$POOL_DEVICE")
+if [ -n "$DEVICE_TYPE" ]; then
     [ "$DEVICE_TYPE" = "ext4" ] || fail "existing device filesystem is not the Symphony ext4 domain"
     [ "$(blkid -o value -s LABEL "$POOL_DEVICE")" = "$POOL_LABEL" ] || \
         fail "existing filesystem is not the identified Symphony pool"
 fi
 
-# project supplies FS_IOC_FS{GET,SET}XATTR project IDs; quota supplies hidden
-# ext4 quota inodes; quotatype initializes the project quota inode. Zero
-# reserved blocks is intentional for this dedicated task-only filesystem:
-# Pilot's eight-GiB emergency reserve is a separate admission policy.
-if [ -z "$DEVICE_TYPE" ]; then
-    mkfs.ext4 -L "$POOL_LABEL" -m 0 -i 65536 -I 256 -J size=64 \
-    -O project,quota -E quotatype=prjquota "$POOL_DEVICE"
-fi
-DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE")
-DEVICE_LABEL=$(blkid -o value -s LABEL "$POOL_DEVICE")
-[ "$DEVICE_TYPE" = "ext4" ] || fail "Symphony pool filesystem type is not ext4"
-[ "$DEVICE_LABEL" = "$POOL_LABEL" ] || fail "Symphony pool label is not exact"
-FEATURES=$(tune2fs -l "$POOL_DEVICE" | sed -n 's/^Filesystem features:[[:space:]]*//p')
-case " $FEATURES " in *" project "*) ;; *) fail "formatted filesystem lacks ext4 project support" ;; esac
-case " $FEATURES " in *" quota "*) ;; *) fail "formatted filesystem lacks ext4 quota storage" ;; esac
-PROJECT_QUOTA_INODE=$(tune2fs -l "$POOL_DEVICE" | awk -F: '$1 == "Project quota inode" {gsub(/[[:space:]]/, "", $2); print $2}')
-[ "${PROJECT_QUOTA_INODE:-0}" -gt 0 ] || fail "project quota inode was not initialized"
-[ "$(tune2fs -l "$POOL_DEVICE" | awk -F: '$1 == "Reserved block count" {gsub(/[[:space:]]/, "", $2); print $2}')" = "0" ] || \
-    fail "reserved ext4 blocks are not zero"
-
 verify_mount() {
     [ "$(findmnt -no TARGET --target "$POOL_ROOT")" = "$POOL_ROOT" ] || fail "pool mount target is wrong"
+    MOUNT_SOURCE=$(findmnt -no SOURCE --target "$POOL_ROOT")
+    [ -n "$MOUNT_SOURCE" ] || fail "pool mount source is unavailable"
+    MOUNT_SOURCE_REAL=$(readlink -f -- "$MOUNT_SOURCE") || fail "pool mount source cannot be resolved"
+    [ "$MOUNT_SOURCE_REAL" = "$POOL_DEVICE_REAL" ] || fail "pool mount source differs from the dedicated device"
     [ "$(findmnt -no FSTYPE --target "$POOL_ROOT")" = "ext4" ] || fail "pool filesystem is not ext4"
     MOUNT_OPTIONS=$(findmnt -no OPTIONS --target "$POOL_ROOT")
     case ",$MOUNT_OPTIONS," in *,prjquota,*|*,pquota,*) ;; *) fail "pool is not mounted with project quota enforcement" ;; esac
     [ "$(findmnt -no UUID --target "$POOL_ROOT")" = "$POOL_UUID" ] || fail "pool mount UUID differs from the dedicated device"
+    [ "$(blockdev --getsize64 "$POOL_DEVICE")" -eq "$EXPECTED_BYTES" ] || \
+        fail "mounted pool backing device is not exactly 64 GiB"
+}
+
+verify_device_filesystem() {
+    DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE")
+    DEVICE_LABEL=$(blkid -o value -s LABEL "$POOL_DEVICE")
+    [ "$DEVICE_TYPE" = "ext4" ] || fail "Symphony pool filesystem type is not ext4"
+    [ "$DEVICE_LABEL" = "$POOL_LABEL" ] || fail "Symphony pool label is not exact"
+    FEATURES=$(tune2fs -l "$POOL_DEVICE" | sed -n 's/^Filesystem features:[[:space:]]*//p')
+    case " $FEATURES " in *" project "*) ;; *) fail "formatted filesystem lacks ext4 project support" ;; esac
+    case " $FEATURES " in *" quota "*) ;; *) fail "formatted filesystem lacks ext4 quota storage" ;; esac
+    PROJECT_QUOTA_INODE=$(tune2fs -l "$POOL_DEVICE" | awk -F: '$1 == "Project quota inode" {gsub(/[[:space:]]/, "", $2); print $2}')
+    [ "${PROJECT_QUOTA_INODE:-0}" -gt 0 ] || fail "project quota inode was not initialized"
+    [ "$(tune2fs -l "$POOL_DEVICE" | awk -F: '$1 == "Reserved block count" {gsub(/[[:space:]]/, "", $2); print $2}')" = "0" ] || \
+        fail "reserved ext4 blocks are not zero"
 }
 
 verify_capacity() {
@@ -128,13 +127,35 @@ EOF
     [ "$AVAILABLE_INODES" -ge "$MIN_INODES" ] || fail "unprivileged f_favail inode headroom is insufficient"
 }
 
-mkdir -p "$POOL_ROOT"
-# A retry may find the exact reviewed pool already mounted. Reuse it and let
-# the identity/option checks below decide whether it is the right mount;
-# never mount a second filesystem over an occupied target.
-if ! mountpoint -q "$POOL_ROOT"; then
+[ -n "$DEVICE_TYPE" ] && POOL_UUID=$(blkid -s UUID -o value "$POOL_DEVICE")
+if mountpoint -q "$POOL_ROOT"; then
+    # A mounted target is evidence, not an invitation to mutate.  In
+    # particular, an unrelated UUID must fail before chown/chmod/fstab/helper
+    # changes can occur.
+    [ -n "$DEVICE_TYPE" ] || fail "mounted pool target has no dedicated filesystem identity"
+    [ -n "${POOL_UUID:-}" ] || fail "dedicated filesystem UUID is unavailable"
+    verify_device_filesystem
+    verify_mount
+    POOL_MOUNTED=1
+else
+    [ ! -L "$POOL_ROOT" ] || fail "pool mount target is a symlink"
+    mkdir -p "$POOL_ROOT"
+    if [ -z "$DEVICE_TYPE" ]; then
+        # project supplies FS_IOC_FS{GET,SET}XATTR project IDs; quota supplies hidden
+        # ext4 quota inodes; quotatype initializes the project quota inode. Zero
+        # reserved blocks is intentional for this dedicated task-only filesystem:
+        # Pilot's eight-GiB emergency reserve is a separate admission policy.
+        mkfs.ext4 -L "$POOL_LABEL" -m 0 -i 65536 -I 256 -J size=64 \
+        -O project,quota -E quotatype=prjquota "$POOL_DEVICE"
+        POOL_UUID=$(blkid -s UUID -o value "$POOL_DEVICE")
+    fi
+    verify_device_filesystem
+    [ -n "${POOL_UUID:-}" ] || fail "dedicated filesystem UUID is unavailable"
     mount -t ext4 -o prjquota "$POOL_DEVICE" "$POOL_ROOT"
+    POOL_MOUNTED=1
+    verify_mount
 fi
+
 # The deployed verifier requires the shared pool root to be owned by the
 # unprivileged execution account and non-writable by group/other. Establish
 # that trust boundary on the mounted filesystem, not its pre-mount directory.

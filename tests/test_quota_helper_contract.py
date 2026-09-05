@@ -79,9 +79,33 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("-Fixed", recipe)
         self.assertIn("64GB", recipe)
         self.assertIn('VhdType -ne "Fixed"', recipe)
-        self.assertIn("--bare", recipe)
+        self.assertIn('ValidateSet("Attach", "Detach")', recipe)
+        self.assertIn('"--mount", $ExpectedPath, "--vhd", "--bare"', recipe)
+        self.assertIn('"--unmount", $ExpectedPath', recipe)
+        self.assertIn("Get-LinuxWholeDiskEvidence", recipe)
+        self.assertIn("exactly one new 64-GiB Linux disk", recipe)
+        self.assertIn("malformed JSON", recipe)
+        self.assertIn("conflicting attachment", recipe)
+        self.assertNotIn("Mount-VHD", recipe)
+        self.assertNotIn("Dismount-VHD", recipe)
+        self.assertNotIn("PHYSICALDRIVE", recipe)
+        self.assertNotIn("FileSize -ne", recipe)
         self.assertNotIn("Resize-VHD", recipe)
         self.assertNotIn("Invoke-Expression", recipe)
+
+    def test_vhdx_operator_contract_is_in_source_digest(self):
+        import deployment_contract
+        self.assertIn("scripts/provision_storage_vhdx.ps1", deployment_contract.CONTRACT_FILES)
+        before = deployment_contract.contract_digest(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            for relative in deployment_contract.CONTRACT_FILES:
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / relative).read_bytes())
+            changed = source / "scripts/provision_storage_vhdx.ps1"
+            changed.write_bytes(changed.read_bytes() + b"\n# contract mutation\n")
+            self.assertNotEqual(before, deployment_contract.contract_digest(source))
 
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("cc"),
                          "native Linux compiler unavailable")
@@ -122,6 +146,17 @@ int main(void) {{
         self.assertIn('stat -c \'%a\' "$HELPER"', recipe)
         self.assertIn('HELPER_UID=$(stat -c \'%u\' "$HELPER")', recipe)
         self.assertIn('HELPER_GID=$(stat -c \'%g\' "$HELPER")', recipe)
+
+    def test_existing_mount_identity_is_verified_before_mutation(self):
+        recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
+        self.assertLess(recipe.index("POOL_UUID=$(blkid -s UUID -o value"), recipe.index("    verify_mount\n"))
+        self.assertLess(recipe.index("if mountpoint -q \"$POOL_ROOT\"; then"), recipe.index('chown duck-lint:duck-lint'))
+        self.assertLess(recipe.index("verify_device_filesystem\n    verify_mount"), recipe.index('chown duck-lint:duck-lint'))
+        self.assertIn('MOUNT_SOURCE_REAL=$(readlink -f -- "$MOUNT_SOURCE")', recipe)
+        self.assertIn('[ "$MOUNT_SOURCE_REAL" = "$POOL_DEVICE_REAL" ]', recipe)
+        self.assertIn('findmnt -no UUID --target "$POOL_ROOT"', recipe)
+        self.assertIn('findmnt -no FSTYPE --target "$POOL_ROOT"', recipe)
+        self.assertIn('findmnt -no OPTIONS --target "$POOL_ROOT"', recipe)
 
     def test_fstab_update_is_exact_and_preserves_unrelated_entries(self):
         recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
@@ -211,6 +246,12 @@ int main(void) {{
                 wsl_contained_exec._quota_task_release("symphony-pilot", "T-000001"),
                 evidence,
             )
+
+    def test_cleanup_helper_proves_removed_limits_after_zero_usage(self):
+        helper = (ROOT / "provisioning" / "quota-admit-task.c").read_text()
+        release = helper[helper.index("static int release_task"):helper.index("int main")]
+        self.assertIn("quota_set(root, id, 0, 0)", release)
+        self.assertIn("quota.dqb_bhardlimit || quota.dqb_ihardlimit", release)
 
 
 if __name__ == "__main__":

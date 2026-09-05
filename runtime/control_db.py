@@ -1215,6 +1215,11 @@ class ControlPlaneDatabase:
             if row["status"] == "released":
                 return dict(row)
             task = self.read_task(task_id)
+            if task["state"] != "PREPARED":
+                raise StateConflict(
+                    "storage reclamation is authorized only for PREPARED admission recovery; "
+                    "post-QUEUED reservations are retained"
+                )
             try:
                 validate_storage_release_proof(
                     proof, project=str(task["project_slug"]),
