@@ -367,22 +367,17 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                 pw.prepare(profile, workspace)
             self.assertEqual(raised.exception.kind, "base_history_rewritten")
 
-    def test_continuation_requires_exact_host_owned_head(self):
+    def test_continuation_requires_retained_host_owned_branch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            source, remote, base_sha = self.local_remote(root)
-            (source / "README.md").write_text("A\nB\n", encoding="utf-8")
-            self.git(source, "add", "README.md")
-            self.git(source, "commit", "-m", "B")
-            continuation_tip = self.git(source, "rev-parse", "HEAD")
+            _, remote, base_sha = self.local_remote(root)
             profile, workspace, record = self.task_workspace(
                 root, remote, base_sha, current_head=base_sha,
             )
-            self.git(source, "push", str(remote), f"HEAD:refs/heads/{record['branch']}")
             with self.assertRaises(pw.PreparationError) as raised:
                 pw.prepare(profile, workspace)
-            self.assertEqual(raised.exception.kind, "server_ref_changed")
-            self.assertNotEqual(continuation_tip, base_sha)
+            self.assertEqual(raised.exception.kind, "continuation_branch")
+            self.assertEqual(self.git(workspace, "branch", "--show-current"), "main")
 
 
 if __name__ == "__main__":

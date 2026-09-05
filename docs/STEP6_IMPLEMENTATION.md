@@ -98,3 +98,15 @@ A blocked implementation can retain its starting HEAD; a clean partial commit
 is persisted with `head_changed`, invalidating earlier acceptance while keeping
 the phase and blocker. Planning requires ordered PM then Planner evidence;
 blocked planning accepts only prefixes of that order.
+
+### Unpublished continuation correction
+
+When `tasks.current_head` is populated, Step 6 continues from the retained
+physical T-N workspace. Preparation proves the shared workspace boundary, the
+registered origin, the host-owned branch, exact equality between local `HEAD`
+and SQLite `current_head`, clean status, commit validity, and recorded-base
+ancestry. It does not fetch or repair the task branch from the remote, and it
+does not switch the branch as a continuation repair. A branch or HEAD mismatch
+is persisted as an infrastructure blocker while leaving both the local branch
+and SQLite value unchanged. The remote task branch remains a Step-7 publication
+artifact.

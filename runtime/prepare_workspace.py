@@ -333,11 +333,15 @@ def local_task_facts(profile: Profile, workspace: pathlib.Path) -> tuple[LocalTa
     base_sha = str(record["base_sha"])
     current_head = record["current_head"]
     published_head = record["published_head"]
-    selected_head = current_head or published_head or base_sha
+    # Step 6 continuation authority is the host-accepted current HEAD plus
+    # the retained physical workspace. A published HEAD belongs to the later
+    # publication contract and must not turn an initial preparation into an
+    # implicit remote continuation.
+    selected_head = current_head or base_sha
     facts = LocalTaskFacts(
         task_uuid=str(record["id"]), identifier=str(record["identifier"]), branch=branch,
         selected_head=str(selected_head), base_ref=str(record["base_ref"]), base_sha=base_sha,
-        mode="continuation" if current_head or published_head else "initial",
+        mode="continuation" if current_head else "initial",
         current_head=str(current_head) if current_head else None,
         published_head=str(published_head) if published_head else None,
     )
@@ -433,6 +437,15 @@ def record_blocker(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFa
                                 body=f"{kind}: {detail}")
 
 
+def step7_publication_applies(profile: Profile, task_uuid: str) -> bool:
+    """Detect a publication row without assigning it a Step-6 meaning."""
+    from control_db import ControlPlaneDatabase
+
+    with ControlPlaneDatabase.open_readonly(control_database_path(profile)) as database:
+        publication = database.read_publication(task_uuid)
+    return bool(publication and publication["publication_status"] != "not_started")
+
+
 def prepare(profile: Profile, workspace: pathlib.Path) -> None:
     # SQLite identity is recovered from the original basename before any
     # filesystem/Git inspection. Never derive compensation identity from Git.
@@ -473,22 +486,59 @@ def _prepare(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts) -
         try:
             if process_owns_workspace(workspace):
                 raise PreparationError("workspace_in_use", "another process currently owns the task workspace")
-            continuation = facts.current_head or facts.published_head
-            fetch_ref = facts.branch if continuation else facts.base_ref
-            fetch = run_git(workspace, "fetch", "--", profile.git_remote, fetch_ref, transport=True)
-            if fetch.returncode:
-                raise PreparationError("git_fetch", "licensed starting ref fetch failed")
-            fetched_sha = git(workspace, "rev-parse", "FETCH_HEAD")
-            if continuation:
-                if fetched_sha != facts.selected_head:
+            if facts.current_head is not None:
+                # An accepted implementation HEAD is deliberately unpublished
+                # until Step 7. The retained local checkout is therefore the
+                # only continuation source. Every comparison below is
+                # read-only: a mismatch is evidence of divergence, never a
+                # reason to reset the checkout or rewrite SQLite.
+                recorded_head = facts.current_head
+                if run_git(workspace, "cat-file", "-e", recorded_head + "^{commit}").returncode:
+                    raise PreparationError("continuation_head", "SQLite current_head is not a local commit")
+                if git(workspace, "branch", "--show-current") != facts.branch:
+                    record_blocker(profile, workspace, facts, "continuation_divergence",
+                                   "retained workspace is not on the host-owned task branch")
                     raise PreparationError(
-                        "server_ref_changed",
-                        "server-fetched continuation ref does not match the local task row",
+                        "continuation_branch",
+                        "retained workspace branch diverges from the host-owned task branch",
+                        persisted=True,
                     )
-                if facts.base_sha and run_git(
-                        workspace, "merge-base", "--is-ancestor", facts.base_sha, facts.selected_head).returncode:
-                    raise PreparationError("ancestry", "local task continuation is not based on the required base")
+                local_head = git(workspace, "rev-parse", "HEAD")
+                if local_head != recorded_head:
+                    record_blocker(profile, workspace, facts, "continuation_divergence",
+                                   f"retained local HEAD {local_head} differs from SQLite current_head {recorded_head}")
+                    raise PreparationError(
+                        "continuation_head",
+                        "retained local HEAD diverges from SQLite current_head; explicit recovery is required",
+                        persisted=True,
+                    )
+                status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+                if status:
+                    record_blocker(profile, workspace, facts, "dirty_task_workspace",
+                                   "unpublished continuation workspace is not clean")
+                    raise PreparationError("dirty_task_workspace", "unpublished continuation workspace must be clean", persisted=True)
+                if run_git(
+                        workspace, "merge-base", "--is-ancestor", facts.base_sha, recorded_head,
+                ).returncode:
+                    record_blocker(profile, workspace, facts, "continuation_divergence",
+                                   "SQLite current_head is not based on the recorded task base")
+                    raise PreparationError(
+                        "ancestry",
+                        "SQLite current_head is not based on the required base",
+                        persisted=True,
+                    )
             else:
+                if facts.published_head is not None or step7_publication_applies(profile, facts.task_uuid):
+                    # Step 7 owns any published-active continuation contract.
+                    # Step 6 has no fallback or implicit interpretation for it.
+                    raise PreparationError(
+                        "publication_state",
+                        "published task state requires the Step-7 preparation contract",
+                    )
+                fetch = run_git(workspace, "fetch", "--", profile.git_remote, facts.base_ref, transport=True)
+                if fetch.returncode:
+                    raise PreparationError("git_fetch", "licensed starting ref fetch failed")
+                fetched_sha = git(workspace, "rev-parse", "FETCH_HEAD")
                 # The recorded base remains the task's starting identity. A
                 # normal default-branch fast-forward must not move it.
                 if run_git(
@@ -502,12 +552,12 @@ def _prepare(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts) -
                         "base_history_rewritten",
                         "recorded task base is not an ancestor of the registered base ref",
                     )
-            status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
-            if status:
-                record_blocker(profile, workspace, facts, "dirty_task_workspace",
-                               "task workspace is not a fresh clean checkout; no legacy recovery import is attempted")
-                raise PreparationError("dirty_task_workspace", "task workspace must be clean for straight-cutover admission", persisted=True)
-            git(workspace, "switch", "-C", facts.branch, facts.selected_head)
+                status = git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+                if status:
+                    record_blocker(profile, workspace, facts, "dirty_task_workspace",
+                                   "task workspace is not a fresh clean checkout; no legacy recovery import is attempted")
+                    raise PreparationError("dirty_task_workspace", "task workspace must be clean for straight-cutover admission", persisted=True)
+                git(workspace, "switch", "-C", facts.branch, facts.base_sha)
             if git(workspace, "status", "--porcelain"):
                 raise PreparationError("clean_verification", "workspace remained dirty")
             tools = prepare_toolchain(profile, workspace, facts.identifier)
