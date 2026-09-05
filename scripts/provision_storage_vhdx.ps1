@@ -5,7 +5,7 @@
 
 This is an operator-only attachment contract.  The path and VHD properties
 are fixed in source; Linux provisioning is a separate phase that must run
-while the reported WSL attachment remains live.  No Hyper-V disk mount is
+while the reported WSL attachment remains live.  No Windows disk mount is
 performed because a transient Windows disk identity is not the Linux
 provisioning identity.
 #>
@@ -21,6 +21,7 @@ $ExpectedBytes = 64GB
 $ExpectedParent = "C:\ProgramData\SymphonyPilot"
 $ExpectedPath = [IO.Path]::Combine($ExpectedParent, "symphony-storage.vhdx")
 $AttachmentStatePath = [IO.Path]::Combine($ExpectedParent, "symphony-storage.vhdx.attachment.json")
+$DiskPart = [IO.Path]::Combine($env:SystemRoot, "System32", "diskpart.exe")
 $Distribution = "Ubuntu-24.04"
 $Wsl = [IO.Path]::Combine($env:SystemRoot, "System32", "wsl.exe")
 $StateSchema = "symphony-pilot-vhdx-attachment/v1"
@@ -221,33 +222,173 @@ function Ensure-OperatorStateNamespace {
     Assert-OperatorStateAcl $ExpectedParent $true
 }
 
-function Get-VhdEvidence {
-    param([bool]$Create)
-    $created = $false
-    if (-not (Test-Path -LiteralPath $ExpectedPath -PathType Leaf)) {
-        if (-not $Create) {
-            throw "the fixed Symphony VHDX does not exist"
+function Invoke-DiskPartFixedVhdxCreate {
+    if (-not (Test-Path -LiteralPath $DiskPart -PathType Leaf)) {
+        throw "the fixed Windows DiskPart executable is unavailable"
+    }
+    $scriptPath = [IO.Path]::Combine(
+        $ExpectedParent,
+        ".symphony-vhdx-create-" + [guid]::NewGuid().ToString("N") + ".txt"
+    )
+    # This is a fixed script assembled only from the fixed source path.  It
+    # is not a caller-provided DiskPart interface and contains no attachment,
+    # resize, partition, filesystem, or drive-letter operation.
+    $scriptText = 'create vdisk file="' + $ExpectedPath +
+        '" maximum=65536 type=fixed' + "`r`nexit`r`n"
+    try {
+        [IO.File]::WriteAllText(
+            $scriptPath,
+            $scriptText,
+            [Text.UTF8Encoding]::new($false)
+        )
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $DiskPart
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        [void]$startInfo.ArgumentList.Add("/s")
+        [void]$startInfo.ArgumentList.Add($scriptPath)
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw "fixed Windows DiskPart could not be started"
         }
-        New-VHD -Path $ExpectedPath -SizeBytes $ExpectedBytes -Fixed | Out-Null
-        $created = $true
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            Output = (($stdoutTask.Result + "`n" + $stderrTask.Result).Trim())
+        }
     }
-    if ($created) {
-        Set-OperatorStateAcl $ExpectedPath $false
-    } else {
-        Assert-OperatorStateAcl $ExpectedPath $false
+    finally {
+        if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
+            [IO.File]::Delete($scriptPath)
+        }
     }
-    $vhd = Get-VHD -Path $ExpectedPath
-    if ([string]$vhd.VhdType -ne "Fixed") {
-        throw "dynamic or differencing VHDs are rejected"
+}
+
+function Get-NativeAllocatedFileBytes {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($null -eq ("SymphonyNativeFileEvidence" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class SymphonyNativeFileEvidence
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetCompressedFileSizeW(
+        string lpFileName,
+        out uint lpFileSizeHigh);
+}
+"@
     }
-    if ([int64]$vhd.Size -ne $ExpectedBytes) {
+    [uint32]$high = 0
+    [uint32]$low = [SymphonyNativeFileEvidence]::GetCompressedFileSizeW(
+        $Path,
+        [ref]$high
+    )
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($low -eq [uint32]::MaxValue -and $errorCode -ne 0) {
+        throw "native allocated-size inspection failed for the fixed VHDX"
+    }
+    ([uint64]$high * 4294967296) + [uint64]$low
+}
+
+function Remove-NewlyCreatedVhdx {
+    # Cleanup is intentionally limited to the exact newly-created leaf.  A
+    # conflicting pre-existing object is never removed or repaired.
+    try {
+        $item = Get-Item -LiteralPath $ExpectedPath -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return
+        }
+        [IO.File]::Delete($ExpectedPath)
+    }
+    catch {
+        # Retain the exact failed object for bounded operator reconciliation;
+        # cleanup failure must not widen into deletion authority.
+    }
+}
+
+function Assert-NativeVhdxPostconditions {
+    param(
+        [object[]]$Images,
+        [object]$FileItem,
+        [uint64]$AllocatedBytes
+    )
+    if (@($Images).Count -ne 1) {
+        throw "native Windows storage evidence did not identify exactly one VHDX"
+    }
+    $image = @($Images)[0]
+    if ([IO.Path]::GetFullPath([string]$image.ImagePath) -ne
+        [IO.Path]::GetFullPath($ExpectedPath)) {
+        throw "native Windows storage evidence identified an unexpected image path"
+    }
+    if ([string]$image.StorageType -ne "VHDX") {
+        throw "fixed Symphony image must have native VHDX storage type"
+    }
+    if ([int64]$image.Size -ne $ExpectedBytes) {
         throw "VHD virtual capacity must be exactly 64 GiB"
+    }
+    if ($null -eq $FileItem -or $FileItem.PSIsContainer -or
+        [IO.Path]::GetFullPath([string]$FileItem.FullName) -ne
+        [IO.Path]::GetFullPath($ExpectedPath)) {
+        throw "fixed VHDX is not the exact ordinary file leaf"
+    }
+    $attributes = [IO.FileAttributes]$FileItem.Attributes
+    if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "fixed VHDX must not be a reparse point"
+    }
+    if (($attributes -band [IO.FileAttributes]::SparseFile) -ne 0 -or
+        ($attributes -band [IO.FileAttributes]::Compressed) -ne 0) {
+        throw "fixed VHDX must not be sparse or compressed"
+    }
+    if ($AllocatedBytes -lt [uint64]$ExpectedBytes) {
+        throw "fixed VHDX physical allocation is below 64 GiB"
     }
     [pscustomobject]@{
         VhdPath = $ExpectedPath
-        VhdType = [string]$vhd.VhdType
-        VirtualSizeBytes = [int64]$vhd.Size
-        FileSizeBytes = [int64]$vhd.FileSize
+        VhdType = "Fixed"
+        VirtualSizeBytes = [int64]$image.Size
+        FileSizeBytes = [int64]$FileItem.Length
+        AllocatedBytes = [uint64]$AllocatedBytes
+    }
+}
+
+function Get-VhdEvidence {
+    param([bool]$Create)
+    $created = $false
+    try {
+        $existing = $null
+        try {
+            $existing = Get-Item -LiteralPath $ExpectedPath -Force -ErrorAction Stop
+        }
+        catch [System.Management.Automation.ItemNotFoundException] {
+            if (-not $Create) {
+                throw "the fixed Symphony VHDX does not exist"
+            }
+            Invoke-DiskPartFixedVhdxCreate | Out-Null
+            $created = $true
+        }
+        if ($created) {
+            Set-OperatorStateAcl $ExpectedPath $false
+        } else {
+            Assert-OperatorStateAcl $ExpectedPath $false
+        }
+        $fileItem = Get-Item -LiteralPath $ExpectedPath -Force -ErrorAction Stop
+        $images = @(Get-DiskImage -ImagePath $ExpectedPath -ErrorAction Stop)
+        $allocatedBytes = Get-NativeAllocatedFileBytes $ExpectedPath
+        Assert-NativeVhdxPostconditions $images $fileItem $allocatedBytes
+    }
+    catch {
+        if ($created) {
+            Remove-NewlyCreatedVhdx
+        }
+        throw
     }
 }
 

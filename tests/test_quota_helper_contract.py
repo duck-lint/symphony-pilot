@@ -75,10 +75,15 @@ class QuotaHelperContractTests(unittest.TestCase):
 
     def test_fixed_vhdx_operator_contract_has_no_growth_or_generic_broker(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
-        self.assertIn("New-VHD", recipe)
-        self.assertIn("-Fixed", recipe)
+        self.assertIn('"System32", "diskpart.exe"', recipe)
+        self.assertIn("maximum=65536", recipe)
+        self.assertIn("type=fixed", recipe)
+        self.assertIn("ArgumentList", recipe)
+        self.assertIn("Get-DiskImage", recipe)
+        self.assertIn("GetCompressedFileSizeW", recipe)
+        self.assertIn("AllocatedBytes", recipe)
+        self.assertIn("Assert-NativeVhdxPostconditions", recipe)
         self.assertIn("64GB", recipe)
-        self.assertIn('VhdType -ne "Fixed"', recipe)
         self.assertIn('ValidateSet("Attach", "Detach")', recipe)
         self.assertIn('"--mount", $ExpectedPath, "--vhd", "--bare"', recipe)
         self.assertIn('"--unmount", $ExpectedPath', recipe)
@@ -87,12 +92,126 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("exactly one new 64-GiB Linux disk", recipe)
         self.assertIn("malformed JSON", recipe)
         self.assertIn("conflicting attachment", recipe)
+        self.assertIn("SparseFile", recipe)
+        self.assertIn("Compressed", recipe)
+        self.assertIn("Remove-NewlyCreatedVhdx", recipe)
+        self.assertIn("maximum=65536 type=fixed", recipe)
+        self.assertNotIn("New-VHD", recipe)
+        self.assertNotIn("Get-VHD", recipe)
         self.assertNotIn("Mount-VHD", recipe)
         self.assertNotIn("Dismount-VHD", recipe)
+        self.assertNotIn("Import-Module Hyper-V", recipe)
         self.assertNotIn("PHYSICALDRIVE", recipe)
         self.assertNotIn("FileSize -ne", recipe)
         self.assertNotIn("Resize-VHD", recipe)
+        self.assertNotIn("attach vdisk", recipe.lower())
+        self.assertNotIn("detach vdisk", recipe.lower())
+        self.assertNotIn("expand vdisk", recipe.lower())
+        self.assertNotIn("compact vdisk", recipe.lower())
+        self.assertNotIn("create partition", recipe.lower())
+        self.assertNotIn("assign letter", recipe.lower())
+        self.assertNotIn("cmd.exe", recipe.lower())
+        self.assertNotIn("powershell -command", recipe.lower())
         self.assertNotIn("Invoke-Expression", recipe)
+        attach_main = recipe[recipe.index('if ($Operation -eq "Attach") {'):]
+        self.assertLess(
+            attach_main.index('$vhd = Get-VhdEvidence $true'),
+            attach_main.index('$attached = Invoke-WslText @("--mount"'),
+        )
+
+    def test_native_vhdx_postcondition_contract_is_explicit(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        self.assertIn("StorageType -ne \"VHDX\"", recipe)
+        self.assertIn("VirtualSizeBytes", recipe)
+        self.assertIn("physical allocation is below 64 GiB", recipe)
+        self.assertIn("fixed VHDX must not be a reparse point", recipe)
+        self.assertIn("fixed VHDX must not be sparse or compressed", recipe)
+        self.assertIn("VhdType = \"Fixed\"", recipe)
+        self.assertIn("$existing = Get-Item", recipe)
+        self.assertIn("if (-not $Create)", recipe)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_native_vhdx_postconditions_reject_conflicting_evidence(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        start = recipe.index("function Assert-NativeVhdxPostconditions")
+        end = recipe.index("function Get-VhdEvidence")
+        validator = recipe[start:end]
+        command = f'''$ErrorActionPreference = "Stop"
+$ExpectedBytes = 64GB
+$ExpectedPath = Join-Path ([IO.Path]::GetTempPath()) "symphony-native-vhdx-test.vhdx"
+{validator}
+$normal = [pscustomobject]@{{
+    PSIsContainer = $false
+    FullName = $ExpectedPath
+    Attributes = [IO.FileAttributes]::Archive
+    Length = 4096
+}}
+$valid = [pscustomobject]@{{ ImagePath = $ExpectedPath; StorageType = "VHDX"; Size = 64GB }}
+$evidence = Assert-NativeVhdxPostconditions @($valid) $normal 64GB
+if ($evidence.VhdType -ne "Fixed" -or $evidence.AllocatedBytes -ne 64GB) {{ exit 1 }}
+function Must-Fail([object[]]$Images, [object]$FileItem, [uint64]$Allocated) {{
+    try {{ Assert-NativeVhdxPostconditions $Images $FileItem $Allocated | Out-Null; return $false }}
+    catch {{ return $true }}
+}}
+if (-not (Must-Fail @([pscustomobject]@{{ ImagePath=$ExpectedPath; StorageType="ISO"; Size=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail @([pscustomobject]@{{ ImagePath=$ExpectedPath; StorageType="VHDX"; Size=1GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail @($valid) $normal (64GB - 1))) {{ exit 1 }}
+if (-not (Must-Fail @($valid) ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::SparseFile; Length=4096 }}) 64GB)) {{ exit 1 }}
+if (-not (Must-Fail @($valid) ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::Compressed; Length=4096 }}) 64GB)) {{ exit 1 }}
+if (-not (Must-Fail @($valid) ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::ReparsePoint; Length=4096 }}) 64GB)) {{ exit 1 }}
+if (-not (Must-Fail @($valid, $valid) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail @([pscustomobject]@{{ ImagePath=(Join-Path ([IO.Path]::GetTempPath()) "other.vhdx"); StorageType="VHDX"; Size=64GB }}) $normal 64GB)) {{ exit 1 }}
+"Native VHDX postconditions: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Native VHDX postconditions: PASS", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_native_allocated_size_smoke_uses_fixed_windows_api(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        start = recipe.index("function Get-NativeAllocatedFileBytes")
+        end = recipe.index("function Remove-NewlyCreatedVhdx")
+        helper = recipe[start:end]
+        command = f'''$ErrorActionPreference = "Stop"
+{helper}
+$temporary = [IO.Path]::GetTempFileName()
+try {{
+    [IO.File]::WriteAllBytes($temporary, (New-Object byte[] 4096))
+    $allocated = Get-NativeAllocatedFileBytes $temporary
+    if ($allocated -lt 4096) {{ exit 1 }}
+    "Native allocated-size smoke: PASS"
+}}
+finally {{
+    if (Test-Path -LiteralPath $temporary) {{ [IO.File]::Delete($temporary) }}
+}}
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Native allocated-size smoke: PASS", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_native_windows_storage_capabilities_are_available(self):
+        command = '''$diskpart = Join-Path $env:SystemRoot "System32\\diskpart.exe"
+if (-not (Test-Path -LiteralPath $diskpart -PathType Leaf)) { exit 1 }
+if ($null -eq (Get-Command Get-DiskImage -ErrorAction SilentlyContinue)) { exit 1 }
+"Native Windows storage capabilities: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Native Windows storage capabilities: PASS", result.stdout)
 
     def test_wsl_vhd_capability_uses_help_grammar_not_exit_status(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
