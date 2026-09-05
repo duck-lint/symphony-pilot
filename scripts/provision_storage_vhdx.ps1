@@ -275,41 +275,61 @@ function Get-NativeVhdxInformation {
         Add-Type -TypeDefinition @"
 using System;
 using System.ComponentModel;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 
 public static class SymphonyVirtDiskEvidence
 {
-    private const uint VirtualDiskAccessGetInfo = 0x80000;
+    private const uint VirtualDiskAccessGetInfo = 0x00080000;
     private const uint OpenVirtualDiskVersion2 = 2;
     private const uint OpenVirtualDiskFlagNone = 0;
     private const uint GetVirtualDiskInfoSize = 1;
-    private const uint GetVirtualDiskInfoVirtualStorageType = 8;
-    private const uint GetVirtualDiskInfoProviderSubtype = 9;
-    private const uint VirtualStorageTypeDeviceUnknown = 0;
+    private const uint GetVirtualDiskInfoVirtualStorageType = 6;
+    private const uint GetVirtualDiskInfoProviderSubtype = 7;
+    private const uint VirtualStorageTypeDeviceVhdx = 3;
+    private static readonly Guid MicrosoftVendorId =
+        new Guid("ec984aec-a0f9-47e9-901f-71415a66345b");
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct VirtualStorageType
     {
         public uint DeviceId;
         public Guid VendorId;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct OpenVirtualDiskParameters
     {
         public uint Version;
         public int GetInfoOnly;
         public int ReadOnly;
+        public Guid ResiliencyGuid;
     }
 
-    [StructLayout(LayoutKind.Explicit)]
+    [StructLayout(LayoutKind.Explicit, Pack = 8, Size = 32)]
     private struct GetVirtualDiskInfo
     {
         [FieldOffset(0)] public uint Version;
         [FieldOffset(8)] public ulong VirtualSize;
-        [FieldOffset(8)] public ulong PhysicalSize;
+        [FieldOffset(16)] public ulong PhysicalSize;
+        [FieldOffset(24)] public uint BlockSize;
+        [FieldOffset(28)] public uint SectorSize;
         [FieldOffset(8)] public VirtualStorageType VirtualStorageType;
         [FieldOffset(8)] public uint ProviderSubtype;
+    }
+
+    private sealed class SafeVirtualDiskHandle : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        private SafeVirtualDiskHandle() : base(true) { }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        protected override bool ReleaseHandle()
+        {
+            return CloseHandle(handle);
+        }
     }
 
     public sealed class Evidence
@@ -321,6 +341,67 @@ public static class SymphonyVirtDiskEvidence
         public ulong PhysicalSize { get; set; }
     }
 
+    public sealed class AbiLayout
+    {
+        public uint SizeInfoVersion { get; set; }
+        public uint VirtualStorageTypeInfoVersion { get; set; }
+        public uint ProviderSubtypeInfoVersion { get; set; }
+        public uint RequestedDeviceId { get; set; }
+        public Guid RequestedVendorId { get; set; }
+        public uint InformationAccessMask { get; set; }
+        public int OpenParametersSize { get; set; }
+        public int OpenParametersVersionOffset { get; set; }
+        public int OpenParametersGetInfoOnlyOffset { get; set; }
+        public int OpenParametersReadOnlyOffset { get; set; }
+        public int OpenParametersResiliencyGuidOffset { get; set; }
+        public int GetInfoBufferSize { get; set; }
+        public int GetInfoVersionOffset { get; set; }
+        public int GetInfoVirtualSizeOffset { get; set; }
+        public int GetInfoPhysicalSizeOffset { get; set; }
+        public int GetInfoBlockSizeOffset { get; set; }
+        public int GetInfoSectorSizeOffset { get; set; }
+        public int GetInfoVirtualStorageTypeOffset { get; set; }
+        public int GetInfoProviderSubtypeOffset { get; set; }
+    }
+
+    public static AbiLayout GetAbiLayout()
+    {
+        return new AbiLayout {
+            SizeInfoVersion = GetVirtualDiskInfoSize,
+            VirtualStorageTypeInfoVersion =
+                GetVirtualDiskInfoVirtualStorageType,
+            ProviderSubtypeInfoVersion = GetVirtualDiskInfoProviderSubtype,
+            RequestedDeviceId = VirtualStorageTypeDeviceVhdx,
+            RequestedVendorId = MicrosoftVendorId,
+            InformationAccessMask = VirtualDiskAccessGetInfo,
+            OpenParametersSize = Marshal.SizeOf(
+                typeof(OpenVirtualDiskParameters)),
+            OpenParametersVersionOffset = Marshal.OffsetOf(
+                typeof(OpenVirtualDiskParameters), "Version").ToInt32(),
+            OpenParametersGetInfoOnlyOffset = Marshal.OffsetOf(
+                typeof(OpenVirtualDiskParameters), "GetInfoOnly").ToInt32(),
+            OpenParametersReadOnlyOffset = Marshal.OffsetOf(
+                typeof(OpenVirtualDiskParameters), "ReadOnly").ToInt32(),
+            OpenParametersResiliencyGuidOffset = Marshal.OffsetOf(
+                typeof(OpenVirtualDiskParameters), "ResiliencyGuid").ToInt32(),
+            GetInfoBufferSize = Marshal.SizeOf(typeof(GetVirtualDiskInfo)),
+            GetInfoVersionOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "Version").ToInt32(),
+            GetInfoVirtualSizeOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "VirtualSize").ToInt32(),
+            GetInfoPhysicalSizeOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "PhysicalSize").ToInt32(),
+            GetInfoBlockSizeOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "BlockSize").ToInt32(),
+            GetInfoSectorSizeOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "SectorSize").ToInt32(),
+            GetInfoVirtualStorageTypeOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "VirtualStorageType").ToInt32(),
+            GetInfoProviderSubtypeOffset = Marshal.OffsetOf(
+                typeof(GetVirtualDiskInfo), "ProviderSubtype").ToInt32()
+        };
+    }
+
     [DllImport("VirtDisk.dll", CharSet = CharSet.Unicode,
         SetLastError = true)]
     private static extern uint OpenVirtualDisk(
@@ -329,23 +410,22 @@ public static class SymphonyVirtDiskEvidence
         uint virtualDiskAccessMask,
         uint flags,
         ref OpenVirtualDiskParameters parameters,
-        out IntPtr handle);
+        out SafeVirtualDiskHandle handle);
 
     [DllImport("VirtDisk.dll", SetLastError = true)]
     private static extern uint GetVirtualDiskInformation(
-        IntPtr handle,
+        SafeVirtualDiskHandle handle,
         ref uint diskInfoSize,
-        ref GetVirtualDiskInfo diskInfo);
+        ref GetVirtualDiskInfo diskInfo,
+        IntPtr sizeUsed);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    private static GetVirtualDiskInfo Query(IntPtr handle, uint version)
+    private static GetVirtualDiskInfo Query(
+        SafeVirtualDiskHandle handle, uint version)
     {
         GetVirtualDiskInfo info = new GetVirtualDiskInfo { Version = version };
         uint size = (uint)Marshal.SizeOf(typeof(GetVirtualDiskInfo));
-        uint status = GetVirtualDiskInformation(handle, ref size, ref info);
+        uint status = GetVirtualDiskInformation(
+            handle, ref size, ref info, IntPtr.Zero);
         if (status != 0)
         {
             throw new Win32Exception((int)status);
@@ -356,15 +436,16 @@ public static class SymphonyVirtDiskEvidence
     public static Evidence Read(string path)
     {
         VirtualStorageType requestedType = new VirtualStorageType {
-            DeviceId = VirtualStorageTypeDeviceUnknown,
-            VendorId = Guid.Empty
+            DeviceId = VirtualStorageTypeDeviceVhdx,
+            VendorId = MicrosoftVendorId
         };
         OpenVirtualDiskParameters parameters = new OpenVirtualDiskParameters {
             Version = OpenVirtualDiskVersion2,
             GetInfoOnly = 1,
-            ReadOnly = 1
+            ReadOnly = 1,
+            ResiliencyGuid = Guid.Empty
         };
-        IntPtr handle = IntPtr.Zero;
+        SafeVirtualDiskHandle handle = null;
         uint status = OpenVirtualDisk(
             ref requestedType,
             path,
@@ -394,9 +475,9 @@ public static class SymphonyVirtDiskEvidence
         }
         finally
         {
-            if (handle != IntPtr.Zero)
+            if (handle != null)
             {
-                CloseHandle(handle);
+                handle.Dispose();
             }
         }
     }

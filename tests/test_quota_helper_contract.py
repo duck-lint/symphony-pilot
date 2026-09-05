@@ -99,11 +99,25 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("Compressed", recipe)
         self.assertIn("Remove-NewlyCreatedVhdx", recipe)
         self.assertIn("maximum=65536 type=fixed", recipe)
-        self.assertIn("VirtualDiskAccessGetInfo = 0x80000", recipe)
+        self.assertIn("VirtualDiskAccessGetInfo = 0x00080000", recipe)
         self.assertIn("OpenVirtualDiskVersion2 = 2", recipe)
+        self.assertIn("GetVirtualDiskInfoSize = 1", recipe)
+        self.assertIn("GetVirtualDiskInfoVirtualStorageType = 6", recipe)
+        self.assertIn("GetVirtualDiskInfoProviderSubtype = 7", recipe)
         self.assertIn("GetInfoOnly = 1", recipe)
         self.assertIn("ReadOnly = 1", recipe)
-        self.assertIn("VirtualStorageTypeDeviceUnknown = 0", recipe)
+        self.assertIn("ResiliencyGuid = Guid.Empty", recipe)
+        self.assertIn("VirtualStorageTypeDeviceVhdx = 3", recipe)
+        self.assertIn("MicrosoftVendorId", recipe)
+        self.assertIn("IntPtr sizeUsed", recipe)
+        self.assertIn("IntPtr.Zero", recipe)
+        self.assertIn("SafeVirtualDiskHandle", recipe)
+        self.assertIn("Size = 32", recipe)
+        self.assertIn("FieldOffset(16)] public ulong PhysicalSize", recipe)
+        self.assertIn("FieldOffset(24)] public uint BlockSize", recipe)
+        self.assertIn("FieldOffset(28)] public uint SectorSize", recipe)
+        self.assertNotIn("GetVirtualDiskInfoVirtualStorageType = 8", recipe)
+        self.assertNotIn("GetVirtualDiskInfoProviderSubtype = 9", recipe)
         self.assertNotIn("AttachVirtualDisk", recipe)
         self.assertNotIn("DetachVirtualDisk", recipe)
         self.assertNotIn("ResizeVirtualDisk", recipe)
@@ -111,6 +125,9 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertNotIn("MergeVirtualDisk", recipe)
         self.assertNotIn("CreateVirtualDisk", recipe)
         self.assertNotIn("SetVirtualDiskInformation", recipe)
+        self.assertNotIn("ExpandVirtualDisk", recipe)
+        self.assertNotIn("VirtualDiskAccessMetaOps", recipe)
+        self.assertNotIn("VirtualDiskAccessAttach", recipe)
         self.assertNotIn("New-VHD", recipe)
         self.assertNotIn("Get-VHD", recipe)
         self.assertNotIn("Mount-VHD", recipe)
@@ -246,6 +263,27 @@ $temporary = [IO.Path]::GetTempFileName()
 try {{
     try {{ Get-NativeVhdxInformation $temporary | Out-Null }} catch {{}}
     if ($null -eq ("SymphonyVirtDiskEvidence" -as [type])) {{ exit 1 }}
+    $layout = [SymphonyVirtDiskEvidence]::GetAbiLayout()
+    if ($layout.SizeInfoVersion -ne 1 -or
+        $layout.VirtualStorageTypeInfoVersion -ne 6 -or
+        $layout.ProviderSubtypeInfoVersion -ne 7 -or
+        $layout.RequestedDeviceId -ne 3 -or
+        $layout.RequestedVendorId.ToString() -ne
+            "ec984aec-a0f9-47e9-901f-71415a66345b" -or
+        $layout.InformationAccessMask -ne 0x00080000) {{ exit 1 }}
+    if ($layout.OpenParametersSize -ne 28 -or
+        $layout.OpenParametersVersionOffset -ne 0 -or
+        $layout.OpenParametersGetInfoOnlyOffset -ne 4 -or
+        $layout.OpenParametersReadOnlyOffset -ne 8 -or
+        $layout.OpenParametersResiliencyGuidOffset -ne 12) {{ exit 1 }}
+    if ($layout.GetInfoBufferSize -ne 32 -or
+        $layout.GetInfoVersionOffset -ne 0 -or
+        $layout.GetInfoVirtualSizeOffset -ne 8 -or
+        $layout.GetInfoPhysicalSizeOffset -ne 16 -or
+        $layout.GetInfoBlockSizeOffset -ne 24 -or
+        $layout.GetInfoSectorSizeOffset -ne 28 -or
+        $layout.GetInfoVirtualStorageTypeOffset -ne 8 -or
+        $layout.GetInfoProviderSubtypeOffset -ne 8) {{ exit 1 }}
     try {{ [SymphonyVirtDiskEvidence]::Read($temporary) | Out-Null; exit 1 }}
     catch {{
         if ($_.Exception.Message -match "Unable to load DLL|EntryPointNotFound|TypeInitialization") {{ exit 1 }}
