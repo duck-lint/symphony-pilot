@@ -475,6 +475,52 @@ def admit_task_quota(
     return value
 
 
+def release_task_quota(
+    project: str, identifier: str, *, timeout_seconds: float = 30,
+    request_id: str | None = None,
+) -> dict[str, object]:
+    """Obtain fixed-helper evidence that one task quota can be released."""
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        raise WslAdapterError("invalid_timeout", "timeout is outside the bounded adapter range")
+    _validate_storage_project(project)
+    if not isinstance(identifier, str) or not _TASK_IDENTIFIER.fullmatch(identifier):
+        raise WslAdapterError("invalid_task_identity", "task identifier is malformed")
+    request_id = request_id or uuid.uuid4().hex
+    _validate_request_id(request_id)
+    wsl = _host_wsl_executable()
+    command = _raw_command(wsl, [
+        "/usr/bin/env", "-i",
+        "HOME=/home/duck-lint", "USER=duck-lint", "LOGNAME=duck-lint",
+        "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
+        "/usr/bin/python3", "-B", CONTAINED_ENTRYPOINT,
+        "--control", "quota-release-task", "--project", project,
+        "--identifier", identifier,
+    ], "/")
+    result = _bounded_process(
+        command, float(timeout_seconds), cwd="/", metadata=(request_id, project, FIXED_DISTRO)
+    )
+    _raise_if_wsl_transport_failed(result)
+    if result.returncode != 0 or result.timed_out:
+        raise WslAdapterError("quota_cleanup", "trusted Linux task quota cleanup failed")
+    try:
+        value = json.loads(result.stdout)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise WslAdapterError("quota_cleanup", "trusted task quota cleanup returned malformed JSON") from exc
+    if (not isinstance(value, dict) or set(value) != {
+            "schema", "project", "identifier", "workspace_path", "project_id",
+            "workspace_state", "quota_state", "growth_possible", "remaining_bytes",
+            "remaining_inodes"
+        } or value.get("schema") != "symphony-pilot-task-quota-release/v1" or
+            value.get("project") != project or value.get("identifier") != identifier or
+            value.get("workspace_path") != f"/home/duck-lint/symphony-workspaces/{project}/{identifier}" or
+            value.get("project_id") != 1_000_000 + int(identifier[2:]) or
+            value.get("workspace_state") != "destroyed" or value.get("quota_state") != "removed" or
+            value.get("growth_possible") is not False or value.get("remaining_bytes") != 0 or
+            value.get("remaining_inodes") != 0):
+        raise WslAdapterError("quota_cleanup", "trusted task quota cleanup returned an unsupported shape")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", required=True, choices=sorted(PROJECT_ROOTS))

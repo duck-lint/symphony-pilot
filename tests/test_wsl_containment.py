@@ -51,8 +51,10 @@ class SupervisorValidationTests(unittest.TestCase):
             f_bsize = 4096
             f_blocks = 100
             f_bfree = 40
+            f_bavail = 35
             f_files = 200
             f_ffree = 150
+            f_favail = 145
 
         findmnt = mock.Mock(returncode=0, stdout=json.dumps({
             "filesystems": [{
@@ -68,6 +70,8 @@ class SupervisorValidationTests(unittest.TestCase):
             evidence = wsl_contained_exec._quota_inspection("symphony-pilot")
         self.assertTrue(evidence["filesystem"]["project_quota_mount"])
         self.assertEqual(evidence["filesystem"]["statvfs"]["inodes"], 200)
+        self.assertEqual(evidence["filesystem"]["statvfs"]["available_blocks"], 35)
+        self.assertEqual(evidence["filesystem"]["statvfs"]["available_inodes"], 145)
         run.assert_called_once_with(
             ["/bin/findmnt", "--json", "--target", "/workspace",
              "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
@@ -80,8 +84,10 @@ class SupervisorValidationTests(unittest.TestCase):
             f_bsize = 4096
             f_blocks = 100
             f_bfree = 40
+            f_bavail = 35
             f_files = 200
             f_ffree = 150
+            f_favail = 145
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory) / "project-root"

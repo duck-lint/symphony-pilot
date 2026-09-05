@@ -111,8 +111,12 @@ def create(args: argparse.Namespace) -> int:
     return 0
 
 
-def verify_profile_storage(profile, identifier: str):
-    """Obtain pool and task proofs through the fixed Linux capability."""
+def verify_profile_storage(profile, identifier: str, *, database, task_id: str):
+    """Obtain task proof only after SQLite has durably reserved capacity."""
+    reservation = database.read_storage_reservation(task_id)
+    if (reservation is None or reservation["status"] != "reserved" or
+            reservation["project_slug"] != profile.slug):
+        raise TaskCommandError("exact durable storage reservation is required before quota mutation")
     try:
         from wsl_adapter import WslAdapterError, admit_task_quota
         evidence = admit_task_quota(
@@ -142,6 +146,21 @@ def verify_profile_storage(profile, identifier: str):
         raise TaskCommandError(f"storage admission failed closed: {exc}") from exc
 
 
+def verify_profile_storage_pool(profile):
+    """Obtain only the shared-pool proof before reserving capacity."""
+    try:
+        from wsl_adapter import WslAdapterError, inspect_quota
+        evidence = inspect_quota(
+            profile.slug, request_id=f"storage-{profile.slug}-pool-admission",
+        )
+        return verify_storage_evidence(
+            profile.slug, evidence, profile.storage_policy,
+            expected_target=str(profile.workspace_root.parent),
+        )
+    except (WslAdapterError, StorageContractError) as exc:
+        raise TaskCommandError(f"trusted storage pool capability is unavailable: {exc}") from exc
+
+
 def queue(args: argparse.Namespace) -> int:
     profile = _profile(args.project)
     selector_kind, selector = _task_selector(args.task)
@@ -153,7 +172,17 @@ def queue(args: argparse.Namespace) -> int:
         if task["state"] != "PREPARED":
             raise StateConflict("only PREPARED tasks may be queued")
         try:
-            admission = verify_profile_storage(profile, str(task["identifier"]))
+            # The SQLite reservation commits before the privileged helper can
+            # mutate project-quota state.  A retained PREPARED row is the
+            # crash-recovery record for an uncertain helper outcome.
+            domain = verify_profile_storage_pool(profile)
+            database.reserve_storage_capacity(
+                task["id"], project_slug=profile.slug, domain=domain,
+                policy=profile.storage_policy,
+            )
+            admission = verify_profile_storage(
+                profile, str(task["identifier"]), database=database, task_id=str(task["id"]),
+            )
             task = database.queue_task_with_storage(
                 task["id"], project_slug=profile.slug,
                 domain=admission.domain, policy=profile.storage_policy,

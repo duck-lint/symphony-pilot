@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Trusted operator verification of a registered project's storage domain.
+"""Trusted operator verification and cleanup of registered storage.
 
-The only Linux operation is the fixed quota inspection exposed by the WSL
+Linux work is restricted to fixed quota capabilities exposed by the WSL
 adapter. This command never provisions devices, selects quota IDs, or accepts
-paths and limits from the caller.
+paths and limits from the caller. Release accepts only proof that the exact
+task workspace and quota cannot grow.
 """
 from __future__ import annotations
 
@@ -17,7 +18,9 @@ sys.path.insert(0, str(ROOT / "runtime"))
 
 from control_db import ControlPlaneDatabase, ControlPlaneError, default_database_path  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
-from storage import StorageContractError, capacity_snapshot, verify_storage_evidence  # noqa: E402
+from storage import (StorageContractError, capacity_snapshot,
+                     storage_release_proof_from_evidence,
+                     verify_storage_evidence)  # noqa: E402
 
 
 def verify(args: argparse.Namespace) -> int:
@@ -44,12 +47,38 @@ def verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def release(args: argparse.Namespace) -> int:
+    profile = resolve_project(args.project, ROOT / "projects")
+    from wsl_adapter import WslAdapterError, release_task_quota
+
+    with ControlPlaneDatabase.open(default_database_path()) as database:
+        task = database.read_task_by_identifier(args.task, project_slug=profile.slug)
+        try:
+            evidence = release_task_quota(
+                profile.slug, str(task["identifier"]),
+                request_id=f"storage-{profile.slug}-{task['identifier']}-release",
+            )
+            proof = storage_release_proof_from_evidence(
+                evidence, project=profile.slug, identifier=str(task["identifier"]),
+            )
+            released = database.release_storage_reservation(task["id"], proof=proof)
+        except (WslAdapterError, StorageContractError) as exc:
+            raise ControlPlaneError(f"storage cleanup failed closed: {exc}") from exc
+    print(json.dumps({"project": profile.slug, "task": task["identifier"],
+                      "reservation": released}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="storage_cli.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
     verify_parser = subparsers.add_parser("verify", help="verify and record the dedicated quota domain")
     verify_parser.add_argument("--project", required=True)
     verify_parser.set_defaults(handler=verify)
+    release_parser = subparsers.add_parser("release", help="release after fixed-helper cleanup proof")
+    release_parser.add_argument("--project", required=True)
+    release_parser.add_argument("--task", required=True)
+    release_parser.set_defaults(handler=release)
     args = parser.parse_args(argv)
     try:
         return args.handler(args)

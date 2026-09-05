@@ -107,7 +107,7 @@ protection and the exact PR head before merging.
 | Linux user/mount/PID/network namespace primitive | PROVEN | real WSL `unshare` probe |
 | Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
 | Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
-| Aggregate persistent-workspace disk quota | IMPLEMENTED / TARGETED-VERIFIED / REQUIRES STEP-8 REVIEW | shared-pool reservation and kernel-proof admission seams; dedicated domain provisioning remains required |
+| Aggregate persistent-workspace disk quota | IMPLEMENTED / TARGETED-VERIFIED / REQUIRES STEP-8 REVIEW | shared-pool pre-helper reservation, source-controlled narrow privileged helper, task-usable capacity, and kernel-proof admission seams; dedicated domain provisioning remains required |
 | Local SQLite task intake / queue authority | TARGETED / FIXTURE-VERIFIED | trusted task CLI, transactionally allocated identity, and PREPARED-to-QUEUED CAS tests |
 | Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
 | Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |

@@ -66,16 +66,30 @@ The initial canary policy is a nominal 64-GiB backing domain with a 63-GiB
 allocatable filesystem ceiling. The one-GiB difference is explicit policy
 headroom for ext4 metadata and is not permission to expand the backing domain.
 The fixed adapter's task admission operation calls only the reviewed,
-root-owned capability-specific quota helper at
-`/usr/libexec/symphony-pilot/quota-admit-task`; absence or unsafe identity of
-that helper fails closed.
+root-owned, setuid-root capability-specific quota helper at
+`/usr/libexec/symphony-pilot/quota-admit-task`; its opened object, containing
+parents, and root-owned identity sidecar are checked before execution. Absence,
+replacement, or unsafe identity fails closed. The source and one-time
+installation recipe are `provisioning/quota-admit-task.c` and
+`scripts/provision_storage_domain.sh`; normal Pilot, Runtime, and model
+execution never receive privilege.
+
+Admission is two phase. A trusted SQLite transaction first holds the complete
+task reservation while the task remains PREPARED. Only then may the helper
+create/bind the exact project-quota directory and prove both kernel EDQUOT
+limits. A second trusted SQLite transaction changes the held reservation into
+QUEUED only after that proof. Process death or helper failure retains the
+reservation for reconciliation; it is never released merely because an
+exception occurred.
 
 Reservations remain active while a retained workspace or quota can grow.
 The trusted database release primitive therefore requires capability-produced
 proof that the exact workspace is destroyed, its project quota is removed, and
 zero further growth is possible. Physical usage observed after a release is
 still an admission constraint; releasing a ledger row never erases bytes that
-remain on the shared pool.
+remain on the shared pool. Pool admission uses `statvfs.f_bavail` and
+`f_favail`, the capacity actually available to the unprivileged task, while
+the physical `f_bfree`/`f_ffree` values remain visible evidence.
 
 Every writable connection explicitly enables:
 

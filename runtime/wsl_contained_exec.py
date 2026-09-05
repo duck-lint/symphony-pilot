@@ -43,6 +43,12 @@ TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
 QUOTA_HELPER_PATH = pathlib.PurePosixPath(
     "/usr/libexec/symphony-pilot/quota-admit-task"
 )
+QUOTA_HELPER_IDENTITY_PATH = pathlib.PurePosixPath(
+    "/etc/symphony-pilot/quota-admit-task.identity.json"
+)
+QUOTA_HELPER_SOURCE_SHA256 = (
+    "8824ee3621b109950927de1b54a83c468aa1db28515164a8a6ce9090a528b0a5"
+)
 
 
 class ContainmentError(RuntimeError):
@@ -291,8 +297,10 @@ def _quota_inspection(project: str) -> dict[str, object]:
                     "block_size": usage.f_frsize or usage.f_bsize,
                     "blocks": usage.f_blocks,
                     "free_blocks": usage.f_bfree,
+                    "available_blocks": usage.f_bavail,
                     "inodes": usage.f_files,
                     "free_inodes": usage.f_ffree,
+                    "available_inodes": usage.f_favail,
                 },
             },
             "ownership": {
@@ -318,7 +326,18 @@ def _quota_inspection(project: str) -> dict[str, object]:
 
 
 def _quota_helper_fd() -> int:
-    """Open the fixed root-owned helper without following a replacement link."""
+    """Open and pin the reviewed helper without following a replacement link."""
+    for parent in (
+        QUOTA_HELPER_PATH.parent, QUOTA_HELPER_PATH.parent.parent,
+        pathlib.PurePosixPath("/etc/symphony-pilot"), pathlib.PurePosixPath("/etc"),
+    ):
+        try:
+            metadata = os.stat(parent, follow_symlinks=False)
+        except OSError as exc:
+            raise ContainmentError("quota_provisioning", "task quota helper parent is unavailable") from exc
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or
+                metadata.st_mode & 0o022):
+            raise ContainmentError("quota_provisioning", "task quota helper parent is not trusted")
     try:
         fd = os.open(
             str(QUOTA_HELPER_PATH),
@@ -331,6 +350,36 @@ def _quota_helper_fd() -> int:
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
                 metadata.st_mode & 0o022 or not metadata.st_mode & 0o111):
             raise ContainmentError("quota_provisioning", "task quota helper is not a trusted executable")
+        try:
+            identity_fd = os.open(
+                str(QUOTA_HELPER_IDENTITY_PATH),
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                identity_metadata = os.fstat(identity_fd)
+                if (not stat.S_ISREG(identity_metadata.st_mode) or
+                        identity_metadata.st_uid != 0 or identity_metadata.st_mode & 0o022):
+                    raise OSError("helper identity sidecar is not trusted")
+                identity_payload = os.read(identity_fd, 4096)
+            finally:
+                os.close(identity_fd)
+            identity_document = json.loads(identity_payload.decode("ascii"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ContainmentError("quota_provisioning", "task quota helper identity is unavailable") from exc
+        if (not isinstance(identity_document, dict) or
+                set(identity_document) != {"schema", "source_sha256", "helper_sha256", "privilege"} or
+                identity_document.get("schema") != "symphony-pilot-quota-helper/v1" or
+                identity_document.get("source_sha256") != QUOTA_HELPER_SOURCE_SHA256 or
+                identity_document.get("privilege") != "setuid-root" or
+                not isinstance(identity_document.get("helper_sha256"), str) or
+                not SHA256.fullmatch(identity_document["helper_sha256"])):
+            raise ContainmentError("quota_provisioning", "task quota helper identity is malformed")
+        digest = hashlib.sha256()
+        os.lseek(fd, 0, os.SEEK_SET)
+        for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != identity_document["helper_sha256"]:
+            raise ContainmentError("quota_provisioning", "task quota helper identity differs from reviewed artifact")
         return fd
     except Exception:
         os.close(fd)
@@ -383,7 +432,7 @@ def _quota_task_admission(
     try:
         try:
             result = subprocess.run(
-                [f"/proc/self/fd/{fd}", "--project", project, "--identifier", identifier,
+                [f"/proc/self/fd/{fd}", "--operation", "admit", "--project", project, "--identifier", identifier,
                  "--byte-limit", str(byte_limit), "--inode-limit", str(inode_limit)],
                 capture_output=True, text=True, timeout=10, check=False,
                 pass_fds=(fd,), executable=f"/proc/self/fd/{fd}",
@@ -408,6 +457,44 @@ def _quota_task_admission(
         "pool": pool,
         "task_quota": task,
     }
+
+
+def _quota_task_release(project: str, identifier: str) -> dict[str, object]:
+    """Obtain exact cleanup evidence from the same fixed helper."""
+    if project not in STORAGE_PROJECTS or not TASK_IDENTIFIER.fullmatch(identifier):
+        raise ContainmentError("quota_identity", "task identifier is malformed")
+    fd = _quota_helper_fd()
+    try:
+        try:
+            result = subprocess.run(
+                [f"/proc/self/fd/{fd}", "--operation", "release", "--project", project,
+                 "--identifier", identifier], capture_output=True, text=True,
+                timeout=10, check=False, pass_fds=(fd,), executable=f"/proc/self/fd/{fd}",
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ContainmentError("quota_cleanup", "task quota cleanup helper did not complete") from exc
+    finally:
+        os.close(fd)
+    if result.returncode or len(result.stdout.encode("utf-8")) > 1024 * 1024:
+        raise ContainmentError("quota_cleanup", "task quota cleanup helper failed")
+    try:
+        evidence = json.loads(result.stdout)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ContainmentError("quota_cleanup", "task quota cleanup returned malformed JSON") from exc
+    expected_path = f"/home/duck-lint/symphony-workspaces/{project}/{identifier}"
+    expected_id = 1_000_000 + int(identifier[2:])
+    if (not isinstance(evidence, dict) or set(evidence) != {
+            "schema", "project", "identifier", "workspace_path", "project_id",
+            "workspace_state", "quota_state", "growth_possible", "remaining_bytes",
+            "remaining_inodes"
+        } or evidence.get("schema") != "symphony-pilot-task-quota-release/v1" or
+            evidence.get("project") != project or evidence.get("identifier") != identifier or
+            evidence.get("workspace_path") != expected_path or evidence.get("project_id") != expected_id or
+            evidence.get("workspace_state") != "destroyed" or evidence.get("quota_state") != "removed" or
+            evidence.get("growth_possible") is not False or evidence.get("remaining_bytes") != 0 or
+            evidence.get("remaining_inodes") != 0):
+        raise ContainmentError("quota_cleanup", "task quota cleanup proof is not exact")
+    return evidence
 
 
 def _contained_cwd(project_root: pathlib.Path, cwd: str) -> str:
@@ -545,7 +632,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--cwd")
-    parser.add_argument("--control", choices=("quota-inspect-root", "quota-admit-task"))
+    parser.add_argument("--control", choices=("quota-inspect-root", "quota-admit-task", "quota-release-task"))
     parser.add_argument("--identifier")
     parser.add_argument("--byte-limit", type=int)
     parser.add_argument("--inode-limit", type=int)
@@ -569,6 +656,12 @@ def main() -> int:
                 raise ContainmentError("control", "quota admission arguments are malformed")
             deployment_root = _deployment_root()
             _validate_deployment(deployment_root)
+        elif args.control == "quota-release-task":
+            if (args.cwd is not None or command or args.identifier is None or
+                    args.byte_limit is not None or args.inode_limit is not None):
+                raise ContainmentError("control", "quota cleanup arguments are malformed")
+            deployment_root = _deployment_root()
+            _validate_deployment(deployment_root)
         elif args.cwd is None or not command:
             raise ContainmentError("command", "contained command is required")
         if args.control == "quota-inspect-root":
@@ -577,6 +670,11 @@ def main() -> int:
         if args.control == "quota-admit-task":
             print(json.dumps(_quota_task_admission(
                 args.project, args.identifier, args.byte_limit, args.inode_limit,
+            ), sort_keys=True))
+            return 0
+        if args.control == "quota-release-task":
+            print(json.dumps(_quota_task_release(
+                args.project, args.identifier,
             ), sort_keys=True))
             return 0
         return run(args.project, args.cwd, command, args.wall_seconds)

@@ -969,26 +969,21 @@ class ControlPlaneDatabase:
         del task_id, project_slug
         raise StateConflict("QUEUED admission requires a verified storage reservation")
 
-    def queue_task_with_storage(
+    def reserve_storage_capacity(
         self,
         task_id: str | uuid.UUID,
         *,
         project_slug: str,
         domain: object,
         policy: object,
-        assignment: object,
     ) -> dict[str, object]:
-        """Verify admission capacity and queue one task in one transaction.
+        """Durably commit a full-task reservation before quota mutation.
 
-        ``domain`` is a host-verified storage proof, never model input.  This
-        method records the proof and reserves the task's complete allowance
-        before the lifecycle can become QUEUED.  It intentionally has no
-        fallback to the low-level ``queue_task`` path.
+        A reserved row while the task is PREPARED is an admission intent. It
+        is deliberately retained across helper failures and process death so
+        uncertain privileged filesystem state cannot free capacity early.
         """
-        from storage import (
-            StorageContractError, StoragePolicy, VerifiedStorageDomain,
-            derive_quota_id, validate_task_quota_binding,
-        )
+        from storage import StorageContractError, StoragePolicy, VerifiedStorageDomain, derive_quota_id
 
         task_id = _uuid(task_id, "task_id")
         project_slug = _project_slug(project_slug)
@@ -1005,10 +1000,7 @@ class ControlPlaneDatabase:
             if task["project_slug"] != project_slug:
                 raise StateConflict("task is not registered to the selected project")
             if task["state"] != "PREPARED":
-                raise StateConflict("only PREPARED tasks may be queued")
-            validate_task_quota_binding(
-                assignment, project=project_slug, identifier=str(task["identifier"]), policy=policy,
-            )
+                raise StateConflict("only PREPARED tasks may reserve storage")
             proposed = (domain.source, domain.target, domain.fstype, domain.options)
             for row in self.connection.execute(
                 "SELECT source, mount_target, fstype, mount_options FROM storage_domains"
@@ -1033,32 +1025,30 @@ class ControlPlaneDatabase:
                  domain.pool_bytes, domain.pool_inodes, domain.free_bytes, domain.free_inodes,
                  timestamp, domain.evidence_json),
             )
+            quota_id = derive_quota_id(str(task["identifier"]))
+            existing = self.connection.execute(
+                "SELECT * FROM storage_reservations WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if existing is not None:
+                if (existing["status"] != "reserved" or existing["project_slug"] != project_slug or
+                        existing["quota_id"] != quota_id or
+                        existing["reserved_bytes"] != policy.task_bytes or
+                        existing["reserved_inodes"] != policy.task_inodes):
+                    raise StateConflict("conflicting storage admission retry")
+                return dict(existing)
             reserved = self.connection.execute(
                 """
                 SELECT COALESCE(SUM(reserved_bytes), 0), COALESCE(SUM(reserved_inodes), 0)
-                FROM storage_reservations
-                WHERE status = 'reserved'
+                FROM storage_reservations WHERE status = 'reserved'
                 """,
             ).fetchone()
-            used_bytes = domain.pool_bytes - domain.free_bytes
-            used_inodes = domain.pool_inodes - domain.free_inodes
-            if used_bytes > policy.allocatable_pool_bytes:
-                # Physical usage outside the reservation ledger remains an
-                # admission constraint; release cannot make it disappear.
-                raise StateConflict("observed storage usage exceeds allocatable pool capacity")
-            # statvfs free space already reflects bytes/inodes used by
-            # reserved tasks. Compare physical free capacity with the
-            # uncommitted reservation capacity instead of subtracting both.
-            available_bytes = min(
-                domain.free_bytes, policy.allocatable_pool_bytes - int(reserved[0])
-            ) - policy.task_bytes
-            available_inodes = min(
-                domain.free_inodes, domain.pool_inodes - int(reserved[1])
-            ) - policy.task_inodes
-            if (available_bytes < policy.emergency_reserve_bytes or
-                    available_inodes < policy.emergency_reserve_inodes):
+            if domain.pool_bytes - domain.free_bytes > policy.allocatable_pool_bytes:
+                raise StateConflict("observed task-usable storage exceeds allocatable pool capacity")
+            available_bytes = min(domain.free_bytes, policy.allocatable_pool_bytes - int(reserved[0]))
+            available_inodes = min(domain.free_inodes, domain.pool_inodes - int(reserved[1]))
+            if (available_bytes - policy.task_bytes < policy.emergency_reserve_bytes or
+                    available_inodes - policy.task_inodes < policy.emergency_reserve_inodes):
                 raise StateConflict("storage admission would consume the emergency reserve")
-            quota_id = derive_quota_id(str(task["identifier"]))
             try:
                 self.connection.execute(
                     """
@@ -1071,6 +1061,80 @@ class ControlPlaneDatabase:
                 )
             except sqlite3.IntegrityError as exc:
                 raise StateConflict("task or host quota identity already has a storage reservation") from exc
+            row = self.connection.execute(
+                "SELECT * FROM storage_reservations WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def queue_task_with_storage(
+        self,
+        task_id: str | uuid.UUID,
+        *,
+        project_slug: str,
+        domain: object,
+        policy: object,
+        assignment: object,
+    ) -> dict[str, object]:
+        """Finalize a durable reservation after exact quota proof."""
+        from storage import (
+            StorageContractError, StoragePolicy, VerifiedStorageDomain,
+            derive_quota_id, validate_task_quota_binding,
+        )
+
+        task_id = _uuid(task_id, "task_id")
+        project_slug = _project_slug(project_slug)
+        if not isinstance(domain, VerifiedStorageDomain):
+            raise StorageContractError("storage admission requires verified host evidence")
+        if not isinstance(policy, StoragePolicy):
+            raise StorageContractError("storage admission requires a validated profile policy")
+        policy.validate()
+        if domain.project != project_slug:
+            raise StateConflict("storage domain is not registered to the selected project")
+        timestamp = _timestamp(None, "occurred_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            if task["project_slug"] != project_slug:
+                raise StateConflict("task is not registered to the selected project")
+            if task["state"] != "PREPARED":
+                raise StateConflict("only PREPARED tasks may be queued")
+            validate_task_quota_binding(
+                assignment, project=project_slug, identifier=str(task["identifier"]), policy=policy,
+            )
+            quota_id = derive_quota_id(str(task["identifier"]))
+            reservation = self.connection.execute(
+                "SELECT * FROM storage_reservations WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if (reservation is None or reservation["status"] != "reserved" or
+                    reservation["project_slug"] != project_slug or
+                    reservation["quota_id"] != quota_id or
+                    reservation["reserved_bytes"] != policy.task_bytes or
+                    reservation["reserved_inodes"] != policy.task_inodes):
+                raise StateConflict("exact durable storage reservation is required before QUEUED")
+            proposed = (domain.source, domain.target, domain.fstype, domain.options)
+            for row in self.connection.execute(
+                "SELECT source, mount_target, fstype, mount_options FROM storage_domains"
+            ).fetchall():
+                identity = (row["source"], row["mount_target"], row["fstype"], row["mount_options"])
+                if identity != proposed:
+                    raise StateConflict("shared storage pool identity changed")
+            self.connection.execute(
+                """
+                INSERT INTO storage_domains(
+                    project_slug, source, mount_target, fstype, mount_options,
+                    pool_bytes, pool_inodes, free_bytes, free_inodes, verified_at, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_slug) DO UPDATE SET
+                    source = excluded.source, mount_target = excluded.mount_target,
+                    fstype = excluded.fstype, mount_options = excluded.mount_options,
+                    pool_bytes = excluded.pool_bytes, pool_inodes = excluded.pool_inodes,
+                    free_bytes = excluded.free_bytes, free_inodes = excluded.free_inodes,
+                    verified_at = excluded.verified_at, evidence_json = excluded.evidence_json
+                """,
+                (domain.project, domain.source, domain.target, domain.fstype, domain.options,
+                 domain.pool_bytes, domain.pool_inodes, domain.free_bytes, domain.free_inodes,
+                 timestamp, domain.evidence_json),
+            )
             self.connection.execute(
                 "UPDATE tasks SET state = 'QUEUED', updated_at = ? WHERE id = ? AND state = 'PREPARED'",
                 (timestamp, task_id),

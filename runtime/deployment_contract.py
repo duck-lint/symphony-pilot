@@ -48,6 +48,8 @@ CONTRACT_FILES = (
     "runtime/publication_key.py",
     "runtime/rulesets.py",
     "scripts/provision_publication_key.py",
+    "provisioning/quota-admit-task.c",
+    "scripts/provision_storage_domain.sh",
     *POLICY_FILES,
 )
 

@@ -36,7 +36,8 @@ class StorageContractTests(unittest.TestCase):
                 "statvfs": {
                     "block_size": 4096, "blocks": 16_777_216,
                     "free_blocks": 15_000_000, "inodes": 10_000_000,
-                    "free_inodes": 9_900_000,
+                    "available_blocks": 14_900_000,
+                    "free_inodes": 9_900_000, "available_inodes": 9_800_000,
                 },
             },
             "quota": {
@@ -49,6 +50,18 @@ class StorageContractTests(unittest.TestCase):
         return verify_storage_evidence(
             "demo", self.evidence(), self.policy(),
             expected_target="/home/duck-lint/symphony-workspaces",
+        )
+
+    def queue_with_reservation(self, database, task, domain=None):
+        domain = domain or self.domain()
+        database.reserve_storage_capacity(
+            task["id"], project_slug=str(task["project_slug"]),
+            domain=domain, policy=self.policy(),
+        )
+        return database.queue_task_with_storage(
+            task["id"], project_slug=str(task["project_slug"]), domain=domain,
+            policy=self.policy(),
+            assignment=admission_proof(domain, identifier=str(task["identifier"])).binding,
         )
 
     def test_unqualified_current_root_is_rejected(self):
@@ -99,6 +112,62 @@ class StorageContractTests(unittest.TestCase):
                     database.queue_task(task["id"], project_slug="demo")
                 self.assertEqual(database.read_task(task["id"])["state"], "PREPARED")
 
+    def test_queue_finalization_requires_preexisting_durable_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                task = database.create_task(
+                    project_slug="demo", title="Storage", objective="Two phase admission",
+                    base_ref="main", base_sha="a" * 40, identifier="T-000001",
+                )
+                with self.assertRaisesRegex(control_db.StateConflict, "durable storage reservation"):
+                    database.queue_task_with_storage(
+                        task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                        assignment=admission_proof(self.domain(), identifier="T-000001").binding,
+                    )
+                self.assertIsNone(database.read_storage_reservation(task["id"]))
+
+    def test_reservation_survives_failed_quota_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                task = database.create_task(
+                    project_slug="demo", title="Storage", objective="Crash recovery",
+                    base_ref="main", base_sha="a" * 40, identifier="T-000001",
+                )
+                database.reserve_storage_capacity(
+                    task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                )
+                bad = dataclasses.replace(
+                    admission_proof(self.domain(), identifier="T-000001").binding,
+                    quota_id=1,
+                )
+                with self.assertRaises(StorageContractError):
+                    database.queue_task_with_storage(
+                        task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                        assignment=bad,
+                    )
+                self.assertEqual(database.read_task(task["id"])["state"], "PREPARED")
+                self.assertEqual(database.read_storage_reservation(task["id"])["status"], "reserved")
+
+    def test_reservation_retry_is_idempotent_but_identity_conflicts_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                task = database.create_task(
+                    project_slug="demo", title="Storage", objective="Retry",
+                    base_ref="main", base_sha="a" * 40, identifier="T-000001",
+                )
+                first = database.reserve_storage_capacity(
+                    task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                )
+                second = database.reserve_storage_capacity(
+                    task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
+                )
+                self.assertEqual(first["task_id"], second["task_id"])
+                conflict = dataclasses.replace(self.policy(), task_bytes=4 * GIB)
+                with self.assertRaisesRegex(control_db.StateConflict, "conflicting"):
+                    database.reserve_storage_capacity(
+                        task["id"], project_slug="demo", domain=self.domain(), policy=conflict,
+                    )
+
     def test_task_quota_binding_is_separate_and_exact(self):
         with tempfile.TemporaryDirectory() as directory:
             with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
@@ -127,10 +196,7 @@ class StorageContractTests(unittest.TestCase):
                         base_ref="main", base_sha="a" * 40, identifier=identifier,
                     )
                     domain = dataclasses.replace(self.domain(), project=project)
-                    database.queue_task_with_storage(
-                        task["id"], project_slug=project, domain=domain, policy=self.policy(),
-                        assignment=admission_proof(domain, identifier=identifier).binding,
-                    )
+                    self.queue_with_reservation(database, task, domain)
                 totals = database.storage_reservation_totals("demo")
                 self.assertEqual(totals["reserved_bytes"], 16 * GIB)
                 self.assertEqual(totals["project_reserved_bytes"], 8 * GIB)
@@ -145,10 +211,7 @@ class StorageContractTests(unittest.TestCase):
                     task_id="11111111-1111-1111-1111-111111111111",
                     identifier="T-000001",
                 )
-                queued = database.queue_task_with_storage(
-                    task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
-                    assignment=admission_proof(self.domain(), identifier="T-000001").binding,
-                )
+                queued = self.queue_with_reservation(database, task)
                 reservation = database.read_storage_reservation(task["id"])
                 self.assertEqual(queued["state"], "QUEUED")
                 self.assertEqual(reservation["reserved_bytes"], 8 * GIB)
@@ -168,15 +231,9 @@ class StorageContractTests(unittest.TestCase):
                     )
                     if number == 7:
                         with self.assertRaises(control_db.StateConflict):
-                            database.queue_task_with_storage(
-                                task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
-                                assignment=admission_proof(self.domain(), identifier=f"T-{number:06d}").binding,
-                            )
+                            self.queue_with_reservation(database, task)
                     else:
-                        database.queue_task_with_storage(
-                            task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
-                            assignment=admission_proof(self.domain(), identifier=f"T-{number:06d}").binding,
-                        )
+                        self.queue_with_reservation(database, task)
 
     def test_reservation_release_requires_trusted_cleanup_proof(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -185,10 +242,7 @@ class StorageContractTests(unittest.TestCase):
                     project_slug="demo", title="Storage", objective="Cleanup proof",
                     base_ref="main", base_sha="a" * 40, identifier="T-000001",
                 )
-                database.queue_task_with_storage(
-                    task["id"], project_slug="demo", domain=self.domain(), policy=self.policy(),
-                    assignment=admission_proof(self.domain(), identifier="T-000001").binding,
-                )
+                self.queue_with_reservation(database, task)
                 with self.assertRaisesRegex(StorageContractError, "cleanup proof"):
                     database.release_storage_reservation(task["id"], proof=None)
                 evidence = {
@@ -214,10 +268,7 @@ class StorageContractTests(unittest.TestCase):
                     project_slug="demo", title="Storage", objective="Retained usage",
                     base_ref="main", base_sha="a" * 40, identifier="T-000001",
                 )
-                database.queue_task_with_storage(
-                    first["id"], project_slug="demo", domain=constrained, policy=self.policy(),
-                    assignment=admission_proof(constrained, identifier="T-000001").binding,
-                )
+                self.queue_with_reservation(database, first, constrained)
                 evidence = {
                     "schema": "symphony-pilot-task-quota-release/v1",
                     "project_id": derive_quota_id("T-000001"),
@@ -237,10 +288,7 @@ class StorageContractTests(unittest.TestCase):
                 )
                 tighter = dataclasses.replace(constrained, free_bytes=15 * GIB)
                 with self.assertRaisesRegex(control_db.StateConflict, "emergency reserve"):
-                    database.queue_task_with_storage(
-                        second["id"], project_slug="demo", domain=tighter, policy=self.policy(),
-                        assignment=admission_proof(tighter, identifier="T-000002").binding,
-                    )
+                    self.queue_with_reservation(database, second, tighter)
     def test_verified_domain_requires_exact_shared_pool_mount_and_identity_proof(self):
         evidence = self.evidence()
         evidence["filesystem"]["target"] = "/home/duck-lint/symphony-workspaces/other"
@@ -267,6 +315,41 @@ class StorageContractTests(unittest.TestCase):
         )
         self.assertLess(domain.pool_bytes, self.policy().pool_bytes)
         self.assertGreaterEqual(domain.pool_bytes, self.policy().allocatable_pool_bytes)
+
+    def test_task_usable_capacity_uses_f_bavail_not_f_bfree(self):
+        evidence = self.evidence()
+        evidence["filesystem"]["statvfs"]["free_blocks"] = 15_000_000
+        evidence["filesystem"]["statvfs"]["available_blocks"] = 14_000_000
+        domain = self.domain_from(evidence)
+        self.assertEqual(domain.free_bytes, 4096 * 14_000_000)
+        self.assertGreater(
+            int(json.loads(domain.evidence_json)["filesystem"]["statvfs"]["free_blocks"]),
+            int(json.loads(domain.evidence_json)["filesystem"]["statvfs"]["available_blocks"]),
+        )
+
+    def test_f_bfree_above_f_bavail_can_preserve_emergency_reserve(self):
+        evidence = self.evidence()
+        evidence["filesystem"]["statvfs"]["free_blocks"] = 16_500_000
+        evidence["filesystem"]["statvfs"]["available_blocks"] = 3_900_000
+        domain = self.domain_from(evidence)
+        with tempfile.TemporaryDirectory() as directory:
+            with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
+                task = database.create_task(
+                    project_slug="demo", title="Storage", objective="Task capacity",
+                    base_ref="main", base_sha="a" * 40, identifier="T-000001",
+                )
+                with self.assertRaisesRegex(control_db.StateConflict, "emergency reserve"):
+                    # Physical f_bfree must not authorize an unprivileged
+                    # admission when f_bavail cannot preserve the reserve.
+                    database.reserve_storage_capacity(
+                        task["id"], project_slug="demo", domain=domain, policy=self.policy(),
+                    )
+
+    def domain_from(self, evidence):
+        return verify_storage_evidence(
+            "demo", evidence, self.policy(),
+            expected_target="/home/duck-lint/symphony-workspaces",
+        )
 
     def test_usable_capacity_below_allocatable_policy_is_rejected(self):
         evidence = self.evidence()

@@ -78,9 +78,13 @@ grandchild can no longer modify a task-visible sentinel. Individual file size
 is bounded. Aggregate admission now uses one shared pool reservation ledger,
 separates nominal backing from the filesystem-usable admission ceiling, and
 keeps reservations active until trusted cleanup proof shows that a task quota
-cannot grow. The current root filesystem is rejected and no task is admitted
-until a dedicated kernel-enforced byte/inode domain and task-binding proof are
-available.
+cannot grow. The reservation is committed before the fixed privileged helper
+can mutate the task quota; uncertain helper outcomes retain that commitment.
+The fixed helper is a source-controlled setuid-root capability with exact
+opened-object identity pinning, not a general command broker. Pool admission
+uses unprivileged `f_bavail`/`f_favail`. The current root filesystem is rejected
+and no task is admitted until a dedicated kernel-enforced byte/inode domain and
+task-binding proof are available.
 
 This fixture proves the constructor, not live Codex behavior. The real launcher
 still fails closed because the accepted Codex App Server authentication path

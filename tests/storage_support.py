@@ -47,6 +47,9 @@ def queue_task(database, task: dict[str, object]) -> dict[str, object]:
         free_inodes=99_000_000,
         evidence_json='{"synthetic_test_proof":true}',
     )
+    database.reserve_storage_capacity(
+        task["id"], project_slug=project, domain=domain, policy=StoragePolicy(),
+    )
     return database.queue_task_with_storage(
         task["id"], project_slug=project, domain=domain, policy=StoragePolicy(),
         assignment=admission_proof(domain, identifier=str(task["identifier"])).binding,

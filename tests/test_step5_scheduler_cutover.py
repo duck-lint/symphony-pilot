@@ -118,10 +118,11 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                     free_bytes=60 * 1024 ** 3, free_inodes=900_000,
                     evidence_json='{"synthetic":true}',
                 )
-                with mock.patch.object(
-                    task, "verify_profile_storage",
-                    return_value=admission_proof(domain, identifier="T-000001"),
-                ):
+                with mock.patch.object(task, "verify_profile_storage_pool", return_value=domain), \
+                     mock.patch.object(
+                         task, "verify_profile_storage",
+                         return_value=admission_proof(domain, identifier="T-000001"),
+                     ):
                     self.assertEqual(task.queue(Namespace(project="alpha", task="T-000001")), 0)
                 with self.assertRaises(control_db.StateConflict):
                     task.queue(Namespace(project="alpha", task="T-000001"))
@@ -195,16 +196,24 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                     "target": "/home/duck-lint/symphony-workspaces", "source": "/dev/vdb",
                     "fstype": "ext4", "options": "rw,relatime,prjquota",
                     "statvfs": {"block_size": 4096, "blocks": 16_777_216,
-                                 "free_blocks": 16_000_000, "inodes": 1_000_000,
-                                 "free_inodes": 900_000},
+                                 "free_blocks": 16_000_000, "available_blocks": 15_900_000,
+                                 "inodes": 1_000_000,
+                                 "free_inodes": 900_000, "available_inodes": 899_000},
                 },
                 "quota": {"backend": "ext4-project-quota", "mount_support": True},
                 "ownership": {"trusted": True},
             },
             "task_quota": task_proof,
         }
+        database = mock.Mock()
+        database.read_storage_reservation.return_value = {
+            "status": "reserved", "project_slug": "alpha",
+        }
         with mock.patch.object(wsl_adapter, "admit_task_quota", return_value=evidence):
-            admission = task.verify_profile_storage(profile, "T-000001")
+            admission = task.verify_profile_storage(
+                profile, "T-000001", database=database,
+                task_id="11111111-1111-1111-1111-111111111111",
+            )
         self.assertIsInstance(admission, StorageAdmissionProof)
         self.assertEqual(admission.binding.quota_id, 1_000_001)
 

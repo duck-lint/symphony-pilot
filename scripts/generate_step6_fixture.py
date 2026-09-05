@@ -52,6 +52,10 @@ def queue_fixture_task(database: ControlPlaneDatabase, task: dict[str, object]) 
             "inode_probe": {"attempted": True, "result": "EDQUOT"},
         }),
     )
+    database.reserve_storage_capacity(
+        task["id"], project_slug=str(task["project_slug"]),
+        domain=domain, policy=StoragePolicy(),
+    )
     database.queue_task_with_storage(
         task["id"], project_slug=str(task["project_slug"]),
         domain=domain, policy=StoragePolicy(), assignment=assignment,

@@ -177,7 +177,15 @@ def verify_storage_evidence(
     if not block_size or free_blocks > blocks or free_inodes > inodes:
         raise StorageContractError("storage statvfs capacities are inconsistent")
     pool_bytes = block_size * blocks
-    free_bytes = block_size * free_blocks
+    available_blocks = _positive_integer(statvfs.get("available_blocks"), "available_blocks")
+    physical_free_inodes = free_inodes
+    available_inodes = _positive_integer(statvfs.get("available_inodes"), "available_inodes")
+    if available_blocks > free_blocks or available_inodes > physical_free_inodes:
+        raise StorageContractError("task-usable statvfs capacity exceeds physical free capacity")
+    # ``free_blocks``/``free_inodes`` describe physical free capacity.  The
+    # task-facing quantities deliberately use f_bavail/f_favail: reserved
+    # unprivileged work must not consume root-reserved filesystem space.
+    free_bytes = block_size * available_blocks
     if pool_bytes > policy.pool_bytes:
         raise StorageContractError("filesystem usable capacity exceeds nominal backing capacity")
     if pool_bytes < policy.allocatable_pool_bytes:
@@ -207,7 +215,7 @@ def verify_storage_evidence(
     return VerifiedStorageDomain(
         project=project, source=source, target=target, fstype=fstype, options=options,
         pool_bytes=pool_bytes, pool_inodes=inodes, free_bytes=free_bytes,
-        free_inodes=free_inodes,
+        free_inodes=available_inodes,
         evidence_json=json.dumps(bounded, sort_keys=True, separators=(",", ":")),
     )
 
@@ -348,8 +356,21 @@ def capacity_snapshot(
     pool_inodes = int(domain["pool_inodes"])
     free_bytes = int(domain["free_bytes"])
     free_inodes = int(domain["free_inodes"])
-    used_bytes = observed_pool_bytes - free_bytes
-    used_inodes = pool_inodes - free_inodes
+    physical_free_bytes = free_bytes
+    physical_free_inodes = free_inodes
+    try:
+        evidence = json.loads(str(domain.get("evidence_json", "{}")))
+        statvfs = evidence.get("filesystem", {}).get("statvfs", {})
+        physical_free_bytes = int(statvfs.get("block_size", 1)) * int(
+            statvfs.get("free_blocks", free_bytes // int(statvfs.get("block_size", 1)))
+        )
+        physical_free_inodes = int(statvfs.get("free_inodes", free_inodes))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        # Synthetic older domain rows have no split evidence; their task
+        # usable free value is the only safe quantity available.
+        pass
+    used_bytes = observed_pool_bytes - physical_free_bytes
+    used_inodes = pool_inodes - physical_free_inodes
     uncommitted_bytes = max(0, pool_bytes - reserved_bytes)
     uncommitted_inodes = max(0, pool_inodes - reserved_inodes)
     return {
@@ -362,8 +383,10 @@ def capacity_snapshot(
         "used_inodes": used_inodes,
         "physical_used_bytes": used_bytes,
         "physical_used_inodes": used_inodes,
-        "physical_free_bytes": free_bytes,
-        "physical_free_inodes": free_inodes,
+        "physical_free_bytes": physical_free_bytes,
+        "physical_free_inodes": physical_free_inodes,
+        "task_usable_free_bytes": free_bytes,
+        "task_usable_free_inodes": free_inodes,
         "reserved_bytes": reserved_bytes,
         "reserved_inodes": reserved_inodes,
         "uncommitted_available_bytes": min(free_bytes, uncommitted_bytes),
