@@ -27,6 +27,9 @@ DEPLOYMENT_NAMESPACE = pathlib.PurePosixPath(
 REQUIRED_AUTHORITY_FILES = (
     "runtime/wsl_contained_exec.py",
     "runtime/containment.py",
+    "provisioning/quota-admit-task.c",
+    "scripts/provision_storage_domain.sh",
+    "scripts/provision_storage_vhdx.ps1",
 )
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -41,14 +44,18 @@ TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
 # limits, binds the workspace to that project quota, and returns bounded
 # kernel evidence.  Missing or unsafe installation fails closed.
 QUOTA_HELPER_PATH = pathlib.PurePosixPath(
-    "/usr/libexec/symphony-pilot/quota-admit-task"
+    "/var/lib/symphony-pilot/quota-admit-task"
 )
 QUOTA_HELPER_IDENTITY_PATH = pathlib.PurePosixPath(
-    "/etc/symphony-pilot/quota-admit-task.identity.json"
+    "/var/lib/symphony-pilot/quota-admit-task.identity.json"
+)
+STORAGE_DOMAIN_IDENTITY_PATH = pathlib.PurePosixPath(
+    "/var/lib/symphony-pilot/storage-domain.identity.json"
 )
 QUOTA_HELPER_GROUP = "symphony-pilot"
+STORAGE_IDENTITY_SCHEMA = "symphony-pilot-storage-domain/v1"
 QUOTA_HELPER_SOURCE_SHA256 = (
-    "f212db1e8bcedf1246ba760643c6c56dca0f29e4d5dff5fead2fe21be66f498f"
+    "53d62ba83ea59045476138adbd42ebe6e8e28b037515ce8847b5624a215867c1"
 )
 
 
@@ -221,6 +228,53 @@ def _workspace_storage_root(project: str) -> tuple[pathlib.Path, bool]:
     return namespace, created
 
 
+def _read_storage_domain_identity() -> dict[str, object]:
+    """Read the root-owned record that binds the live pool to Pilot."""
+    path = pathlib.Path(STORAGE_DOMAIN_IDENTITY_PATH)
+    for parent in (path.parent, path.parent.parent, path.parent.parent.parent):
+        try:
+            metadata = os.stat(parent, follow_symlinks=False)
+        except OSError as exc:
+            raise ContainmentError("quota_identity", "storage-domain identity parent is unavailable") from exc
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or
+                metadata.st_mode & 0o022):
+            raise ContainmentError("quota_identity", "storage-domain identity parent is not trusted")
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            metadata = os.fstat(fd)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
+                    metadata.st_mode & 0o022):
+                raise OSError("storage-domain identity is not trusted")
+            payload = os.read(fd, 8192)
+        finally:
+            os.close(fd)
+        identity = json.loads(payload.decode("ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ContainmentError("quota_identity", "storage-domain identity is unavailable") from exc
+    required = {
+        "schema", "pool_label", "filesystem_uuid", "backing_bytes",
+        "allocatable_bytes", "filesystem", "mount_target", "quota_features",
+        "mount_options", "reserved_blocks",
+    }
+    if not isinstance(identity, dict) or set(identity) != required:
+        raise ContainmentError("quota_identity", "storage-domain identity is malformed")
+    if (identity["schema"] != STORAGE_IDENTITY_SCHEMA or
+            not isinstance(identity["pool_label"], str) or
+            not re.fullmatch(r"[A-Z0-9_-]{1,32}", identity["pool_label"]) or
+            not isinstance(identity["filesystem_uuid"], str) or
+            not re.fullmatch(r"[0-9a-fA-F-]{8,64}", identity["filesystem_uuid"]) or
+            identity["filesystem"] != "ext4" or
+            identity["mount_target"] != str(WORKSPACE_ROOT) or
+            identity["quota_features"] != ["project", "quota"] or
+            identity["mount_options"] != ["prjquota"] or
+            identity["reserved_blocks"] != 0 or
+            any(isinstance(identity[field], bool) or not isinstance(identity[field], int) or
+                identity[field] <= 0 for field in ("backing_bytes", "allocatable_bytes"))):
+        raise ContainmentError("quota_identity", "storage-domain identity does not match the reviewed contract")
+    return identity
+
+
 def _quota_inspection(project: str) -> dict[str, object]:
     """Return bounded evidence for the persistent task-storage filesystem.
 
@@ -245,7 +299,7 @@ def _quota_inspection(project: str) -> dict[str, object]:
         try:
             result = subprocess.run(
                 ["/bin/findmnt", "--json", "--target", str(target),
-                 "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
+                 "--output", "TARGET,SOURCE,UUID,FSTYPE,OPTIONS"],
                 capture_output=True, text=True, timeout=5, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -258,13 +312,19 @@ def _quota_inspection(project: str) -> dict[str, object]:
             entry = entries[0]
             mount_target = entry["target"]
             source = entry["source"]
+            filesystem_uuid = entry["uuid"]
             fstype = entry["fstype"]
             options = entry["options"]
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise ContainmentError("quota_inspection", "trusted mount inspection returned malformed evidence") from exc
         if (not isinstance(mount_target, str) or not isinstance(source, str) or
+                not isinstance(filesystem_uuid, str) or
                 not isinstance(fstype, str) or not isinstance(options, str)):
             raise ContainmentError("quota_inspection", "trusted mount inspection fields are malformed")
+        identity = _read_storage_domain_identity()
+        if (identity["filesystem_uuid"].lower() != filesystem_uuid.lower() or
+                identity["filesystem"] != fstype or identity["mount_target"] != mount_target):
+            raise ContainmentError("quota_identity", "mounted filesystem does not match the trusted storage domain")
         try:
             usage = os.statvfs(target)
         except OSError as exc:
@@ -291,6 +351,7 @@ def _quota_inspection(project: str) -> dict[str, object]:
             "filesystem": {
                 "target": mount_target,
                 "source": source,
+                "uuid": filesystem_uuid,
                 "fstype": fstype,
                 "options": options,
                 "project_quota_mount": project_quota,
@@ -310,6 +371,7 @@ def _quota_inspection(project: str) -> dict[str, object]:
                 "mode": ownership.st_mode & 0o777 if ownership is not None else None,
                 "trusted": trusted_ownership,
             },
+            "storage_identity": identity,
             # Mount flags alone do not prove that a task quota identity is
             # applicable or that either hard limit is enforced. Those facts
             # require the separate trusted provisioning/verifier proof.
@@ -330,7 +392,7 @@ def _quota_helper_fd() -> int:
     """Open and pin the reviewed helper without following a replacement link."""
     for parent in (
         QUOTA_HELPER_PATH.parent, QUOTA_HELPER_PATH.parent.parent,
-        pathlib.PurePosixPath("/etc/symphony-pilot"), pathlib.PurePosixPath("/etc"),
+        QUOTA_HELPER_PATH.parent.parent.parent,
     ):
         try:
             metadata = os.stat(parent, follow_symlinks=False)
@@ -354,8 +416,7 @@ def _quota_helper_fd() -> int:
         except (ImportError, KeyError) as exc:
             raise ContainmentError("quota_provisioning", "task quota helper group is unavailable") from exc
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
-                metadata.st_gid != expected_gid or metadata.st_mode & 0o022 or
-                not metadata.st_mode & 0o111 or not metadata.st_mode & stat.S_ISUID):
+                metadata.st_gid != expected_gid or stat.S_IMODE(metadata.st_mode) != 0o4750):
             raise ContainmentError("quota_provisioning", "task quota helper is not a trusted executable")
         try:
             identity_fd = os.open(
@@ -643,7 +704,8 @@ def run(project: str, cwd: str, command: list[str], wall_seconds: float) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", required=True)
+    parser.add_argument("--project")
+    parser.add_argument("--verify-deployment", action="store_true")
     parser.add_argument("--cwd")
     parser.add_argument("--control", choices=("quota-inspect-root", "quota-admit-task", "quota-release-task"))
     parser.add_argument("--identifier")
@@ -654,6 +716,20 @@ def main() -> int:
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
+        if args.verify_deployment:
+            if (args.project is not None or args.cwd is not None or args.control is not None or
+                    args.identifier is not None or args.byte_limit is not None or
+                    args.inode_limit is not None or command):
+                raise ContainmentError("control", "deployment verification arguments are malformed")
+            deployment_root = _deployment_root()
+            manifest = _validate_deployment(deployment_root)
+            print(json.dumps({"schema": DEPLOYMENT_SCHEMA,
+                              "source_commit": manifest["source_commit"],
+                              "deployment_identity": manifest["deployment_identity"]},
+                             sort_keys=True))
+            return 0
+        if not args.project:
+            raise ContainmentError("project", "project is required")
         if args.control == "quota-inspect-root":
             if (args.cwd is not None or command or args.identifier is not None or
                     args.byte_limit is not None or args.inode_limit is not None):

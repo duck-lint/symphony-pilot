@@ -28,7 +28,7 @@ class QuotaHelperContractTests(unittest.TestCase):
 
     def test_provisioning_recipe_is_fixed_and_not_a_command_broker(self):
         recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
-        self.assertIn("mkfs.ext4 -m 0 -i 65536 -I 256 -J size=64", recipe)
+        self.assertIn("mkfs.ext4 -L \"$POOL_LABEL\" -m 0 -i 65536 -I 256 -J size=64", recipe)
         self.assertIn("-O project,quota -E quotatype=prjquota", recipe)
         self.assertIn("mount -t ext4 -o prjquota", recipe)
         self.assertIn('chown duck-lint:duck-lint "$POOL_ROOT"', recipe)
@@ -43,6 +43,14 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("64 * 1024 * 1024 * 1024", recipe)
         self.assertIn("/home/duck-lint/symphony-workspaces", recipe)
         self.assertIn("/dev/sdd", recipe)
+        self.assertIn("POOL_LABEL=SYMPHONY-POOL", recipe)
+        self.assertIn('DEVICE_LABEL=$(blkid -o value -s LABEL "$POOL_DEVICE")', recipe)
+        self.assertIn('if [ -z "$DEVICE_TYPE" ]; then', recipe)
+        self.assertIn('if [ -e "$STORAGE_IDENTITY" ]; then', recipe)
+        self.assertIn('if ! cmp -s "$FSTAB_TMP" "$FSTAB"', recipe)
+        self.assertIn("--verify-deployment", recipe)
+        self.assertIn("/usr/bin/python3 -B", recipe)
+        self.assertIn("/var/lib/symphony-pilot/storage-domain.identity.json", recipe)
         helper = (ROOT / "provisioning" / "quota-admit-task.c").read_text()
         self.assertNotIn("system(", helper)
         self.assertNotIn("popen(", helper)
@@ -58,14 +66,58 @@ class QuotaHelperContractTests(unittest.TestCase):
 
     def test_task_helper_proves_project_inheritance(self):
         helper = (ROOT / "provisioning" / "quota-admit-task.c").read_text()
-        self.assertIn("attrs.fsx_xflags |= FS_XFLAG_PROJINHERIT", helper)
+        self.assertIn("attrs->fsx_xflags |= FS_XFLAG_PROJINHERIT", helper)
         self.assertIn("attrs.fsx_projid != project_id", helper)
         self.assertIn("!(attrs.fsx_xflags & FS_XFLAG_PROJINHERIT)", helper)
         self.assertIn("inheritance_probe", helper)
+        self.assertNotIn("project_fd < 0 && create", helper)
+        self.assertNotIn("task_fd < 0 && create", helper)
+
+    def test_fixed_vhdx_operator_contract_has_no_growth_or_generic_broker(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        self.assertIn("New-VHD", recipe)
+        self.assertIn("-Fixed", recipe)
+        self.assertIn("64GB", recipe)
+        self.assertIn('VhdType -ne "Fixed"', recipe)
+        self.assertIn("--bare", recipe)
+        self.assertNotIn("Resize-VHD", recipe)
+        self.assertNotIn("Invoke-Expression", recipe)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("cc"),
+                         "native Linux compiler unavailable")
+    def test_fsxattr_transition_uses_original_kernel_state(self):
+        source = (ROOT / "provisioning" / "quota-admit-task.c").as_posix()
+        harness = f'''#define main quota_helper_original_main
+#include "{source}"
+#undef main
+int main(void) {{
+    struct fsxattr fresh = {{ .fsx_projid = 0, .fsx_xflags = 0x100 }};
+    if (!prepare_project_attributes(&fresh, 1000001) ||
+        fresh.fsx_projid != 1000001 ||
+        !(fresh.fsx_xflags & FS_XFLAG_PROJINHERIT) ||
+        !(fresh.fsx_xflags & 0x100)) return 1;
+    if (prepare_project_attributes(&fresh, 1000001)) return 2;
+    struct fsxattr wrong = {{ .fsx_projid = 1000002, .fsx_xflags = 0 }};
+    if (prepare_project_attributes(&wrong, 1000001) || wrong.fsx_projid != 1000002) return 3;
+    return 0;
+}}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            harness_path = pathlib.Path(directory) / "fsxattr-transition.c"
+            output = pathlib.Path(directory) / "fsxattr-transition"
+            harness_path.write_text(harness, encoding="utf-8")
+            compile_result = subprocess.run(
+                ["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                 str(harness_path), "-o", str(output)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            result = subprocess.run([str(output)], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_provisioning_source_digest_is_verified_before_compile(self):
         recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
-        self.assertLess(recipe.index("ACTUAL_SOURCE_SHA256=$(sha256sum"), recipe.index("cc -std=c11"))
+        self.assertLess(recipe.index("ACTUAL_SOURCE_SHA256=$(sha256sum"), recipe.index('"$CC" -std=c11'))
         self.assertIn('[ "$ACTUAL_SOURCE_SHA256" = "$EXPECTED_SOURCE_SHA256" ]', recipe)
         self.assertIn('stat -c \'%a\' "$HELPER"', recipe)
         self.assertIn('HELPER_UID=$(stat -c \'%u\' "$HELPER")', recipe)
@@ -89,7 +141,7 @@ class QuotaHelperContractTests(unittest.TestCase):
         }
         good_parent = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
         good_helper = types.SimpleNamespace(
-            st_mode=stat.S_IFREG | stat.S_ISUID | 0o755, st_uid=0, st_gid=4242,
+            st_mode=stat.S_IFREG | stat.S_ISUID | 0o750, st_uid=0, st_gid=4242,
         )
         good_identity = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)
         fake_grp = types.SimpleNamespace(
@@ -120,8 +172,9 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertEqual(run_case(), 7)
         for bad_helper, bad_parent, bad_document in (
             (types.SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0, st_gid=4242), good_parent, identity),
-            (types.SimpleNamespace(st_mode=stat.S_IFREG | stat.S_ISUID | 0o755, st_uid=1, st_gid=4242), good_parent, identity),
-            (types.SimpleNamespace(st_mode=stat.S_IFREG | stat.S_ISUID | 0o755, st_uid=0, st_gid=99), good_parent, identity),
+            (types.SimpleNamespace(st_mode=stat.S_IFREG | stat.S_ISUID | 0o750, st_uid=1, st_gid=4242), good_parent, identity),
+            (types.SimpleNamespace(st_mode=stat.S_IFREG | stat.S_ISUID | 0o750, st_uid=0, st_gid=99), good_parent, identity),
+            (types.SimpleNamespace(st_mode=stat.S_IFREG | stat.S_ISUID | 0o755, st_uid=0, st_gid=4242), good_parent, identity),
             (good_helper, good_parent, {**identity, "group": "wrong"}),
             (good_helper, types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=0), identity),
         ):

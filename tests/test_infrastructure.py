@@ -280,7 +280,8 @@ class InfrastructureTests(unittest.TestCase):
         summary = json.loads(result.stdout)
         self.assertEqual(
             summary["files"],
-            len(deploy.DEPLOYED_RUNTIME_FILES) + len(deploy.ROLE_POLICY_FILES) + 3,
+            len(deploy.DEPLOYED_RUNTIME_FILES) + len(deploy.DEPLOYED_OPERATOR_FILES) +
+            len(deploy.ROLE_POLICY_FILES) + 3,
         )
 
     def test_deployment_stages_manifest_covered_wsl_supervisor(self):

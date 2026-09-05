@@ -67,7 +67,7 @@ allocatable filesystem ceiling. The one-GiB difference is explicit policy
 headroom for ext4 metadata and is not permission to expand the backing domain.
 The fixed adapter's task admission operation calls only the reviewed,
 root-owned, setuid-root capability-specific quota helper at
-`/usr/libexec/symphony-pilot/quota-admit-task`; its opened object, containing
+`/var/lib/symphony-pilot/quota-admit-task`; its opened object, containing
 parents, and root-owned identity sidecar are checked before execution. Absence,
 replacement, or unsafe identity fails closed. The source and one-time
 installation recipe are `provisioning/quota-admit-task.c` and

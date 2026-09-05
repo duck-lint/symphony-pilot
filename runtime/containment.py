@@ -240,7 +240,7 @@ def _mount_ro(source: str, target: str) -> str:
     return (f"if [ -e {shlex.quote(source)} ]; then "
             f"mkdir -p {shlex.quote(target)}; "
             f"mount --rbind {shlex.quote(source)} {shlex.quote(target)}; "
-            f"mount -o remount,ro,bind {shlex.quote(target)}; fi")
+            f"mount -o remount,ro,nosuid,nodev,bind {shlex.quote(target)}; fi")
 
 
 def _fixture_script() -> str:
@@ -255,6 +255,8 @@ if test -e /operator-codex/auth.json; then fail operator_codex_visible; fi
 if test -e /sibling/GH-99/secret; then fail sibling_visible; fi
 if test -e /other-project/state/secret; then fail other_project_visible; fi
 if test -e /host-state/secret || test -e /host-logs/secret; then fail host_state_visible; fi
+if test -e /var/lib/symphony-pilot/quota-admit-task; then fail quota_helper_visible; fi
+if command -v quota-admit-task >/dev/null 2>&1; then fail quota_helper_executable_visible; fi
 if test -e /etc/passwd; then fail broad_etc_visible; fi
 if printf x > /symphony-inbox/should-not-write 2>/tmp/fixture.err; then fail inbox_writable; fi
 ln -s /outside /workspace/escape
@@ -331,11 +333,11 @@ def task_domain_command(identity: BackendIdentity, root: pathlib.Path, workspace
         f"mount --bind {shlex.quote(str(workspace))} {shlex.quote(str(root / 'workspace'))}",
         f"mount --bind {shlex.quote(str(home))} {shlex.quote(str(root / 'home/task'))}",
         f"mount --bind {shlex.quote(str(inbox))} {shlex.quote(str(root / 'symphony-inbox'))}",
-        f"mount -o remount,ro,bind {shlex.quote(str(root / 'symphony-inbox'))}",
+        f"mount -o remount,ro,nosuid,nodev,bind {shlex.quote(str(root / 'symphony-inbox'))}",
         f"mount --bind {shlex.quote(str(outbox))} {shlex.quote(str(root / 'symphony-outbox'))}",
         f"touch {shlex.quote(str(root / 'fixture/hostile.sh'))}; "
         f"mount --bind {shlex.quote(str(fixture))} {shlex.quote(str(root / 'fixture/hostile.sh'))}; "
-        f"mount -o remount,ro,bind {shlex.quote(str(root / 'fixture/hostile.sh'))}",
+        f"mount -o remount,ro,nosuid,nodev,bind {shlex.quote(str(root / 'fixture/hostile.sh'))}",
         _mount_ro("/bin", str(root / "bin")),
         _mount_ro("/usr", str(root / "usr")),
         _mount_ro("/lib", str(root / "lib")),
@@ -357,7 +359,7 @@ def _acceptance_mount_ro(source: pathlib.Path, target: pathlib.Path) -> str:
     """Bind one reviewed host path read-only without importing nested mounts."""
     return (f"mkdir -p {shlex.quote(str(target))}; "
             f"mount --bind {shlex.quote(str(source))} {shlex.quote(str(target))}; "
-            f"mount -o remount,ro,bind {shlex.quote(str(target))}")
+            f"mount -o remount,ro,nosuid,nodev,bind {shlex.quote(str(target))}")
 
 
 def _acceptance_mount_file_ro(source: pathlib.Path, target: pathlib.Path) -> str:
@@ -365,14 +367,14 @@ def _acceptance_mount_file_ro(source: pathlib.Path, target: pathlib.Path) -> str
     return (f"mkdir -p {shlex.quote(str(target.parent))}; "
             f"touch {shlex.quote(str(target))}; "
             f"mount --bind {shlex.quote(str(source))} {shlex.quote(str(target))}; "
-            f"mount -o remount,ro,bind {shlex.quote(str(target))}")
+            f"mount -o remount,ro,nosuid,nodev,bind {shlex.quote(str(target))}")
 
 
 def _acceptance_mount_rw(source: pathlib.Path, target: pathlib.Path) -> str:
     """Bind one explicitly writable output/cache path into the domain."""
     return (f"mkdir -p {shlex.quote(str(target))}; "
             f"mount --bind {shlex.quote(str(source))} {shlex.quote(str(target))}; "
-            f"mount -o remount,rw,bind {shlex.quote(str(target))}")
+            f"mount -o remount,rw,nosuid,nodev,bind {shlex.quote(str(target))}")
 
 
 def acceptance_domain_command(

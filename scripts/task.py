@@ -22,6 +22,8 @@ from control_db import (ControlPlaneDatabase, ControlPlaneError,
                         default_database_path)  # noqa: E402
 from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
+from workspace_boundary import (WorkspaceBoundaryError,
+                                create_empty_task_workspace)  # noqa: E402
 from storage import (StorageAdmissionProof, StorageContractError,
                      task_quota_binding_from_evidence,
                      verify_storage_evidence)  # noqa: E402
@@ -180,6 +182,12 @@ def queue(args: argparse.Namespace) -> int:
                 task["id"], project_slug=profile.slug, domain=domain,
                 policy=profile.storage_policy,
             )
+            try:
+                create_empty_task_workspace(
+                    pathlib.Path(profile.workspace_root), str(task["identifier"]),
+                )
+            except WorkspaceBoundaryError as exc:
+                raise TaskCommandError(f"task workspace admission failed: {exc}") from exc
             admission = verify_profile_storage(
                 profile, str(task["identifier"]), database=database, task_id=str(task["id"]),
             )

@@ -23,6 +23,7 @@ class WorkspaceBoundaryError(RuntimeError):
 
 MAX_METADATA_BYTES = 128 * 1024
 GIT_EXECUTABLE = shutil.which("git")
+TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
 
 
 def physical_directory(path: pathlib.Path) -> pathlib.Path:
@@ -34,6 +35,43 @@ def physical_directory(path: pathlib.Path) -> pathlib.Path:
                 or getattr(info, "st_file_attributes", 0) & 0x400):
             raise WorkspaceBoundaryError("workspace metadata parent is not a physical directory")
     return path
+
+
+def create_empty_task_workspace(workspace_root: pathlib.Path, identifier: str) -> pathlib.Path:
+    """Create the exact unprivileged task namespace before quota mutation.
+
+    The privileged quota helper never creates namespaces.  This host-side
+    operation makes the project and task directories under the already
+    trusted pool, then requires the task directory to remain empty and owned
+    by the unprivileged caller so Git preparation can use it after QUEUED.
+    """
+    if not TASK_IDENTIFIER.fullmatch(identifier):
+        raise WorkspaceBoundaryError("task identifier is malformed")
+    project_root = pathlib.Path(os.path.abspath(workspace_root))
+    pool_root = physical_directory(project_root.parent)
+    try:
+        project_root.lstat()
+    except FileNotFoundError:
+        os.mkdir(project_root, 0o700)
+    project_root = physical_directory(project_root)
+    try:
+        task_root = project_root / identifier
+        task_root.lstat()
+    except FileNotFoundError:
+        os.mkdir(task_root, 0o700)
+    task_root = physical_directory(task_root)
+    for path in (project_root, task_root):
+        info = path.stat()
+        if (os.name != "nt" and
+                ((hasattr(os, "getuid") and info.st_uid != os.getuid()) or
+                 info.st_mode & 0o077)):
+            raise WorkspaceBoundaryError("task workspace is not owned by the unprivileged host account")
+    if any(task_root.iterdir()):
+        raise WorkspaceBoundaryError("new task workspace must be empty")
+    # Keep the variable in the contract: the task path must be physically
+    # below the pool we validated, not merely textually below a profile path.
+    task_root.relative_to(pool_root)
+    return task_root
 
 
 @contextlib.contextmanager

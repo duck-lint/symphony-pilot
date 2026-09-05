@@ -7,27 +7,37 @@
 # execution remains unprivileged.
 set -eu
 umask 077
+# Root provisioning is a fixed operator action. Do not inherit compiler,
+# shell, Python, Git, or PATH resolution controls from the caller.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset CDPATH ENV BASH_ENV PYTHONPATH PYTHONHOME CC CFLAGS CPPFLAGS LDFLAGS
+CC=/usr/bin/cc
 
 POOL_DEVICE=${1:?usage: provision_storage_domain.sh /dev/<dedicated-device>}
 SCRIPT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 POOL_ROOT=/home/duck-lint/symphony-workspaces
 HELPER_SOURCE=$SCRIPT_ROOT/provisioning/quota-admit-task.c
 SUPERVISOR_SOURCE=$SCRIPT_ROOT/runtime/wsl_contained_exec.py
-HELPER=/usr/libexec/symphony-pilot/quota-admit-task
+VHD_OPERATOR_SOURCE=$SCRIPT_ROOT/scripts/provision_storage_vhdx.ps1
+HELPER=/var/lib/symphony-pilot/quota-admit-task
 HELPER_GROUP=symphony-pilot
-IDENTITY=/etc/symphony-pilot/quota-admit-task.identity.json
+IDENTITY=/var/lib/symphony-pilot/quota-admit-task.identity.json
+STORAGE_IDENTITY=/var/lib/symphony-pilot/storage-domain.identity.json
 FSTAB=/etc/fstab
+POOL_LABEL=SYMPHONY-POOL
 EXPECTED_BYTES=$((64 * 1024 * 1024 * 1024))
 ALLOCATABLE_BYTES=$((63 * 1024 * 1024 * 1024))
 MIN_INODES=500000
 FSTAB_TMP=
 HELPER_TMP=
 IDENTITY_TMP=
+STORAGE_IDENTITY_TMP=
 
 cleanup() {
     [ -z "$FSTAB_TMP" ] || rm -f -- "$FSTAB_TMP"
     [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"
     [ -z "$IDENTITY_TMP" ] || rm -f -- "$IDENTITY_TMP"
+    [ -z "$STORAGE_IDENTITY_TMP" ] || rm -f -- "$STORAGE_IDENTITY_TMP"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -38,6 +48,15 @@ fail() {
 
 [ "$(id -u)" -eq 0 ] || fail "must run once as root"
 [ "$(id -u duck-lint)" -ge 0 ] || fail "fixed duck-lint account is required"
+
+# This script is executable only from an atomic, manifest-covered deployment.
+# The deployed supervisor verifies the script, helper source, VHDX contract,
+# and all other authority files before any device or filesystem operation.
+[ -f "$SUPERVISOR_SOURCE" ] || fail "deployed supervisor is unavailable"
+[ -f "$HELPER_SOURCE" ] || fail "deployed quota helper source is unavailable"
+[ -f "$VHD_OPERATOR_SOURCE" ] || fail "deployed fixed-VHDX contract is unavailable"
+/usr/bin/python3 -B "$SUPERVISOR_SOURCE" --verify-deployment >/dev/null || \
+    fail "the provisioning authority is not the exact deployed Pilot snapshot"
 case "$POOL_DEVICE" in
     /dev/*) ;;
     *) fail "dedicated block device must be under /dev" ;;
@@ -62,17 +81,27 @@ ACTUAL_SOURCE_SHA256=$(sha256sum "$HELPER_SOURCE" | awk '{print $1}')
 [ "$ACTUAL_SOURCE_SHA256" = "$EXPECTED_SOURCE_SHA256" ] || \
     fail "quota helper source differs from the reviewed supervisor digest"
 
-if blkid -o value -s TYPE "$POOL_DEVICE" >/dev/null 2>&1; then
-    fail "refusing to overwrite a device with an existing filesystem"
+DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE" 2>/dev/null || true)
+if [ -z "$DEVICE_TYPE" ]; then
+    mountpoint -q "$POOL_ROOT" && fail "storage pool mount target is already occupied"
+else
+    [ "$DEVICE_TYPE" = "ext4" ] || fail "existing device filesystem is not the Symphony ext4 domain"
+    [ "$(blkid -o value -s LABEL "$POOL_DEVICE")" = "$POOL_LABEL" ] || \
+        fail "existing filesystem is not the identified Symphony pool"
 fi
-mountpoint -q "$POOL_ROOT" && fail "storage pool mount target is already occupied"
 
 # project supplies FS_IOC_FS{GET,SET}XATTR project IDs; quota supplies hidden
 # ext4 quota inodes; quotatype initializes the project quota inode. Zero
 # reserved blocks is intentional for this dedicated task-only filesystem:
 # Pilot's eight-GiB emergency reserve is a separate admission policy.
-mkfs.ext4 -m 0 -i 65536 -I 256 -J size=64 \
+if [ -z "$DEVICE_TYPE" ]; then
+    mkfs.ext4 -L "$POOL_LABEL" -m 0 -i 65536 -I 256 -J size=64 \
     -O project,quota -E quotatype=prjquota "$POOL_DEVICE"
+fi
+DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE")
+DEVICE_LABEL=$(blkid -o value -s LABEL "$POOL_DEVICE")
+[ "$DEVICE_TYPE" = "ext4" ] || fail "Symphony pool filesystem type is not ext4"
+[ "$DEVICE_LABEL" = "$POOL_LABEL" ] || fail "Symphony pool label is not exact"
 FEATURES=$(tune2fs -l "$POOL_DEVICE" | sed -n 's/^Filesystem features:[[:space:]]*//p')
 case " $FEATURES " in *" project "*) ;; *) fail "formatted filesystem lacks ext4 project support" ;; esac
 case " $FEATURES " in *" quota "*) ;; *) fail "formatted filesystem lacks ext4 quota storage" ;; esac
@@ -80,14 +109,6 @@ PROJECT_QUOTA_INODE=$(tune2fs -l "$POOL_DEVICE" | awk -F: '$1 == "Project quota 
 [ "${PROJECT_QUOTA_INODE:-0}" -gt 0 ] || fail "project quota inode was not initialized"
 [ "$(tune2fs -l "$POOL_DEVICE" | awk -F: '$1 == "Reserved block count" {gsub(/[[:space:]]/, "", $2); print $2}')" = "0" ] || \
     fail "reserved ext4 blocks are not zero"
-
-mkdir -p "$POOL_ROOT"
-mount -t ext4 -o prjquota "$POOL_DEVICE" "$POOL_ROOT"
-# The deployed verifier requires the shared pool root to be owned by the
-# unprivileged execution account and non-writable by group/other. Establish
-# that trust boundary on the mounted filesystem, not its pre-mount directory.
-chown duck-lint:duck-lint "$POOL_ROOT"
-chmod 0750 "$POOL_ROOT"
 
 verify_mount() {
     [ "$(findmnt -no TARGET --target "$POOL_ROOT")" = "$POOL_ROOT" ] || fail "pool mount target is wrong"
@@ -105,6 +126,44 @@ EOF
     [ $((BLOCK_SIZE * AVAILABLE_BLOCKS)) -ge "$ALLOCATABLE_BYTES" ] || \
         fail "unprivileged f_bavail capacity is below 63 GiB"
     [ "$AVAILABLE_INODES" -ge "$MIN_INODES" ] || fail "unprivileged f_favail inode headroom is insufficient"
+}
+
+mkdir -p "$POOL_ROOT"
+# A retry may find the exact reviewed pool already mounted. Reuse it and let
+# the identity/option checks below decide whether it is the right mount;
+# never mount a second filesystem over an occupied target.
+if ! mountpoint -q "$POOL_ROOT"; then
+    mount -t ext4 -o prjquota "$POOL_DEVICE" "$POOL_ROOT"
+fi
+# The deployed verifier requires the shared pool root to be owned by the
+# unprivileged execution account and non-writable by group/other. Establish
+# that trust boundary on the mounted filesystem, not its pre-mount directory.
+chown duck-lint:duck-lint "$POOL_ROOT"
+chmod 0750 "$POOL_ROOT"
+
+write_storage_identity() {
+    STORAGE_IDENTITY_TMP=$(mktemp /var/.symphony-pilot-storage-identity.XXXXXX)
+    printf '{"schema":"symphony-pilot-storage-domain/v1","pool_label":"%s","filesystem_uuid":"%s","backing_bytes":%s,"allocatable_bytes":%s,"filesystem":"ext4","mount_target":"%s","quota_features":["project","quota"],"mount_options":["prjquota"],"reserved_blocks":0}\n' \
+        "$POOL_LABEL" "$POOL_UUID" "$EXPECTED_BYTES" "$ALLOCATABLE_BYTES" "$POOL_ROOT" \
+        > "$STORAGE_IDENTITY_TMP"
+    install -o root -g "$HELPER_GROUP" -m 0640 "$STORAGE_IDENTITY_TMP" "$STORAGE_IDENTITY"
+    rm -f -- "$STORAGE_IDENTITY_TMP"
+    STORAGE_IDENTITY_TMP=
+}
+
+verify_storage_identity() {
+    [ -f "$STORAGE_IDENTITY" ] && [ ! -L "$STORAGE_IDENTITY" ] || \
+        fail "storage-domain identity record is unavailable"
+    [ "$(stat -c '%u %g %a' "$STORAGE_IDENTITY")" = "0 $EXPECTED_GID 640" ] || \
+        fail "storage-domain identity record has unsafe privilege state"
+    grep -Fq '"schema":"symphony-pilot-storage-domain/v1"' "$STORAGE_IDENTITY" || fail "storage-domain identity schema is wrong"
+    grep -Fq '"pool_label":"SYMPHONY-POOL"' "$STORAGE_IDENTITY" || fail "storage-domain identity label is wrong"
+    grep -Fq '"filesystem":"ext4"' "$STORAGE_IDENTITY" || fail "storage-domain identity filesystem is wrong"
+    grep -Fq '"mount_target":"/home/duck-lint/symphony-workspaces"' "$STORAGE_IDENTITY" || fail "storage-domain identity target is wrong"
+    grep -Fq '"quota_features":["project","quota"]' "$STORAGE_IDENTITY" || fail "storage-domain quota features are wrong"
+    grep -Fq '"mount_options":["prjquota"]' "$STORAGE_IDENTITY" || fail "storage-domain mount options are wrong"
+    grep -Fq '"reserved_blocks":0' "$STORAGE_IDENTITY" || fail "storage-domain reserved blocks are wrong"
+    grep -Fq '"filesystem_uuid":"'"$POOL_UUID"'"' "$STORAGE_IDENTITY" || fail "storage-domain UUID differs from the device"
 }
 
 POOL_UUID=$(blkid -s UUID -o value "$POOL_DEVICE")
@@ -131,9 +190,20 @@ if ! awk -v root="$POOL_ROOT" -v desired="$FSTAB_ENTRY" '
 ' "$FSTAB" > "$FSTAB_TMP"; then
     fail "/etc/fstab already contains a conflicting Symphony mount entry"
 fi
-install -o root -g root -m 0644 "$FSTAB_TMP" "$FSTAB"
+if ! cmp -s "$FSTAB_TMP" "$FSTAB"; then
+    install -o root -g root -m 0644 "$FSTAB_TMP" "$FSTAB"
+fi
 rm -f -- "$FSTAB_TMP"
 FSTAB_TMP=
+
+getent group "$HELPER_GROUP" >/dev/null 2>&1 || groupadd --system "$HELPER_GROUP"
+EXPECTED_GID=$(getent group "$HELPER_GROUP" | awk -F: '{print $3}')
+install -d -o root -g "$HELPER_GROUP" -m 0750 /var/lib/symphony-pilot
+if [ -e "$STORAGE_IDENTITY" ]; then
+    verify_storage_identity
+else
+    write_storage_identity
+fi
 
 # Re-read the exact persistent entry through the normal mount path, then prove
 # the quota state survives the remount before any task admission is possible.
@@ -141,14 +211,23 @@ umount "$POOL_ROOT"
 mount "$POOL_ROOT"
 verify_mount
 verify_capacity
+verify_storage_identity
 
-getent group "$HELPER_GROUP" >/dev/null 2>&1 || groupadd --system "$HELPER_GROUP"
 usermod --append --groups "$HELPER_GROUP" duck-lint
-install -d -o root -g root -m 0755 /etc/symphony-pilot
-install -d -o root -g root -m 0755 /usr/libexec/symphony-pilot
-HELPER_TMP=/etc/symphony-pilot/quota-admit-task.tmp
-cc -std=c11 -O2 -Wall -Wextra -Werror "$HELPER_SOURCE" -o "$HELPER_TMP"
-install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"
+HELPER_TMP=/var/lib/symphony-pilot/quota-admit-task.tmp
+"$CC" -std=c11 -O2 -Wall -Wextra -Werror "$HELPER_SOURCE" -o "$HELPER_TMP"
+COMPILED_HELPER_SHA256=$(sha256sum "$HELPER_TMP" | awk '{print $1}')
+if [ -e "$HELPER" ]; then
+    [ ! -L "$HELPER" ] || fail "existing quota helper is a symlink"
+    [ "$(stat -c '%u %g %a' "$HELPER")" = "0 $EXPECTED_GID 4750" ] || \
+        fail "existing quota helper privilege state conflicts"
+    [ "$(sha256sum "$HELPER" | awk '{print $1}')" = "$COMPILED_HELPER_SHA256" ] || \
+        fail "existing quota helper bytes differ from the reviewed build"
+    rm -f -- "$HELPER_TMP"
+    HELPER_TMP=
+else
+    install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"
+fi
 
 HELPER_UID=$(stat -c '%u' "$HELPER")
 HELPER_GID=$(stat -c '%g' "$HELPER")
@@ -158,12 +237,23 @@ EXPECTED_GID=$(getent group "$HELPER_GROUP" | awk -F: '{print $3}')
 [ "$(stat -c '%a' "$HELPER")" = "4750" ] || fail "quota helper is not exactly setuid-root mode 4750"
 
 HELPER_SHA256=$(sha256sum "$HELPER" | awk '{print $1}')
-IDENTITY_TMP=/etc/symphony-pilot/quota-admit-task.identity.json.tmp
-printf '{"schema":"symphony-pilot-quota-helper/v1","source_sha256":"%s","helper_sha256":"%s","group":"%s","privilege":"setuid-root"}\n' \
-    "$ACTUAL_SOURCE_SHA256" "$HELPER_SHA256" "$HELPER_GROUP" > "$IDENTITY_TMP"
-install -o root -g root -m 0644 "$IDENTITY_TMP" "$IDENTITY"
-rm -f -- "$IDENTITY_TMP" "$HELPER_TMP"
-IDENTITY_TMP=
+if [ -e "$IDENTITY" ]; then
+    [ ! -L "$IDENTITY" ] || fail "existing quota helper identity is a symlink"
+    [ "$(stat -c '%u %g %a' "$IDENTITY")" = "0 $EXPECTED_GID 640" ] || \
+        fail "existing quota helper identity privilege state conflicts"
+    grep -Fq '"schema":"symphony-pilot-quota-helper/v1"' "$IDENTITY" || fail "existing quota helper identity schema conflicts"
+    grep -Fq '"source_sha256":"'"$ACTUAL_SOURCE_SHA256"'"' "$IDENTITY" || fail "existing quota helper source identity conflicts"
+    grep -Fq '"helper_sha256":"'"$HELPER_SHA256"'"' "$IDENTITY" || fail "existing quota helper binary identity conflicts"
+    grep -Fq '"group":"'"$HELPER_GROUP"'"' "$IDENTITY" || fail "existing quota helper group identity conflicts"
+    grep -Fq '"privilege":"setuid-root"' "$IDENTITY" || fail "existing quota helper privilege identity conflicts"
+else
+    IDENTITY_TMP=/var/lib/symphony-pilot/quota-admit-task.identity.json.tmp
+    printf '{"schema":"symphony-pilot-quota-helper/v1","source_sha256":"%s","helper_sha256":"%s","group":"%s","privilege":"setuid-root"}\n' \
+        "$ACTUAL_SOURCE_SHA256" "$HELPER_SHA256" "$HELPER_GROUP" > "$IDENTITY_TMP"
+    install -o root -g "$HELPER_GROUP" -m 0640 "$IDENTITY_TMP" "$IDENTITY"
+    rm -f -- "$IDENTITY_TMP"
+    IDENTITY_TMP=
+fi
 HELPER_TMP=
 
 # This fixed helper operation performs generic PRJQUOTA Q_GETQUOTA and

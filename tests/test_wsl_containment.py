@@ -18,6 +18,11 @@ import wsl_contained_exec
 
 
 class SupervisorValidationTests(unittest.TestCase):
+    def test_hostile_task_cannot_resolve_privileged_quota_helper(self):
+        fixture = containment._fixture_script()
+        self.assertIn("/var/lib/symphony-pilot/quota-admit-task", fixture)
+        self.assertIn("quota_helper_executable_visible", fixture)
+
     def test_quota_inspection_rejects_untrusted_project(self):
         with self.assertRaisesRegex(wsl_contained_exec.ContainmentError, "not admitted"):
             wsl_contained_exec._workspace_storage_root("../../etc")
@@ -57,16 +62,27 @@ class SupervisorValidationTests(unittest.TestCase):
             f_favail = 145
 
         findmnt = mock.Mock(returncode=0, stdout=json.dumps({
-            "filesystems": [{
+                "filesystems": [{
                     "target": "/home/duck-lint/symphony-workspaces",
-                "source": "/dev/vdb",
-                "fstype": "ext4",
+                    "source": "/dev/vdb",
+                    "uuid": "11111111-2222-3333-4444-555555555555",
+                    "fstype": "ext4",
                 "options": "rw,relatime,prjquota",
             }],
         }))
+        identity = {
+            "schema": "symphony-pilot-storage-domain/v1",
+            "pool_label": "SYMPHONY-POOL",
+            "filesystem_uuid": "11111111-2222-3333-4444-555555555555",
+            "backing_bytes": 64 * 1024 ** 3, "allocatable_bytes": 63 * 1024 ** 3,
+            "filesystem": "ext4", "mount_target": "/home/duck-lint/symphony-workspaces",
+            "quota_features": ["project", "quota"], "mount_options": ["prjquota"],
+            "reserved_blocks": 0,
+        }
         with mock.patch.object(wsl_contained_exec, "_workspace_storage_root", return_value=(pathlib.PurePosixPath("/workspace"), False)), \
              mock.patch.object(wsl_contained_exec.subprocess, "run", return_value=findmnt) as run, \
-             mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True):
+             mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True), \
+             mock.patch.object(wsl_contained_exec, "_read_storage_domain_identity", return_value=identity):
             evidence = wsl_contained_exec._quota_inspection("symphony-pilot")
         self.assertTrue(evidence["filesystem"]["project_quota_mount"])
         self.assertEqual(evidence["filesystem"]["statvfs"]["inodes"], 200)
@@ -74,7 +90,7 @@ class SupervisorValidationTests(unittest.TestCase):
         self.assertEqual(evidence["filesystem"]["statvfs"]["available_inodes"], 145)
         run.assert_called_once_with(
             ["/bin/findmnt", "--json", "--target", "/workspace",
-             "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
+             "--output", "TARGET,SOURCE,UUID,FSTYPE,OPTIONS"],
             capture_output=True, text=True, timeout=5, check=False,
         )
 
@@ -94,15 +110,28 @@ class SupervisorValidationTests(unittest.TestCase):
             root.mkdir()
             findmnt = mock.Mock(returncode=0, stdout=json.dumps({
                 "filesystems": [{
-                    "target": str(root / wsl_contained_exec.QUOTA_PROBE_NAME),
+                    # findmnt reports the backing mount target, not the inert
+                    # child pathname used to obtain a statvfs handle.
+                    "target": "/home/duck-lint/symphony-workspaces",
                     "source": "/dev/vdb",
+                    "uuid": "11111111-2222-3333-4444-555555555555",
                     "fstype": "ext4",
                     "options": "rw,relatime,prjquota",
                 }],
             }))
+            identity = {
+                "schema": "symphony-pilot-storage-domain/v1",
+                "pool_label": "SYMPHONY-POOL",
+                "filesystem_uuid": "11111111-2222-3333-4444-555555555555",
+                "backing_bytes": 64 * 1024 ** 3, "allocatable_bytes": 63 * 1024 ** 3,
+                "filesystem": "ext4", "mount_target": "/home/duck-lint/symphony-workspaces",
+                "quota_features": ["project", "quota"], "mount_options": ["prjquota"],
+                "reserved_blocks": 0,
+            }
             with mock.patch.object(wsl_contained_exec, "_workspace_storage_root", return_value=(root, True)), \
                  mock.patch.object(wsl_contained_exec.subprocess, "run", return_value=findmnt), \
-                 mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True):
+                 mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True), \
+                 mock.patch.object(wsl_contained_exec, "_read_storage_domain_identity", return_value=identity):
                 evidence = wsl_contained_exec._quota_inspection("symphony-pilot")
             self.assertTrue(evidence["probe_created"])
             self.assertFalse((root / wsl_contained_exec.QUOTA_PROBE_NAME).exists())
@@ -213,10 +242,15 @@ class DeploymentIdentityTests(unittest.TestCase):
             root.mkdir()
             runtime = root / "runtime"
             runtime.mkdir()
+            (root / "provisioning").mkdir()
+            (root / "scripts").mkdir()
             files = {}
             for relative, content in (
                 ("runtime/wsl_contained_exec.py", b"supervisor"),
                 ("runtime/containment.py", b"containment"),
+                ("provisioning/quota-admit-task.c", b"quota-helper"),
+                ("scripts/provision_storage_domain.sh", b"storage-provisioner"),
+                ("scripts/provision_storage_vhdx.ps1", b"vhdx-provisioner"),
             ):
                 path = root / pathlib.PurePosixPath(relative)
                 path.write_bytes(content)
@@ -249,10 +283,15 @@ class DeploymentIdentityTests(unittest.TestCase):
             root.mkdir()
             runtime = root / "runtime"
             runtime.mkdir()
+            (root / "provisioning").mkdir()
+            (root / "scripts").mkdir()
             files = {}
             for relative, content in (
                 ("runtime/wsl_contained_exec.py", b"supervisor"),
                 ("runtime/containment.py", b"containment"),
+                ("provisioning/quota-admit-task.c", b"quota-helper"),
+                ("scripts/provision_storage_domain.sh", b"storage-provisioner"),
+                ("scripts/provision_storage_vhdx.ps1", b"vhdx-provisioner"),
             ):
                 path = root / pathlib.PurePosixPath(relative)
                 path.write_bytes(content)

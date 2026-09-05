@@ -141,7 +141,7 @@ class WslAdapterTests(unittest.TestCase):
         )
         setup = command[-1]
         self.assertIn("mount --make-rprivate /", setup)
-        self.assertIn("mount -o remount,ro,bind", setup)
+        self.assertIn("mount -o remount,ro,nosuid,nodev,bind", setup)
         self.assertIn("exec /usr/sbin/chroot", setup)
         self.assertIn("/project", setup)
         self.assertIn("mise", setup)
@@ -150,6 +150,8 @@ class WslAdapterTests(unittest.TestCase):
         self.assertIn("--net", command)
         self.assertNotIn("/home/duck-lint/.config/symphony-pilot/secrets", setup)
         self.assertNotIn("/home/duck-lint/.codex", setup)
+        self.assertIn("nosuid,nodev", setup)
+        self.assertNotIn("/var/lib/symphony-pilot/quota-admit-task", setup)
 
     def test_execution_uses_sterile_environment_and_returns_structured_result(self):
         process = FakeProcess(stdout=b"ok\n", stderr=b"", returncode=7)

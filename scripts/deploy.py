@@ -14,7 +14,8 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 from prepare_workspace import Profile, PreparationError, deployment_path, load_profile
-from deployment_contract import (DEPLOYED_RUNTIME_FILES, POLICY_FILES, ROLE_POLICY_FILES,
+from deployment_contract import (DEPLOYED_OPERATOR_FILES, DEPLOYED_RUNTIME_FILES,
+                                 POLICY_FILES, ROLE_POLICY_FILES,
                                  contract_digest, deployment_identity)
 from project_registry import resolve_project
 from render_workflow import render
@@ -54,13 +55,16 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
                           "source_commit": source_commit,
                           "source_clean": not bool(source_status),
                           "role_policies": sorted(role_names),
-                          "files": (len(DEPLOYED_RUNTIME_FILES) + len(ROLE_POLICY_FILES) + 3)},
+                          "files": (len(DEPLOYED_RUNTIME_FILES) + len(DEPLOYED_OPERATOR_FILES) +
+                                    len(ROLE_POLICY_FILES) + 3)},
                          sort_keys=True))
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=f".{profile.slug}.stage-", dir=target.parent))
     try:
         (stage / "runtime").mkdir()
+        (stage / "provisioning").mkdir()
+        (stage / "scripts").mkdir()
         (stage / "workflow").mkdir()
         (stage / "workflow" / "agents").mkdir()
         (stage / "projects" / profile.slug).mkdir(parents=True)
@@ -68,6 +72,8 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         # same atomic, manifest-covered snapshot as the other control hooks;
         # the Windows adapter never executes its mutable source copy.
         for relative in DEPLOYED_RUNTIME_FILES:
+            shutil.copy2(ROOT / relative, stage / relative)
+        for relative in DEPLOYED_OPERATOR_FILES:
             shutil.copy2(ROOT / relative, stage / relative)
         shutil.copy2(ROOT / POLICY_FILES[0], stage / POLICY_FILES[0])
         for relative in ROLE_POLICY_FILES:

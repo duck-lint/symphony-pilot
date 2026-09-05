@@ -18,6 +18,7 @@ GIB = 1024 ** 3
 STORAGE_INSPECTION_SCHEMA = "symphony-pilot-quota-inspection/v1"
 STORAGE_SCOPE = "persistent_symphony_workspace_pool"
 STORAGE_POOL_ROOT = "/home/duck-lint/symphony-workspaces"
+STORAGE_IDENTITY_SCHEMA = "symphony-pilot-storage-domain/v1"
 TASK_QUOTA_ADMISSION_SCHEMA = "symphony-pilot-task-quota-admission/v1"
 TASK_QUOTA_RELEASE_SCHEMA = "symphony-pilot-task-quota-release/v1"
 STORAGE_BYTES_MIN = 1
@@ -193,6 +194,26 @@ def verify_storage_evidence(
     if inodes < policy.task_inodes + policy.emergency_reserve_inodes:
         raise StorageContractError("dedicated storage pool lacks inode headroom")
 
+    identity = evidence.get("storage_identity")
+    if not isinstance(identity, Mapping):
+        raise StorageContractError("trusted storage-domain identity is missing")
+    if (set(identity) != {
+            "schema", "pool_label", "filesystem_uuid", "backing_bytes",
+            "allocatable_bytes", "filesystem", "mount_target", "quota_features",
+            "mount_options", "reserved_blocks",
+        } or identity.get("schema") != STORAGE_IDENTITY_SCHEMA or
+            not isinstance(identity.get("pool_label"), str) or
+            not isinstance(identity.get("filesystem_uuid"), str) or
+            identity.get("filesystem") != "ext4" or
+            identity.get("mount_target") != expected_target or
+            identity.get("quota_features") != ["project", "quota"] or
+            identity.get("mount_options") != ["prjquota"] or
+            identity.get("reserved_blocks") != 0 or
+            identity.get("backing_bytes") != policy.pool_bytes or
+            identity.get("allocatable_bytes") != policy.allocatable_pool_bytes or
+            filesystem.get("uuid") != identity.get("filesystem_uuid")):
+        raise StorageContractError("storage evidence does not match the trusted domain identity")
+
     quota = evidence.get("quota")
     if not isinstance(quota, Mapping):
         raise StorageContractError("storage evidence has no quota enforcement proof")
@@ -209,6 +230,7 @@ def verify_storage_evidence(
         "project": project,
         "scope": STORAGE_SCOPE,
         "filesystem": dict(filesystem),
+        "storage_identity": dict(identity),
         "quota": dict(quota),
         "ownership": dict(ownership),
     }

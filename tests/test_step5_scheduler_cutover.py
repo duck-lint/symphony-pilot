@@ -196,6 +196,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                 "project": "alpha", "scope": "persistent_symphony_workspace_pool",
                 "filesystem": {
                     "target": "/home/duck-lint/symphony-workspaces", "source": "/dev/vdb",
+                    "uuid": "11111111-2222-3333-4444-555555555555",
                     "fstype": "ext4", "options": "rw,relatime,prjquota",
                     "statvfs": {"block_size": 4096, "blocks": 16_777_216,
                                  "free_blocks": 16_000_000, "available_blocks": 15_900_000,
@@ -204,6 +205,18 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                 },
                 "quota": {"backend": "ext4-project-quota", "mount_support": True},
                 "ownership": {"trusted": True},
+                "storage_identity": {
+                    "schema": "symphony-pilot-storage-domain/v1",
+                    "pool_label": "SYMPHONY-POOL",
+                    "filesystem_uuid": "11111111-2222-3333-4444-555555555555",
+                    "backing_bytes": 64 * 1024 ** 3,
+                    "allocatable_bytes": 63 * 1024 ** 3,
+                    "filesystem": "ext4",
+                    "mount_target": "/home/duck-lint/symphony-workspaces",
+                    "quota_features": ["project", "quota"],
+                    "mount_options": ["prjquota"],
+                    "reserved_blocks": 0,
+                },
             },
             "task_quota": task_proof,
         }
@@ -287,6 +300,10 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                 relative for relative in manifest["files"] if relative.startswith("runtime/")
             }
             self.assertEqual(runtime_files, set(deployment_contract.DEPLOYED_RUNTIME_FILES))
+            self.assertEqual(
+                {relative for relative in manifest["files"] if relative.startswith(("provisioning/", "scripts/"))},
+                set(deployment_contract.DEPLOYED_OPERATOR_FILES),
+            )
             with mock.patch.object(project, "install_root", return_value=target):
                 project.verify_deployment(profile)
             self.assertFalse((target / "runtime/broker.py").exists())

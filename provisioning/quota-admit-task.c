@@ -66,42 +66,41 @@ static int exact_path(char *out, size_t size, const char *project,
     return written > 0 && (size_t)written < size;
 }
 
+static int prepare_project_attributes(struct fsxattr *attrs, uint32_t project_id) {
+    int needs_set = 0;
+    if (attrs->fsx_projid != 0 && attrs->fsx_projid != project_id) return 0;
+    if (attrs->fsx_projid != project_id) {
+        attrs->fsx_projid = project_id;
+        needs_set = 1;
+    }
+    if (!(attrs->fsx_xflags & FS_XFLAG_PROJINHERIT)) {
+        /* Preserve unrelated flags while enabling subtree project charging. */
+        attrs->fsx_xflags |= FS_XFLAG_PROJINHERIT;
+        needs_set = 1;
+    }
+    return needs_set;
+}
+
 static int open_task(int pool_fd, const char *project, const char *identifier,
-                     uint32_t project_id, int create, char *path, size_t path_size) {
+                     uint32_t project_id, char *path, size_t path_size) {
     int project_fd = -1, task_fd = -1;
     struct stat st;
     struct fsxattr attrs;
     if (!exact_path(path, path_size, project, identifier)) return -1;
     if (fstat(pool_fd, &st) || !S_ISDIR(st.st_mode)) goto fail;
     project_fd = openat(pool_fd, project, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (project_fd < 0 && create && errno == ENOENT) {
-        if (mkdirat(pool_fd, project, 0700) && errno != EEXIST) goto fail;
-        project_fd = openat(pool_fd, project, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    }
-    if (project_fd < 0) goto fail;
-    if (fstat(project_fd, &st) || !S_ISDIR(st.st_mode)) goto fail;
+    if (project_fd < 0 || fstat(project_fd, &st) || !S_ISDIR(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 0077)) goto fail;
     task_fd = openat(project_fd, identifier,
                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (task_fd < 0 && create && errno == ENOENT) {
-        if (mkdirat(project_fd, identifier, 0700) && errno != EEXIST) goto fail;
-        task_fd = openat(project_fd, identifier,
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    }
-    if (task_fd < 0 || fstat(task_fd, &st) || !S_ISDIR(st.st_mode)) goto fail;
+    if (task_fd < 0 || fstat(task_fd, &st) || !S_ISDIR(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 0077)) goto fail;
     if (ioctl(task_fd, FS_IOC_FSGETXATTR, &attrs)) goto fail;
-    if (attrs.fsx_projid != 0 && attrs.fsx_projid != project_id) {
-        errno = EEXIST; goto fail;
-    }
-    if (attrs.fsx_projid == 0) {
-        attrs.fsx_projid = project_id;
-    }
-    if (!(attrs.fsx_xflags & FS_XFLAG_PROJINHERIT)) {
-        /* Preserve unrelated flags while enabling subtree project charging. */
-        attrs.fsx_xflags |= FS_XFLAG_PROJINHERIT;
-    }
-    if (attrs.fsx_projid != project_id ||
-        !(attrs.fsx_xflags & FS_XFLAG_PROJINHERIT)) {
+    if (prepare_project_attributes(&attrs, project_id)) {
         if (ioctl(task_fd, FS_IOC_FSSETXATTR, &attrs)) goto fail;
+    } else if (attrs.fsx_projid != project_id ||
+               !(attrs.fsx_xflags & FS_XFLAG_PROJINHERIT)) {
+        goto fail;
     }
     if (ioctl(task_fd, FS_IOC_FSGETXATTR, &attrs) ||
         attrs.fsx_projid != project_id ||
@@ -217,7 +216,7 @@ static int admit(const char *project, const char *identifier,
         return 2;
     pool_fd = open(POOL_ROOT, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (pool_fd < 0) return 3;
-    task_fd = open_task(pool_fd, project, identifier, id, 1, path, sizeof(path));
+    task_fd = open_task(pool_fd, project, identifier, id, path, sizeof(path));
     if (task_fd < 0 || quota_set(pool_fd, id, byte_limit, inode_limit) ||
         quota_get(pool_fd, id, &quota)) { close(pool_fd); return 3; }
     if (quota.dqb_bhardlimit != (byte_limit / QUOTA_BLOCK) ||

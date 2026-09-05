@@ -73,6 +73,15 @@ DEPLOYED_RUNTIME_FILES = (
     "runtime/runtime_lock.py",
 )
 
+# These operator-boundary artifacts are deployed in the same immutable,
+# manifest-covered snapshot. The root operator action must not compile a
+# mutable checkout copy.
+DEPLOYED_OPERATOR_FILES = (
+    "provisioning/quota-admit-task.c",
+    "scripts/provision_storage_domain.sh",
+    "scripts/provision_storage_vhdx.ps1",
+)
+
 
 def contract_digest(source_root: pathlib.Path) -> str:
     """Hash the bounded lifecycle/generation contract with path framing."""

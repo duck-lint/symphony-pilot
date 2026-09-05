@@ -32,6 +32,7 @@ class StorageContractTests(unittest.TestCase):
             "scope": "persistent_symphony_workspace_pool",
             "filesystem": {
                 "target": target, "source": "/dev/vdb", "fstype": "ext4",
+                "uuid": "11111111-2222-3333-4444-555555555555",
                 "options": "rw,relatime,prjquota",
                 "statvfs": {
                     "block_size": 4096, "blocks": 16_777_216,
@@ -44,6 +45,18 @@ class StorageContractTests(unittest.TestCase):
                 "backend": "ext4-project-quota", "mount_support": True,
             },
             "ownership": {"trusted": True},
+            "storage_identity": {
+                "schema": "symphony-pilot-storage-domain/v1",
+                "pool_label": "SYMPHONY-POOL",
+                "filesystem_uuid": "11111111-2222-3333-4444-555555555555",
+                "backing_bytes": 64 * GIB,
+                "allocatable_bytes": 63 * GIB,
+                "filesystem": "ext4",
+                "mount_target": "/home/duck-lint/symphony-workspaces",
+                "quota_features": ["project", "quota"],
+                "mount_options": ["prjquota"],
+                "reserved_blocks": 0,
+            },
         }
 
     def domain(self) -> VerifiedStorageDomain:

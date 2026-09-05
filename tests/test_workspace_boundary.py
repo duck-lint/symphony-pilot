@@ -23,6 +23,22 @@ import workspace_boundary as boundary
 
 
 class WorkspaceBoundaryTests(unittest.TestCase):
+    def test_task_workspace_is_created_unprivileged_and_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = pathlib.Path(directory) / "symphony-workspaces"
+            pool.mkdir()
+            project_root = pool / "demo"
+            workspace = boundary.create_empty_task_workspace(project_root, "T-000001")
+            self.assertEqual(workspace, project_root / "T-000001")
+            self.assertTrue(workspace.is_dir())
+            self.assertEqual(list(workspace.iterdir()), [])
+            if os.name != "nt":
+                self.assertEqual(workspace.stat().st_mode & 0o077, 0)
+            self.assertEqual(boundary.create_empty_task_workspace(project_root, "T-000001"), workspace)
+            (workspace / "unexpected").write_text("evidence", encoding="utf-8")
+            with self.assertRaises(boundary.WorkspaceBoundaryError):
+                boundary.create_empty_task_workspace(project_root, "T-000001")
+
     def case(self):
         case = fixtures.Step6LifecycleTests("runTest")
         case.setUp()
@@ -246,7 +262,9 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             source = root / "source"
-            for relative in (*deployment_contract.CONTRACT_FILES, "projects/symphony-canary/profile.toml"):
+            for relative in (*deployment_contract.CONTRACT_FILES,
+                             *deployment_contract.DEPLOYED_OPERATOR_FILES,
+                             "projects/symphony-canary/profile.toml"):
                 target = source / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative, target)

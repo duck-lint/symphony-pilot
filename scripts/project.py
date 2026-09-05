@@ -31,7 +31,8 @@ from prepare_workspace import (
     require_physical_namespace,
     state_namespace_for_slug,
 )
-from deployment_contract import DEPLOYED_RUNTIME_FILES, contract_digest, deployment_identity
+from deployment_contract import (DEPLOYED_OPERATOR_FILES, DEPLOYED_RUNTIME_FILES,
+                                 contract_digest, deployment_identity)
 from containment import ContainmentError, backend_identity, require_execution_capability
 from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
 from rulesets import RulesetError, fetch_all_rulesets, fetch_ruleset_details, require_default_branch_ruleset
@@ -627,6 +628,7 @@ def verify_manifest(root, manifest_path, manifest):
 REQUIRED_DEPLOYMENT_FILES = (
     "profile.toml",
     *DEPLOYED_RUNTIME_FILES,
+    *DEPLOYED_OPERATOR_FILES,
     "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",
     "workflow/agents/project-manager.toml",
