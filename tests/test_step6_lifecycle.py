@@ -312,6 +312,69 @@ class Step6LifecycleTests(unittest.TestCase):
             ]
             self.assertEqual(len(implementer_runs), 1)
 
+    def test_architect_only_correction_block_cannot_adopt_changed_head(self):
+        old_head, finding, licensed_round = self._license_validation_correction()
+        attempt = self._attempt()
+        architect_run_id = str(attempt["run"]["id"])
+        (self.workspace / "unauthorized-correction").write_text("unexpected\n", encoding="utf-8")
+        self._git("add", "unauthorized-correction")
+        self._git("commit", "-qm", "unauthorized architect-only change")
+        unexpected_head = self._git("rev-parse", "HEAD")
+        self._write_result(attempt, self._result(
+            attempt, "blocked", findings=[self._finding(
+                "ARCHITECT", "infrastructure condition", blocker_kind="infrastructure"
+            )],
+        ))
+        import after_run
+        with mock.patch.object(after_run, "load_profile", return_value=self.profile):
+            self.assertEqual(
+                after_run.main(["--profile", str(self.profile_path), "--workspace", str(self.workspace)]),
+                78,
+            )
+        with control_db.open_database(self.database_path) as database:
+            projection = database.read_projection(self.TASK_ID)
+            self.assertEqual(database.read_task(self.TASK_ID)["current_head"], old_head)
+            self.assertEqual(database.read_task(self.TASK_ID)["state"], "ADVERSARIAL_REVIEW")
+            self.assertEqual(database.read_role_run(architect_run_id)["status"], "failed")
+            self.assertEqual(database.read_finding(finding["id"])["licensed_correction_round"], licensed_round)
+            self.assertEqual(projection["blockers"][-1]["kind"], "infrastructure")
+            implementer_runs = [row for row in projection["role_runs"] if row["role"] == "IMPLEMENTER"]
+            self.assertEqual(len(implementer_runs), 1)
+        self.assertEqual(self._git("rev-parse", "HEAD"), unexpected_head)
+
+    def test_architect_only_planned_block_cannot_adopt_changed_head(self):
+        attempt = self._attempt()
+        self._write_result(attempt, self._result(
+            attempt, "planning_complete",
+            roles=[self._role("PROJECT-MANAGER", "APPROVE"), self._role("PLANNER", "COMPLETE")],
+        ))
+        reconcile(self.profile, self.workspace)
+        attempt = self._attempt()
+        architect_run_id = str(attempt["run"]["id"])
+        (self.workspace / "unauthorized-planned").write_text("unexpected\n", encoding="utf-8")
+        self._git("add", "unauthorized-planned")
+        self._git("commit", "-qm", "unauthorized planned change")
+        unexpected_head = self._git("rev-parse", "HEAD")
+        self._write_result(attempt, self._result(
+            attempt, "blocked", findings=[self._finding(
+                "ARCHITECT", "infrastructure condition", blocker_kind="infrastructure"
+            )],
+        ))
+        import after_run
+        with mock.patch.object(after_run, "load_profile", return_value=self.profile):
+            self.assertEqual(
+                after_run.main(["--profile", str(self.profile_path), "--workspace", str(self.workspace)]),
+                78,
+            )
+        with control_db.open_database(self.database_path) as database:
+            projection = database.read_projection(self.TASK_ID)
+            self.assertIsNone(database.read_task(self.TASK_ID)["current_head"])
+            self.assertEqual(database.read_task(self.TASK_ID)["state"], "PLANNED")
+            self.assertEqual(database.read_role_run(architect_run_id)["status"], "failed")
+            self.assertEqual(projection["blockers"][-1]["kind"], "infrastructure")
+            self.assertFalse(any(row["role"] == "IMPLEMENTER" for row in projection["role_runs"]))
+        self.assertEqual(self._git("rev-parse", "HEAD"), unexpected_head)
+
     def test_complete_lifecycle_stops_at_archivist_and_ready_is_guarded(self):
         attempt = self._attempt()
         self._write_result(attempt, self._result(

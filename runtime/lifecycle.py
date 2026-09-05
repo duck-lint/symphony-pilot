@@ -622,6 +622,9 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
             allowed_verdict.add("BLOCKED")
         if packet["verdict"] not in allowed_verdict:
             raise LifecycleError("lifecycle role verdict is not licensed for that role")
+    implementer_present = "IMPLEMENTER" in packets
+    if not implementer_present and actual_head != selected_head:
+        raise LifecycleError("Git HEAD changed without an IMPLEMENTER role result")
     if outcome == "correction_required":
         if state in {"IMPLEMENTED", "REVIEW"}:
             required_role = "REVIEWER" if state == "IMPLEMENTED" else "ADVERSARY"
@@ -741,7 +744,7 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
         if implementer_run_id is None or database.read_role_run(implementer_run_id)["round"] != blocked_implementer_round:
             raise LifecycleError("blocked IMPLEMENTER round was not persisted as allocated")
         _rollover_blocked_correction(database, task, licensed_rows, implementer_run_id)
-    if implementation_phase:
+    if implementation_phase and implementer_present:
         old_head = selected_head
         if old_head != actual_head:
             database.connection.execute(
