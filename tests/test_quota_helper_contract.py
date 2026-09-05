@@ -106,6 +106,9 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("AreAccessRulesProtected", recipe)
         self.assertIn("SetAccessRuleProtection($true, $false)", recipe)
         self.assertIn("FileSystemRights]::FullControl", recipe)
+        self.assertIn("NTAccount", recipe)
+        self.assertIn("IdentityReference", recipe)
+        self.assertIn("IsNullOrWhiteSpace", recipe)
         self.assertIn("Throw-ReconciliationRequired", recipe)
         self.assertIn("VhdxReconciliationRequired", recipe)
         self.assertIn("attachment reconciliation required before Attach", recipe)
@@ -119,6 +122,69 @@ class QuotaHelperContractTests(unittest.TestCase):
         attach_body = recipe[recipe.index('if ($Operation -eq "Attach")'):]
         self.assertNotIn('"already-attached"', attach_body)
         self.assertIn("Move-Item -LiteralPath $temporary -Destination $AttachmentStatePath -Force", recipe)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_vhdx_operator_sid_normalization_uses_real_acl_representations(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        convert_start = recipe.index("function ConvertTo-SidValue")
+        assert_start = recipe.index("function Assert-OperatorStateAcl")
+        set_start = recipe.index("function Set-OperatorStateAcl")
+        ensure_start = recipe.index("function Ensure-OperatorStateNamespace")
+        functions = (
+            recipe[convert_start:assert_start]
+            + recipe[assert_start:set_start]
+            + recipe[set_start:ensure_start]
+        )
+        command = f'''$ErrorActionPreference = "Stop"
+$OperatorAdminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+$OperatorSystemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+{functions}
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("symphony-vhdx-acl-test-" + [guid]::NewGuid().ToString("N"))
+try {{
+    New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+    $acl = Get-Acl -LiteralPath $temporaryRoot
+    $ownerSid = ConvertTo-SidValue $acl.Owner
+    $ownerAccount = New-Object -TypeName System.Security.Principal.NTAccount -ArgumentList ([string]$acl.Owner)
+    $accountSid = ConvertTo-SidValue $ownerAccount
+    $sidObject = New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $ownerSid
+    $identityReferenceSid = ConvertTo-SidValue $acl.Access[0].IdentityReference
+    $builtinAdminSid = ConvertTo-SidValue "BUILTIN\\Administrators"
+    if ($accountSid -ne $ownerSid -or
+        (ConvertTo-SidValue $sidObject) -ne $ownerSid -or
+        [string]::IsNullOrWhiteSpace($identityReferenceSid) -or
+        $builtinAdminSid -ne "S-1-5-32-544") {{ exit 1 }}
+    try {{
+        Set-OperatorStateAcl $temporaryRoot $true
+        $reviewedAcl = Get-Acl -LiteralPath $temporaryRoot
+        if ((ConvertTo-SidValue $reviewedAcl.Owner) -ne "S-1-5-32-544") {{ exit 1 }}
+        Assert-OperatorStateAcl $temporaryRoot $true
+    }} catch {{
+        if ($_.Exception.Message -notmatch "Access is denied|not allowed to be the owner|UnauthorizedAccessException") {{ throw }}
+        "ACL shape smoke skipped: elevation unavailable"
+    }}
+    try {{ ConvertTo-SidValue ""; exit 1 }} catch {{
+        if ($_.Exception.Message -notmatch "operator-state ACL contains an unresolvable identity") {{ exit 1 }}
+    }}
+    try {{ ConvertTo-SidValue "NoSuchDomain\\NoSuchAccount_987654"; exit 1 }} catch {{
+        if ($_.Exception.Message -notmatch "operator-state ACL contains an unresolvable identity") {{ exit 1 }}
+    }}
+    "ACL normalization smoke: PASS"
+}}
+finally {{
+    if (Test-Path -LiteralPath $temporaryRoot) {{ Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }}
+}}'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0 and (
+            "Access is denied" in result.stderr or
+            "UnauthorizedAccessException" in result.stderr
+        ):
+            self.skipTest("temporary ACL smoke test requires elevation")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ACL normalization smoke: PASS", result.stdout)
 
     def test_fixed_vhdx_recovery_contract_is_bounded_and_evidence_driven(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()

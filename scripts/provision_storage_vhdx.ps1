@@ -100,10 +100,25 @@ function Get-LinuxWholeDiskEvidence {
 function ConvertTo-SidValue {
     param([object]$Identity)
     try {
+        if ($null -eq $Identity) {
+            throw "identity is empty"
+        }
         if ($Identity -is [System.Security.Principal.SecurityIdentifier]) {
             return $Identity.Value
         }
-        return $Identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($Identity -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($Identity)) {
+                throw "identity string is empty"
+            }
+            $Identity = New-Object -TypeName System.Security.Principal.NTAccount -ArgumentList $Identity
+        }
+        if ($Identity -is [System.Security.Principal.IdentityReference]) {
+            return $Identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        if ($Identity.PSObject.Methods.Name -contains "Translate") {
+            return $Identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        throw "identity cannot be translated"
     }
     catch {
         throw "operator-state ACL contains an unresolvable identity"
