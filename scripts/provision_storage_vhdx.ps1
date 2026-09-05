@@ -269,6 +269,148 @@ function Invoke-DiskPartFixedVhdxCreate {
     }
 }
 
+function Get-NativeVhdxInformation {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($null -eq ("SymphonyVirtDiskEvidence" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class SymphonyVirtDiskEvidence
+{
+    private const uint VirtualDiskAccessGetInfo = 0x80000;
+    private const uint OpenVirtualDiskVersion2 = 2;
+    private const uint OpenVirtualDiskFlagNone = 0;
+    private const uint GetVirtualDiskInfoSize = 1;
+    private const uint GetVirtualDiskInfoVirtualStorageType = 8;
+    private const uint GetVirtualDiskInfoProviderSubtype = 9;
+    private const uint VirtualStorageTypeDeviceUnknown = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VirtualStorageType
+    {
+        public uint DeviceId;
+        public Guid VendorId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OpenVirtualDiskParameters
+    {
+        public uint Version;
+        public int GetInfoOnly;
+        public int ReadOnly;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct GetVirtualDiskInfo
+    {
+        [FieldOffset(0)] public uint Version;
+        [FieldOffset(8)] public ulong VirtualSize;
+        [FieldOffset(8)] public ulong PhysicalSize;
+        [FieldOffset(8)] public VirtualStorageType VirtualStorageType;
+        [FieldOffset(8)] public uint ProviderSubtype;
+    }
+
+    public sealed class Evidence
+    {
+        public uint DeviceId { get; set; }
+        public Guid VendorId { get; set; }
+        public uint ProviderSubtype { get; set; }
+        public ulong VirtualSize { get; set; }
+        public ulong PhysicalSize { get; set; }
+    }
+
+    [DllImport("VirtDisk.dll", CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern uint OpenVirtualDisk(
+        ref VirtualStorageType virtualStorageType,
+        string path,
+        uint virtualDiskAccessMask,
+        uint flags,
+        ref OpenVirtualDiskParameters parameters,
+        out IntPtr handle);
+
+    [DllImport("VirtDisk.dll", SetLastError = true)]
+    private static extern uint GetVirtualDiskInformation(
+        IntPtr handle,
+        ref uint diskInfoSize,
+        ref GetVirtualDiskInfo diskInfo);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static GetVirtualDiskInfo Query(IntPtr handle, uint version)
+    {
+        GetVirtualDiskInfo info = new GetVirtualDiskInfo { Version = version };
+        uint size = (uint)Marshal.SizeOf(typeof(GetVirtualDiskInfo));
+        uint status = GetVirtualDiskInformation(handle, ref size, ref info);
+        if (status != 0)
+        {
+            throw new Win32Exception((int)status);
+        }
+        return info;
+    }
+
+    public static Evidence Read(string path)
+    {
+        VirtualStorageType requestedType = new VirtualStorageType {
+            DeviceId = VirtualStorageTypeDeviceUnknown,
+            VendorId = Guid.Empty
+        };
+        OpenVirtualDiskParameters parameters = new OpenVirtualDiskParameters {
+            Version = OpenVirtualDiskVersion2,
+            GetInfoOnly = 1,
+            ReadOnly = 1
+        };
+        IntPtr handle = IntPtr.Zero;
+        uint status = OpenVirtualDisk(
+            ref requestedType,
+            path,
+            VirtualDiskAccessGetInfo,
+            OpenVirtualDiskFlagNone,
+            ref parameters,
+            out handle);
+        try
+        {
+            if (status != 0)
+            {
+                throw new Win32Exception((int)status);
+            }
+            GetVirtualDiskInfo typeInfo = Query(
+                handle, GetVirtualDiskInfoVirtualStorageType);
+            GetVirtualDiskInfo subtypeInfo = Query(
+                handle, GetVirtualDiskInfoProviderSubtype);
+            GetVirtualDiskInfo sizeInfo = Query(
+                handle, GetVirtualDiskInfoSize);
+            return new Evidence {
+                DeviceId = typeInfo.VirtualStorageType.DeviceId,
+                VendorId = typeInfo.VirtualStorageType.VendorId,
+                ProviderSubtype = subtypeInfo.ProviderSubtype,
+                VirtualSize = sizeInfo.VirtualSize,
+                PhysicalSize = sizeInfo.PhysicalSize
+            };
+        }
+        finally
+        {
+            if (handle != IntPtr.Zero)
+            {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+"@
+    }
+    try {
+        [SymphonyVirtDiskEvidence]::Read($Path)
+    }
+    catch {
+        throw "native VirtDisk VHDX inspection failed"
+    }
+}
+
 function Get-NativeAllocatedFileBytes {
     param([Parameter(Mandatory)][string]$Path)
     if ($null -eq ("SymphonyNativeFileEvidence" -as [type])) {
@@ -316,22 +458,24 @@ function Remove-NewlyCreatedVhdx {
 
 function Assert-NativeVhdxPostconditions {
     param(
-        [object[]]$Images,
+        [object]$NativeInfo,
         [object]$FileItem,
         [uint64]$AllocatedBytes
     )
-    if (@($Images).Count -ne 1) {
-        throw "native Windows storage evidence did not identify exactly one VHDX"
+    if ($null -eq $NativeInfo) {
+        throw "native VirtDisk evidence is absent"
     }
-    $image = @($Images)[0]
-    if ([IO.Path]::GetFullPath([string]$image.ImagePath) -ne
-        [IO.Path]::GetFullPath($ExpectedPath)) {
-        throw "native Windows storage evidence identified an unexpected image path"
+    if ([uint32]$NativeInfo.DeviceId -ne 3) {
+        throw "native VirtDisk storage type is not VHDX"
     }
-    if ([string]$image.StorageType -ne "VHDX") {
-        throw "fixed Symphony image must have native VHDX storage type"
+    if ([guid]$NativeInfo.VendorId -ne
+        [guid]::Parse("ec984aec-a0f9-47e9-901f-71415a66345b")) {
+        throw "native VirtDisk provider is not Microsoft"
     }
-    if ([int64]$image.Size -ne $ExpectedBytes) {
+    if ([uint32]$NativeInfo.ProviderSubtype -ne 2) {
+        throw "native VirtDisk provider subtype is not Fixed"
+    }
+    if ([uint64]$NativeInfo.VirtualSize -ne [uint64]$ExpectedBytes) {
         throw "VHD virtual capacity must be exactly 64 GiB"
     }
     if ($null -eq $FileItem -or $FileItem.PSIsContainer -or
@@ -353,7 +497,10 @@ function Assert-NativeVhdxPostconditions {
     [pscustomobject]@{
         VhdPath = $ExpectedPath
         VhdType = "Fixed"
-        VirtualSizeBytes = [int64]$image.Size
+        VirtualStorageType = "VHDX"
+        ProviderSubtype = [uint32]$NativeInfo.ProviderSubtype
+        VirtualSizeBytes = [int64]$NativeInfo.VirtualSize
+        PhysicalSizeBytes = [int64]$NativeInfo.PhysicalSize
         FileSizeBytes = [int64]$FileItem.Length
         AllocatedBytes = [uint64]$AllocatedBytes
     }
@@ -380,9 +527,9 @@ function Get-VhdEvidence {
             Assert-OperatorStateAcl $ExpectedPath $false
         }
         $fileItem = Get-Item -LiteralPath $ExpectedPath -Force -ErrorAction Stop
-        $images = @(Get-DiskImage -ImagePath $ExpectedPath -ErrorAction Stop)
+        $nativeInfo = Get-NativeVhdxInformation $ExpectedPath
         $allocatedBytes = Get-NativeAllocatedFileBytes $ExpectedPath
-        Assert-NativeVhdxPostconditions $images $fileItem $allocatedBytes
+        Assert-NativeVhdxPostconditions $nativeInfo $fileItem $allocatedBytes
     }
     catch {
         if ($created) {
@@ -687,8 +834,12 @@ function New-Evidence {
     [ordered]@{
         VhdPath = $Vhd.VhdPath
         VhdType = $Vhd.VhdType
+        VirtualStorageType = $Vhd.VirtualStorageType
+        ProviderSubtype = $Vhd.ProviderSubtype
         VirtualSizeBytes = $Vhd.VirtualSizeBytes
+        PhysicalSizeBytes = $Vhd.PhysicalSizeBytes
         FileSizeBytes = $Vhd.FileSizeBytes
+        AllocatedBytes = $Vhd.AllocatedBytes
         LinuxDevice = $LinuxDevice
         LinuxDevicesBefore = @($LinuxDevicesBefore | ForEach-Object { $_.LinuxDevice })
         LinuxDevicesAfter = @($LinuxDevicesAfter | ForEach-Object { $_.LinuxDevice })

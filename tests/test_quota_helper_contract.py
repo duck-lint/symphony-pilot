@@ -79,7 +79,10 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("maximum=65536", recipe)
         self.assertIn("type=fixed", recipe)
         self.assertIn("ArgumentList", recipe)
-        self.assertIn("Get-DiskImage", recipe)
+        self.assertIn("VirtDisk.dll", recipe)
+        self.assertIn("OpenVirtualDisk", recipe)
+        self.assertIn("GetVirtualDiskInformation", recipe)
+        self.assertIn("CloseHandle", recipe)
         self.assertIn("GetCompressedFileSizeW", recipe)
         self.assertIn("AllocatedBytes", recipe)
         self.assertIn("Assert-NativeVhdxPostconditions", recipe)
@@ -96,6 +99,18 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("Compressed", recipe)
         self.assertIn("Remove-NewlyCreatedVhdx", recipe)
         self.assertIn("maximum=65536 type=fixed", recipe)
+        self.assertIn("VirtualDiskAccessGetInfo = 0x80000", recipe)
+        self.assertIn("OpenVirtualDiskVersion2 = 2", recipe)
+        self.assertIn("GetInfoOnly = 1", recipe)
+        self.assertIn("ReadOnly = 1", recipe)
+        self.assertIn("VirtualStorageTypeDeviceUnknown = 0", recipe)
+        self.assertNotIn("AttachVirtualDisk", recipe)
+        self.assertNotIn("DetachVirtualDisk", recipe)
+        self.assertNotIn("ResizeVirtualDisk", recipe)
+        self.assertNotIn("CompactVirtualDisk", recipe)
+        self.assertNotIn("MergeVirtualDisk", recipe)
+        self.assertNotIn("CreateVirtualDisk", recipe)
+        self.assertNotIn("SetVirtualDiskInformation", recipe)
         self.assertNotIn("New-VHD", recipe)
         self.assertNotIn("Get-VHD", recipe)
         self.assertNotIn("Mount-VHD", recipe)
@@ -121,7 +136,10 @@ class QuotaHelperContractTests(unittest.TestCase):
 
     def test_native_vhdx_postcondition_contract_is_explicit(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
-        self.assertIn("StorageType -ne \"VHDX\"", recipe)
+        self.assertIn("DeviceId -ne 3", recipe)
+        self.assertIn("ProviderSubtype -ne 2", recipe)
+        self.assertIn("VirtualStorageType = \"VHDX\"", recipe)
+        self.assertIn("ProviderSubtype = [uint32]$NativeInfo.ProviderSubtype", recipe)
         self.assertIn("VirtualSizeBytes", recipe)
         self.assertIn("physical allocation is below 64 GiB", recipe)
         self.assertIn("fixed VHDX must not be a reparse point", recipe)
@@ -147,21 +165,23 @@ $normal = [pscustomobject]@{{
     Attributes = [IO.FileAttributes]::Archive
     Length = 4096
 }}
-$valid = [pscustomobject]@{{ ImagePath = $ExpectedPath; StorageType = "VHDX"; Size = 64GB }}
+$valid = [pscustomobject]@{{ DeviceId = 3; VendorId = "ec984aec-a0f9-47e9-901f-71415a66345b"; ProviderSubtype = 2; VirtualSize = 64GB; PhysicalSize = 64GB }}
 $evidence = Assert-NativeVhdxPostconditions @($valid) $normal 64GB
-if ($evidence.VhdType -ne "Fixed" -or $evidence.AllocatedBytes -ne 64GB) {{ exit 1 }}
-function Must-Fail([object[]]$Images, [object]$FileItem, [uint64]$Allocated) {{
-    try {{ Assert-NativeVhdxPostconditions $Images $FileItem $Allocated | Out-Null; return $false }}
+if ($evidence.VhdType -ne "Fixed" -or $evidence.VirtualStorageType -ne "VHDX" -or $evidence.ProviderSubtype -ne 2 -or $evidence.AllocatedBytes -ne 64GB) {{ exit 1 }}
+function Must-Fail([object]$NativeInfo, [object]$FileItem, [uint64]$Allocated) {{
+    try {{ Assert-NativeVhdxPostconditions $NativeInfo $FileItem $Allocated | Out-Null; return $false }}
     catch {{ return $true }}
 }}
-if (-not (Must-Fail @([pscustomobject]@{{ ImagePath=$ExpectedPath; StorageType="ISO"; Size=64GB }}) $normal 64GB)) {{ exit 1 }}
-if (-not (Must-Fail @([pscustomobject]@{{ ImagePath=$ExpectedPath; StorageType="VHDX"; Size=1GB }}) $normal 64GB)) {{ exit 1 }}
-if (-not (Must-Fail @($valid) $normal (64GB - 1))) {{ exit 1 }}
-if (-not (Must-Fail @($valid) ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::SparseFile; Length=4096 }}) 64GB)) {{ exit 1 }}
-if (-not (Must-Fail @($valid) ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::Compressed; Length=4096 }}) 64GB)) {{ exit 1 }}
-if (-not (Must-Fail @($valid) ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::ReparsePoint; Length=4096 }}) 64GB)) {{ exit 1 }}
-if (-not (Must-Fail @($valid, $valid) $normal 64GB)) {{ exit 1 }}
-if (-not (Must-Fail @([pscustomobject]@{{ ImagePath=(Join-Path ([IO.Path]::GetTempPath()) "other.vhdx"); StorageType="VHDX"; Size=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail ([pscustomobject]@{{ DeviceId=2; VendorId="ec984aec-a0f9-47e9-901f-71415a66345b"; ProviderSubtype=2; VirtualSize=64GB; PhysicalSize=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail ([pscustomobject]@{{ DeviceId=3; VendorId="00000000-0000-0000-0000-000000000000"; ProviderSubtype=2; VirtualSize=64GB; PhysicalSize=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail ([pscustomobject]@{{ DeviceId=3; VendorId="ec984aec-a0f9-47e9-901f-71415a66345b"; ProviderSubtype=3; VirtualSize=64GB; PhysicalSize=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail ([pscustomobject]@{{ DeviceId=3; VendorId="ec984aec-a0f9-47e9-901f-71415a66345b"; ProviderSubtype=4; VirtualSize=64GB; PhysicalSize=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail ([pscustomobject]@{{ DeviceId=3; VendorId="ec984aec-a0f9-47e9-901f-71415a66345b"; ProviderSubtype=99; VirtualSize=64GB; PhysicalSize=64GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail ([pscustomobject]@{{ DeviceId=3; VendorId="ec984aec-a0f9-47e9-901f-71415a66345b"; ProviderSubtype=2; VirtualSize=1GB; PhysicalSize=1GB }}) $normal 64GB)) {{ exit 1 }}
+if (-not (Must-Fail $valid $normal (64GB - 1))) {{ exit 1 }}
+if (-not (Must-Fail $valid ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::SparseFile; Length=4096 }}) 64GB)) {{ exit 1 }}
+if (-not (Must-Fail $valid ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::Compressed; Length=4096 }}) 64GB)) {{ exit 1 }}
+if (-not (Must-Fail $valid ([pscustomobject]@{{ PSIsContainer=$false; FullName=$ExpectedPath; Attributes=[IO.FileAttributes]::ReparsePoint; Length=4096 }}) 64GB)) {{ exit 1 }}
 "Native VHDX postconditions: PASS"
 '''
         result = subprocess.run(
@@ -203,7 +223,7 @@ finally {{
     def test_native_windows_storage_capabilities_are_available(self):
         command = '''$diskpart = Join-Path $env:SystemRoot "System32\\diskpart.exe"
 if (-not (Test-Path -LiteralPath $diskpart -PathType Leaf)) { exit 1 }
-if ($null -eq (Get-Command Get-DiskImage -ErrorAction SilentlyContinue)) { exit 1 }
+if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\\VirtDisk.dll") -PathType Leaf)) { exit 1 }
 "Native Windows storage capabilities: PASS"
 '''
         result = subprocess.run(
@@ -212,6 +232,36 @@ if ($null -eq (Get-Command Get-DiskImage -ErrorAction SilentlyContinue)) { exit 
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Native Windows storage capabilities: PASS", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_virtdisk_readonly_api_smoke_resolves_and_rejects_ordinary_file(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        start = recipe.index("function Get-NativeVhdxInformation")
+        end = recipe.index("function Get-NativeAllocatedFileBytes")
+        verifier = recipe[start:end]
+        command = f'''$ErrorActionPreference = "Stop"
+{verifier}
+$temporary = [IO.Path]::GetTempFileName()
+try {{
+    try {{ Get-NativeVhdxInformation $temporary | Out-Null }} catch {{}}
+    if ($null -eq ("SymphonyVirtDiskEvidence" -as [type])) {{ exit 1 }}
+    try {{ [SymphonyVirtDiskEvidence]::Read($temporary) | Out-Null; exit 1 }}
+    catch {{
+        if ($_.Exception.Message -match "Unable to load DLL|EntryPointNotFound|TypeInitialization") {{ exit 1 }}
+    }}
+    "VirtDisk read-only API smoke: PASS"
+}}
+finally {{
+    if (Test-Path -LiteralPath $temporary) {{ [IO.File]::Delete($temporary) }}
+}}
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VirtDisk read-only API smoke: PASS", result.stdout)
 
     def test_wsl_vhd_capability_uses_help_grammar_not_exit_status(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
