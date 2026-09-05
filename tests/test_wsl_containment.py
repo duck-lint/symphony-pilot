@@ -18,6 +18,52 @@ import wsl_contained_exec
 
 
 class SupervisorValidationTests(unittest.TestCase):
+    def test_quota_inspection_selector_is_host_derived(self):
+        with self.assertRaisesRegex(wsl_contained_exec.ContainmentError, "task identifier"):
+            wsl_contained_exec._task_workspace("symphony-pilot", "../../etc")
+
+    def test_quota_inspection_requires_deployment_validation(self):
+        with mock.patch.object(wsl_contained_exec, "_deployment_root", return_value=pathlib.Path("/trusted")), \
+             mock.patch.object(wsl_contained_exec, "_validate_deployment") as validate, \
+             mock.patch.object(wsl_contained_exec, "_quota_inspection", return_value={"schema": "test"}), \
+             mock.patch.object(sys, "argv", [
+                 "wsl_contained_exec.py", "--project", "symphony-pilot",
+                 "--control", "quota-inspect", "--identifier", "T-000001",
+             ]), \
+             mock.patch("builtins.print") as output:
+            self.assertEqual(wsl_contained_exec.main(), 0)
+        validate.assert_called_once_with(pathlib.Path("/trusted"))
+        output.assert_called_once()
+
+    def test_quota_inspection_returns_bounded_mount_and_capacity_evidence(self):
+        class Usage:
+            f_frsize = 4096
+            f_bsize = 4096
+            f_blocks = 100
+            f_bfree = 40
+            f_files = 200
+            f_ffree = 150
+
+        findmnt = mock.Mock(returncode=0, stdout=json.dumps({
+            "filesystems": [{
+                "target": "/home/duck-lint/symphony-workspaces/symphony-pilot/T-000001",
+                "source": "/dev/vdb",
+                "fstype": "ext4",
+                "options": "rw,relatime,prjquota",
+            }],
+        }))
+        with mock.patch.object(wsl_contained_exec, "_task_workspace", return_value=pathlib.PurePosixPath("/workspace")), \
+             mock.patch.object(wsl_contained_exec.subprocess, "run", return_value=findmnt) as run, \
+             mock.patch.object(wsl_contained_exec.os, "statvfs", return_value=Usage(), create=True):
+            evidence = wsl_contained_exec._quota_inspection("symphony-pilot", "T-000001")
+        self.assertTrue(evidence["filesystem"]["project_quota_mount"])
+        self.assertEqual(evidence["filesystem"]["statvfs"]["inodes"], 200)
+        run.assert_called_once_with(
+            ["/bin/findmnt", "--json", "--target", "/workspace",
+             "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+
     def test_writable_mountpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory)

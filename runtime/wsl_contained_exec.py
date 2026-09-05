@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -30,6 +31,9 @@ REQUIRED_AUTHORITY_FILES = (
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_PROFILE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
+TASK_IDENTIFIER = re.compile(r"T-[0-9]{6}\Z")
+WORKSPACE_ROOT = pathlib.PurePosixPath("/home/duck-lint/symphony-workspaces")
+QUOTA_INSPECTION_SCHEMA = "symphony-pilot-quota-inspection/v1"
 
 
 class ContainmentError(RuntimeError):
@@ -162,6 +166,82 @@ def _project_root(project: str) -> pathlib.Path:
     if os.path.ismount(resolved):
         raise ContainmentError("project", "approved project root is itself a mountpoint")
     return resolved
+
+
+def _task_workspace(project: str, identifier: str) -> pathlib.Path:
+    if project not in PROJECT_ROOTS:
+        raise ContainmentError("project", "project is not admitted to the WSL quota domain")
+    if not isinstance(identifier, str) or not TASK_IDENTIFIER.fullmatch(identifier):
+        raise ContainmentError("task_identifier", "task identifier is malformed")
+    root = pathlib.Path(WORKSPACE_ROOT) / project
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved = (resolved_root / identifier).resolve(strict=True)
+    except OSError as exc:
+        raise ContainmentError("quota_workspace", "persistent task workspace cannot be resolved") from exc
+    if resolved_root != root or resolved.parent != resolved_root or not resolved.is_dir():
+        raise ContainmentError("quota_workspace", "persistent task workspace leaves its derived namespace")
+    if root.is_symlink() or (resolved_root / identifier).is_symlink():
+        raise ContainmentError("quota_workspace", "persistent task workspace must not be a symlink")
+    return resolved
+
+
+def _quota_inspection(project: str, identifier: str) -> dict[str, object]:
+    """Return bounded evidence for the derived persistent task filesystem.
+
+    This is deliberately inspection-only.  It never selects a quota backend,
+    changes mounts, assigns project IDs, or launches a caller-supplied command.
+    """
+    workspace = _task_workspace(project, identifier)
+    try:
+        result = subprocess.run(
+            ["/bin/findmnt", "--json", "--target", str(workspace),
+             "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ContainmentError("quota_inspection", "trusted mount inspection did not complete") from exc
+    if result.returncode:
+        raise ContainmentError("quota_inspection", "trusted mount inspection failed")
+    try:
+        payload = json.loads(result.stdout)
+        entries = payload["filesystems"]
+        entry = entries[0]
+        target = entry["target"]
+        source = entry["source"]
+        fstype = entry["fstype"]
+        options = entry["options"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise ContainmentError("quota_inspection", "trusted mount inspection returned malformed evidence") from exc
+    if (not isinstance(target, str) or not isinstance(source, str) or
+            not isinstance(fstype, str) or not isinstance(options, str)):
+        raise ContainmentError("quota_inspection", "trusted mount inspection fields are malformed")
+    try:
+        usage = os.statvfs(workspace)
+    except OSError as exc:
+        raise ContainmentError("quota_inspection", "persistent task filesystem statistics are unavailable") from exc
+    option_set = frozenset(options.split(","))
+    project_quota = fstype in {"ext4", "xfs"} and bool(option_set & {"prjquota", "pquota"})
+    return {
+        "schema": QUOTA_INSPECTION_SCHEMA,
+        "project": project,
+        "identifier": identifier,
+        "workspace": str(workspace),
+        "filesystem": {
+            "target": target,
+            "source": source,
+            "fstype": fstype,
+            "options": options,
+            "project_quota_mount": project_quota,
+            "statvfs": {
+                "block_size": usage.f_frsize or usage.f_bsize,
+                "blocks": usage.f_blocks,
+                "free_blocks": usage.f_bfree,
+                "inodes": usage.f_files,
+                "free_inodes": usage.f_ffree,
+            },
+        },
+    }
 
 
 def _contained_cwd(project_root: pathlib.Path, cwd: str) -> str:
@@ -298,14 +378,27 @@ def run(project: str, cwd: str, command: list[str], wall_seconds: float) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
-    parser.add_argument("--cwd", required=True)
+    parser.add_argument("--cwd")
+    parser.add_argument("--control", choices=("quota-inspect",))
+    parser.add_argument("--identifier")
     parser.add_argument("--wall-seconds", type=float, default=30 * 60)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
-        if not command:
+        if args.control == "quota-inspect":
+            if args.cwd is not None or command or args.identifier is None:
+                raise ContainmentError("control", "quota inspection arguments are malformed")
+            # Control operations are still trusted deployment operations.  Do
+            # not let their fixed nature bypass the manifest and inventory
+            # gate that protects normal contained execution.
+            deployment_root = _deployment_root()
+            _validate_deployment(deployment_root)
+        elif args.cwd is None or not command:
             raise ContainmentError("command", "contained command is required")
+        if args.control == "quota-inspect":
+            print(json.dumps(_quota_inspection(args.project, args.identifier), sort_keys=True))
+            return 0
         return run(args.project, args.cwd, command, args.wall_seconds)
     except Exception as exc:
         kind = getattr(exc, "kind", "containment")

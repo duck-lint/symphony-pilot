@@ -58,6 +58,24 @@ class WslAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(wsl_adapter.WslAdapterError, "only Ubuntu-24.04"):
             wsl_adapter.execute("symphony-runtime", "/mnt/f/PROJECT-REPOS/symphony-runtime", ["/usr/bin/id"], distro="Debian")
 
+    def test_quota_inspection_rejects_untrusted_task_selector(self):
+        with self.assertRaises(wsl_adapter.WslAdapterError) as raised:
+            wsl_adapter.inspect_quota("symphony-pilot", "../../etc")
+        self.assertEqual(raised.exception.kind, "invalid_task_identifier")
+
+    def test_quota_inspection_uses_fixed_deployed_control_operation(self):
+        process = FakeProcess(stdout=b'{"schema":"symphony-pilot-quota-inspection/v1"}', returncode=0)
+        with mock.patch.object(wsl_adapter, "_host_wsl_executable", return_value=pathlib.Path("C:/Windows/System32/wsl.exe")), \
+             mock.patch.object(wsl_adapter, "_sterile_windows_environment", return_value={}), \
+             mock.patch.object(wsl_adapter.subprocess, "Popen", return_value=process) as popen:
+            result = wsl_adapter.inspect_quota("symphony-pilot", "T-000001", request_id="quota-test")
+        self.assertEqual(result["schema"], "symphony-pilot-quota-inspection/v1")
+        command = popen.call_args.args[0]
+        self.assertIn("--control", command)
+        self.assertIn("quota-inspect", command)
+        self.assertIn("--identifier", command)
+        self.assertNotIn("/mnt/f/PROJECT-REPOS/symphony-pilot", command)
+
     def test_cwd_traversal_aliases_and_windows_forms_are_rejected(self):
         cases = (
             "/mnt/f/PROJECT-REPOS/symphony-runtime/../../etc",
