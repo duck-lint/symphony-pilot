@@ -102,12 +102,31 @@ function Assert-WslVhdCapability {
 }
 
 function Read-AttachmentState {
-    if (-not (Test-Path -LiteralPath $AttachmentStatePath -PathType Leaf)) {
+    try {
+        $parent = Get-Item -LiteralPath $ExpectedParent -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
         return $null
     }
-    $item = Get-Item -LiteralPath $AttachmentStatePath -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "VHDX attachment state is a reparse point"
+    if (-not $parent.PSIsContainer -or
+        ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "VHDX attachment state parent is not a normal fixed namespace"
+    }
+    $stateName = [IO.Path]::GetFileName($AttachmentStatePath)
+    $items = @(
+        Get-ChildItem -LiteralPath $ExpectedParent -Force |
+            Where-Object { $_.Name -eq $stateName }
+    )
+    if ($items.Count -eq 0) {
+        return $null
+    }
+    if ($items.Count -ne 1) {
+        throw "VHDX attachment state namespace is ambiguous"
+    }
+    $item = $items[0]
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "VHDX attachment state is not a normal non-reparse file"
     }
     try {
         $state = Get-Content -LiteralPath $AttachmentStatePath -Raw | ConvertFrom-Json
@@ -115,7 +134,21 @@ function Read-AttachmentState {
     catch {
         throw "VHDX attachment state is malformed"
     }
-    if ($null -eq $state -or $state.Schema -ne $StateSchema -or
+    $expectedFields = @(
+        "Schema", "VhdPath", "VhdType", "VirtualSizeBytes",
+        "LinuxDevice", "Attached"
+    )
+    if ($null -eq $state) {
+        throw "VHDX attachment state is malformed"
+    }
+    # The sidecar is bounded cache/recovery evidence, not authority.  Its
+    # fixed namespace, exact field set, and immutable contract values prevent
+    # it from widening the VHD object identity; an untrusted edit can only
+    # cause fail-closed reconciliation.
+    $actualFields = @($state.PSObject.Properties.Name)
+    if ($actualFields.Count -ne $expectedFields.Count -or
+        @($actualFields | Where-Object { $_ -notin $expectedFields }).Count -ne 0 -or
+        $state.Schema -ne $StateSchema -or
         $state.VhdPath -ne $ExpectedPath -or $state.VhdType -ne "Fixed" -or
         [int64]$state.VirtualSizeBytes -ne $ExpectedBytes -or
         $state.Attached -ne $true -or
@@ -123,6 +156,28 @@ function Read-AttachmentState {
         throw "VHDX attachment state conflicts with the fixed contract"
     }
     $state
+}
+
+function Resolve-DetachReconciliation {
+    param(
+        [object[]]$Before,
+        [object[]]$After,
+        [int]$UnmountExitCode
+    )
+    $beforeExact = @($Before | Where-Object { $_.SizeBytes -eq $ExpectedBytes })
+    $afterExact = @($After | Where-Object { $_.SizeBytes -eq $ExpectedBytes })
+    if ($afterExact.Count -ne 0) {
+        throw "WSL VHD detachment left contradictory exact-size Linux device evidence"
+    }
+    # The fixed VHD path is the detachment capability.  A nonzero result is
+    # recoverable only when post-command evidence proves no exact-size device
+    # remains; the evidence, not a stale sidecar or a guessed /dev name, closes
+    # the reconciliation.
+    [pscustomobject]@{
+        Action = if ($beforeExact.Count -eq 0) { "already-detached" } else { "reconciled-detached" }
+        LinuxDevice = if ($beforeExact.Count -eq 1) { $beforeExact[0].LinuxDevice } else { $null }
+        UnmountExitCode = $UnmountExitCode
+    }
 }
 
 function Write-AttachmentState {
@@ -151,7 +206,9 @@ function New-Evidence {
         [object]$Vhd,
         [AllowNull()][string]$LinuxDevice,
         [string]$Action,
-        [string]$State
+        [string]$State,
+        [object[]]$LinuxDevicesBefore = @(),
+        [object[]]$LinuxDevicesAfter = @()
     )
     [ordered]@{
         VhdPath = $Vhd.VhdPath
@@ -159,6 +216,8 @@ function New-Evidence {
         VirtualSizeBytes = $Vhd.VirtualSizeBytes
         FileSizeBytes = $Vhd.FileSizeBytes
         LinuxDevice = $LinuxDevice
+        LinuxDevicesBefore = @($LinuxDevicesBefore | ForEach-Object { $_.LinuxDevice })
+        LinuxDevicesAfter = @($LinuxDevicesAfter | ForEach-Object { $_.LinuxDevice })
         WslAttachmentState = $State
         AttachmentAction = $Action
         Distribution = $Distribution
@@ -178,7 +237,7 @@ if ($Operation -eq "Attach") {
             $exactBefore.Count -ne 1) {
             throw "tracked VHDX attachment is missing or conflicts with another 64-GiB Linux disk"
         }
-        New-Evidence $vhd $state.LinuxDevice "already-attached" "attached"
+        New-Evidence $vhd $state.LinuxDevice "already-attached" "attached" $before $before
         exit 0
     }
     if ($exactBefore.Count -ne 0) {
@@ -198,32 +257,22 @@ if ($Operation -eq "Attach") {
         throw "direct VHD attachment did not produce exactly one new 64-GiB Linux disk"
     }
     Write-AttachmentState $new[0].LinuxDevice
-    New-Evidence $vhd $new[0].LinuxDevice "attached" "attached"
+    New-Evidence $vhd $new[0].LinuxDevice "attached" "attached" $before $after
     exit 0
 }
 
 $vhd = Get-VhdEvidence $false
 $before = @(Get-LinuxWholeDiskEvidence)
 $state = Read-AttachmentState
-$exactBefore = @($before | Where-Object { $_.SizeBytes -eq $ExpectedBytes })
-if ($null -eq $state) {
-    if ($exactBefore.Count -ne 0) {
-        throw "an untracked exact-size Linux disk is a conflicting attachment"
-    }
-    New-Evidence $vhd $null "already-detached" "detached"
-    exit 0
-}
-if ($exactBefore.Count -ne 1 -or $exactBefore[0].LinuxDevice -ne $state.LinuxDevice) {
-    throw "tracked VHDX attachment is missing or conflicts with another 64-GiB Linux disk"
-}
 $detached = Invoke-WslText @("--unmount", $ExpectedPath)
-if ($detached.ExitCode -ne 0) {
-    throw "direct WSL VHD detachment failed: $($detached.Output)"
-}
 $after = @(Get-LinuxWholeDiskEvidence)
-if (@($after | Where-Object { $_.LinuxDevice -eq $state.LinuxDevice }).Count -ne 0 -or
-    @($after | Where-Object { $_.SizeBytes -eq $ExpectedBytes }).Count -ne 0) {
-    throw "WSL VHD detachment did not remove the tracked Linux device"
+$reconciliation = Resolve-DetachReconciliation $before $after $detached.ExitCode
+if ($null -ne $state) {
+    Remove-Item -LiteralPath $AttachmentStatePath -Force
 }
-Remove-Item -LiteralPath $AttachmentStatePath -Force
-New-Evidence $vhd $state.LinuxDevice "detached" "detached"
+$reconciliation.LinuxDevice = if ($null -ne $reconciliation.LinuxDevice) {
+    [string]$reconciliation.LinuxDevice
+} else {
+    $null
+}
+New-Evidence $vhd $reconciliation.LinuxDevice $reconciliation.Action "detached" $before $after

@@ -93,6 +93,61 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertNotIn("Resize-VHD", recipe)
         self.assertNotIn("Invoke-Expression", recipe)
 
+    def test_fixed_vhdx_recovery_contract_is_bounded_and_evidence_driven(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        self.assertIn("Resolve-DetachReconciliation", recipe)
+        self.assertIn("reconciled-detached", recipe)
+        self.assertIn("UnmountExitCode", recipe)
+        self.assertIn("LinuxDevicesBefore", recipe)
+        self.assertIn("LinuxDevicesAfter", recipe)
+        self.assertIn("Get-ChildItem -LiteralPath $ExpectedParent -Force", recipe)
+        self.assertIn("PSIsContainer", recipe)
+        self.assertIn("ReparsePoint", recipe)
+        self.assertIn("PSObject.Properties.Name", recipe)
+        self.assertIn("GetFileName($AttachmentStatePath)", recipe)
+        self.assertIn("an untracked exact-size Linux disk is a conflicting attachment", recipe)
+        self.assertIn('Invoke-WslText @("--unmount", $ExpectedPath)', recipe)
+        self.assertLess(
+            recipe.rfind("Resolve-DetachReconciliation"),
+            recipe.rfind("Remove-Item -LiteralPath $AttachmentStatePath -Force"),
+        )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_vhdx_detach_reconciler_covers_recovery_and_conflict_evidence(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        start = recipe.index("function Resolve-DetachReconciliation")
+        end = recipe.index("function Write-AttachmentState")
+        reconciler = recipe[start:end]
+        prefix = "$ExpectedBytes = 64GB\n" + reconciler
+
+        def run(before, after, exit_code, expect_success):
+            def evidence(devices):
+                return "@(" + ",".join(
+                    "[pscustomobject]@{SizeBytes=64GB; LinuxDevice='%s'}" % device
+                    for device in devices
+                ) + ")"
+
+            command = prefix + "\ntry {\n" + (
+                "$result = Resolve-DetachReconciliation %s %s %d\n"
+                "$result | ConvertTo-Json -Compress\n"
+            ) % (evidence(before), evidence(after), exit_code) + (
+                "exit 0\n} catch { exit 1 }"
+                if expect_success else
+                "exit 1\n} catch { exit 0 }"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb"], [], 0, True))
+        self.assertIn('"Action":"already-detached"', run([], [], 1, True))
+        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdc"], [], 1, True))
+        self.assertIn('"Action":"reconciled-detached"', run(["/dev/sdb", "/dev/sdc"], [], 0, True))
+        run(["/dev/sdb"], ["/dev/sdc"], 0, False)
+
     def test_vhdx_operator_contract_is_in_source_digest(self):
         import deployment_contract
         self.assertIn("scripts/provision_storage_vhdx.ps1", deployment_contract.CONTRACT_FILES)
