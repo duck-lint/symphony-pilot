@@ -92,7 +92,7 @@ compile_helper_preflight() {
         fail "trusted provisioning prerequisite helper temporary file mode is unsafe"
     if ! /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         "$CC" -std=c11 -O2 -Wall -Wextra -Werror "$HELPER_SOURCE" \
-        -o "$HELPER_TMP" >/dev/null 2>&1; then
+        -o "$HELPER_TMP"; then
         fail "trusted provisioning prerequisite helper compilation failed"
     fi
     chown root:root "$HELPER_TMP" || \

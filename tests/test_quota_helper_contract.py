@@ -806,6 +806,8 @@ int main(void) {{
         self.assertIn('/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin', recipe)
         self.assertIn('-std=c11 -O2 -Wall -Wextra -Werror', recipe)
         self.assertEqual(recipe.count('-std=c11 -O2 -Wall -Wextra -Werror'), 1)
+        self.assertNotIn('-o "$HELPER_TMP" >/dev/null 2>&1', recipe)
+        self.assertIn('trusted provisioning prerequisite helper compilation failed', recipe)
         self.assertIn('install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"', recipe)
         self.assertIn('rm -f -- "$HELPER_TMP"', recipe)
         self.assertIn('[ "$ACTUAL_SOURCE_SHA256" = "$EXPECTED_SOURCE_SHA256" ]', recipe)

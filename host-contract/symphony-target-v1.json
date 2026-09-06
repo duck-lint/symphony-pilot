@@ -1,0 +1,92 @@
+{
+  "schema": "symphony-pilot-host-contract/v1",
+  "version": 1,
+  "exact_identity": {
+    "windows": {
+      "architecture": "AMD64",
+      "build_family": "10.0.22631",
+      "build": "10.0.22631.6199",
+      "product_label": "Windows 10 Home",
+      "windows_version": "2009"
+    },
+    "powershell": {
+      "edition": "Core",
+      "version": "7.6.5",
+      "platform": "Win32NT"
+    },
+    "wsl": {
+      "version": "2.7.12.0",
+      "kernel_package_version": "6.18.33.2-2",
+      "uname_kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "wslg": "1.0.73.2",
+      "msrdc": "1.2.7214",
+      "direct3d": "1.611.1-81528511",
+      "dxcore": "10.0.26100.1-240331-1435.ge-release",
+      "reported_windows": "10.0.22631.6199",
+      "default_version": "2",
+      "distribution": "Ubuntu-24.04",
+      "distribution_version": "2"
+    },
+    "ubuntu": {
+      "distro": "Ubuntu",
+      "version": "24.04.4 LTS",
+      "version_id": "24.04",
+      "codename": "noble",
+      "architecture": "x86_64",
+      "compiler": "/usr/bin/cc",
+      "compiler_version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "glibc": "2.39-0ubuntu8.8",
+      "e2fsprogs": "1.47.0",
+      "util_linux": {
+        "mount": "2.39.3",
+        "findmnt": "2.39.3"
+      },
+      "quotactl_fd": 443
+    },
+    "paths": {
+      "pilot_source_root": "F:\\PROJECT-REPOS\\symphony-pilot",
+      "runtime_source_root": "F:\\PROJECT-REPOS\\symphony-runtime",
+      "canary_source_root": "F:\\PROJECT-REPOS\\symphony-canary",
+      "wsl_distribution": "Ubuntu-24.04",
+      "wsl_user": "duck-lint",
+      "deployed_pilot_root": "/home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary",
+      "workspace_root": "/home/duck-lint/symphony-workspaces"
+    }
+  },
+  "compatible_buildability": {
+    "ubuntu_linux": {
+      "os_id": "ubuntu",
+      "version_prefix": "24.04",
+      "architecture": "x86_64",
+      "compiler_path": "/usr/bin/cc",
+      "compiler_family": "gcc",
+      "compiler_major": 13,
+      "glibc_family": "2.39",
+      "e2fsprogs_family": "1.47",
+      "util_linux_minimum": "2.39",
+      "quotactl_fd": 443
+    },
+    "windows_native": {
+      "architecture": "AMD64"
+    }
+  },
+  "informational": {
+    "target_windows_product_label": "Windows 10 Home",
+    "target_windows_version": "2009",
+    "target_d3d": "1.611.1-81528511",
+    "target_dxcore": "10.0.26100.1-240331-1435.ge-release"
+  },
+  "disposable_runner": {
+    "repository": "duck-lint/symphony-pilot",
+    "branch": "codex/step-8-deployment-immutability",
+    "labels": [
+      "self-hosted",
+      "windows",
+      "x64",
+      "symphony-target",
+      "symphony-disposable"
+    ],
+    "marker_path": "C:\\SymphonyTargetRunner\\runner-marker.json",
+    "marker_schema": "symphony-pilot-disposable-target-runner/v1"
+  }
+}

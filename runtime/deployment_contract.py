@@ -51,6 +51,9 @@ CONTRACT_FILES = (
     "provisioning/quota-admit-task.c",
     "scripts/provision_storage_domain.sh",
     "scripts/provision_storage_vhdx.ps1",
+    # Step-8 CI target identity is part of the reviewed source/deployment
+    # contract; changing it must invalidate compatibility evidence.
+    "host-contract/symphony-target-v1.json",
     *POLICY_FILES,
 )
 

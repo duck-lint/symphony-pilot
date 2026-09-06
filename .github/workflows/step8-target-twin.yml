@@ -1,0 +1,97 @@
+name: Symphony Step 8 disposable target twin
+
+on:
+  push:
+    branches:
+      - codex/step-8-deployment-immutability
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  target-twin:
+    name: Tier C disposable Windows and WSL2 target twin
+    if: github.repository == 'duck-lint/symphony-pilot' && github.ref == 'refs/heads/codex/step-8-deployment-immutability'
+    runs-on:
+      - self-hosted
+      - windows
+      - x64
+      - symphony-target
+      - symphony-disposable
+    env:
+      SYMPHONY_TARGET_MARKER: C:\SymphonyTargetRunner\runner-marker.json
+      SYMPHONY_TARGET_VHDX: C:\ProgramData\SymphonyPilot\symphony-storage.vhdx
+    steps:
+      - name: Checkout exact trusted branch SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Verify trusted event and disposable runner marker
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne "duck-lint/symphony-pilot") { throw "unexpected repository" }
+          if ($env:GITHUB_REF -ne "refs/heads/codex/step-8-deployment-immutability") { throw "unexpected trusted ref" }
+          if (-not (Test-Path -LiteralPath $env:SYMPHONY_TARGET_MARKER -PathType Leaf)) { throw "disposable target runner marker is absent" }
+          $marker = Get-Content -LiteralPath $env:SYMPHONY_TARGET_MARKER -Raw | ConvertFrom-Json
+          if ($marker.schema -ne "symphony-pilot-disposable-target-runner/v1") { throw "disposable target runner marker schema is not accepted" }
+          if ($marker.disposable -ne $true) { throw "runner is not marked disposable" }
+
+      - name: Create evidence directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path artifacts/step8 | Out-Null
+
+      - name: Verify exact target contract before fixture mutation
+        shell: pwsh
+        run: |
+          ./scripts/collect_step8_windows_observation.ps1 -IncludeWsl -OutputPath artifacts/step8/target-host.json
+          python scripts/verify_step8_host.py --tier target-twin --observed-file artifacts/step8/target-host.json --output artifacts/step8/target-verification.json
+
+      - name: Verify exact source and Runtime candidates
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -d /home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary
+          test "$(git -C /home/duck-lint/symphony-runtime rev-parse HEAD)" = "c584331afafbb317861ecef338558d88db5a9f2c"
+
+      - name: Run real Pilot deployment and frozen verifier
+        shell: pwsh
+        run: |
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 /mnt/f/PROJECT-REPOS/symphony-pilot/scripts/deploy.py --project symphony-canary
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 /mnt/f/PROJECT-REPOS/symphony-pilot/scripts/project.py --project symphony-canary test
+
+      - name: Run disposable storage lifecycle through reviewed operator paths
+        shell: pwsh
+        run: |
+          # This job is the only reviewed location allowed to mutate its
+          # disposable fixture. Production paths and credentials are absent.
+          $attachOutput = & ./scripts/provision_storage_vhdx.ps1 -Operation Attach
+          if ($LASTEXITCODE -ne 0) { throw "disposable VHDX Attach failed" }
+          $attach = ($attachOutput | Select-Object -Last 1 | ConvertFrom-Json)
+          if ($attach.LinuxDevice -notmatch '^/dev/[^/]+$') { throw "Attach did not return a bounded Linux device identity" }
+          & wsl.exe -d Ubuntu-24.04 --user root -- /bin/sh /home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary/scripts/provision_storage_domain.sh $attach.LinuxDevice
+
+      - name: Run exact deployment and storage evidence checks
+        shell: pwsh
+        run: |
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 /mnt/f/PROJECT-REPOS/symphony-pilot/scripts/project.py --project symphony-canary test
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -m unittest discover -s /mnt/f/PROJECT-REPOS/symphony-pilot/tests -v
+
+      - name: Detach and clean disposable fixture
+        if: always()
+        shell: pwsh
+        run: ./scripts/provision_storage_vhdx.ps1 -Operation Detach
+
+      - name: Write final exact-SHA evidence
+        if: always()
+        shell: pwsh
+        run: python scripts/write_step8_evidence.py --tier target-twin --result "${{ job.status }}" --observed-file artifacts/step8/target-verification.json --output artifacts/step8/target-final.json
+
+      - name: Upload Tier C evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: step8-target-evidence-${{ github.sha }}
+          path: artifacts/step8

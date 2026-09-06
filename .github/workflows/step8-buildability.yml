@@ -1,0 +1,85 @@
+name: Symphony Step 8 buildability
+
+on:
+  pull_request:
+  push:
+    branches:
+      - codex/step-8-deployment-immutability
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  ubuntu-buildability:
+    name: Tier A native Ubuntu buildability
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Create evidence directory
+        run: mkdir -p artifacts/step8
+
+      - name: Verify compatible Ubuntu contract
+        run: |
+          python3 scripts/verify_step8_host.py \
+            --tier ubuntu-buildability \
+            --output artifacts/step8/ubuntu-host.json
+
+      - name: Compile the exact production helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep compiler stderr on the job log: this is the build diagnostic,
+          # not an operator-facing summary that can erase the cause.
+          /usr/bin/cc -std=c11 -O2 -Wall -Wextra -Werror \
+            provisioning/quota-admit-task.c \
+            -o artifacts/step8/quota-admit-task
+          file artifacts/step8/quota-admit-task
+          readelf -h artifacts/step8/quota-admit-task
+
+      - name: Parse the production provisioner
+        run: /bin/sh -n scripts/provision_storage_domain.sh
+
+      - name: Run full Pilot Python suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Run mandatory native Linux Step 8 tests
+        run: |
+          python3 -m unittest -v \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_fsxattr_transition_uses_original_kernel_state \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_helper_compiles_with_strict_linux_warnings \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_exact_copy_is_proven_before_identity_and_execution \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_corrupt_install_fails_before_identity_or_helper_execution
+
+      - name: Run root-only preflight harnesses without host provisioning
+        run: |
+          sudo -E python3 -m unittest -v \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_missing_compiler_preflight_stops_before_mutation \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_failing_compiler_preflight_stops_before_mutation \
+            tests.test_quota_helper_contract.QuotaHelperContractTests.test_successful_preflight_installs_same_binary_without_recompile
+
+      - name: Check deployment dry run
+        run: python3 scripts/deploy.py --project symphony-canary --dry-run
+
+      - name: Write final exact-SHA evidence
+        if: always()
+        run: |
+          python3 scripts/write_step8_evidence.py \
+            --tier ubuntu-buildability \
+            --result "${{ job.status }}" \
+            --observed-file artifacts/step8/ubuntu-host.json \
+            --output artifacts/step8/ubuntu-final.json
+
+      - name: Upload Tier A evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: step8-ubuntu-evidence-${{ github.sha }}
+          path: artifacts/step8

@@ -1,0 +1,74 @@
+name: Symphony Step 8 Windows native contract
+
+on:
+  pull_request:
+  push:
+    branches:
+      - codex/step-8-deployment-immutability
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    name: Tier B hosted Windows native behavior
+    runs-on: windows-2022
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Create evidence directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path artifacts/step8 | Out-Null
+
+      - name: Collect Windows native observation
+        shell: pwsh
+        run: ./scripts/collect_step8_windows_observation.ps1 -OutputPath artifacts/step8/windows-host.json
+
+      - name: Verify compatible Windows native contract
+        shell: pwsh
+        run: python scripts/verify_step8_host.py --tier windows-native --observed-file artifacts/step8/windows-host.json --output artifacts/step8/windows-verification.json
+
+      - name: Parse the production VHDX operator script
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/provision_storage_vhdx.ps1),
+            [ref]$tokens,
+            [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) { $errors | Out-String | Write-Error; exit 1 }
+
+      - name: Run Windows storage and ACL contract tests
+        shell: pwsh
+        run: python -m unittest tests.test_quota_helper_contract -v
+
+      - name: Run non-mutating WSL grammar probe when WSL is present
+        shell: pwsh
+        run: |
+          $wsl = Join-Path $env:SystemRoot "System32\wsl.exe"
+          if (-not (Test-Path -LiteralPath $wsl -PathType Leaf)) {
+            Write-Host "WSL grammar probe unavailable on hosted Windows runner; this is not Tier C evidence."
+            exit 0
+          }
+          $help = (& $wsl --help 2>&1 | Out-String)
+          if ($help -notmatch '(?m)--mount' -or $help -notmatch '(?m)--vhd' -or
+              $help -notmatch '(?m)--bare' -or $help -notmatch '(?m)--unmount') {
+            throw "required WSL direct-VHD grammar is not advertised"
+          }
+
+      - name: Write final exact-SHA evidence
+        if: always()
+        shell: pwsh
+        run: python scripts/write_step8_evidence.py --tier windows-native --result "${{ job.status }}" --observed-file artifacts/step8/windows-verification.json --output artifacts/step8/windows-final.json
+
+      - name: Upload Tier B evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: step8-windows-evidence-${{ github.sha }}
+          path: artifacts/step8
