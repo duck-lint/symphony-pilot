@@ -1017,6 +1017,7 @@ COMPILED_HELPER_SHA256=
 cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
 trap cleanup EXIT
 {preflight}
+compile_helper_preflight
 touch "{marker}"
 '''
             harness = root / "run.sh"
@@ -1055,6 +1056,7 @@ COMPILED_HELPER_SHA256=
 cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
 trap cleanup EXIT
 {preflight}
+compile_helper_preflight
 touch "{marker}"
 '''
             harness = root / "run.sh"
@@ -1111,6 +1113,7 @@ COMPILED_HELPER_SHA256=
 cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
 trap cleanup EXIT
 {preflight}
+compile_helper_preflight
 install -m 4750 "$HELPER_TMP" "{installed}"
 if ! cmp -s "$HELPER_TMP" "{installed}"; then exit 1; fi
 if [ "$(cat "{count}")" != "1" ]; then exit 1; fi
