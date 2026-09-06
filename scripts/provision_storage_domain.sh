@@ -81,6 +81,34 @@ ACTUAL_SOURCE_SHA256=$(sha256sum "$HELPER_SOURCE" | awk '{print $1}')
 [ "$ACTUAL_SOURCE_SHA256" = "$EXPECTED_SOURCE_SHA256" ] || \
     fail "quota helper source differs from the reviewed supervisor digest"
 
+compile_helper_preflight() {
+    [ -f "$CC" ] && [ -x "$CC" ] || \
+        fail "trusted provisioning prerequisite /usr/bin/cc is unavailable"
+    HELPER_TMP=$(mktemp /tmp/.symphony-pilot-quota-admit-task.XXXXXX) || \
+        fail "trusted provisioning prerequisite helper temporary file is unavailable"
+    chown root:root "$HELPER_TMP" || \
+        fail "trusted provisioning prerequisite helper temporary file ownership is unsafe"
+    chmod 0700 "$HELPER_TMP" || \
+        fail "trusted provisioning prerequisite helper temporary file mode is unsafe"
+    if ! /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        "$CC" -std=c11 -O2 -Wall -Wextra -Werror "$HELPER_SOURCE" \
+        -o "$HELPER_TMP" >/dev/null 2>&1; then
+        fail "trusted provisioning prerequisite helper compilation failed"
+    fi
+    chown root:root "$HELPER_TMP" || \
+        fail "trusted provisioning prerequisite helper output ownership is unsafe"
+    chmod 0700 "$HELPER_TMP" || \
+        fail "trusted provisioning prerequisite helper output mode is unsafe"
+    [ -f "$HELPER_TMP" ] || fail "trusted provisioning prerequisite helper output is unavailable"
+    [ "$(stat -c '%u %a' "$HELPER_TMP")" = "0 700" ] || \
+        fail "trusted provisioning prerequisite helper output privilege state is unsafe"
+    COMPILED_HELPER_SHA256=$(sha256sum "$HELPER_TMP" | awk '{print $1}')
+    [ "${COMPILED_HELPER_SHA256:-}" ] || \
+        fail "trusted provisioning prerequisite helper output identity is unavailable"
+}
+
+compile_helper_preflight
+
 DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE" 2>/dev/null || true)
 POOL_DEVICE_REAL=$(readlink -f -- "$POOL_DEVICE")
 if [ -n "$DEVICE_TYPE" ]; then
@@ -235,9 +263,6 @@ verify_capacity
 verify_storage_identity
 
 usermod --append --groups "$HELPER_GROUP" duck-lint
-HELPER_TMP=/var/lib/symphony-pilot/quota-admit-task.tmp
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror "$HELPER_SOURCE" -o "$HELPER_TMP"
-COMPILED_HELPER_SHA256=$(sha256sum "$HELPER_TMP" | awk '{print $1}')
 if [ -e "$HELPER" ]; then
     [ ! -L "$HELPER" ] || fail "existing quota helper is a symlink"
     [ "$(stat -c '%u %g %a' "$HELPER")" = "0 $EXPECTED_GID 4750" ] || \
@@ -248,6 +273,7 @@ if [ -e "$HELPER" ]; then
     HELPER_TMP=
 else
     install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"
+    rm -f -- "$HELPER_TMP"
 fi
 
 HELPER_UID=$(stat -c '%u' "$HELPER")

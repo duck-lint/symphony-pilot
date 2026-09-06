@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -784,11 +785,188 @@ int main(void) {{
 
     def test_provisioning_source_digest_is_verified_before_compile(self):
         recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
-        self.assertLess(recipe.index("ACTUAL_SOURCE_SHA256=$(sha256sum"), recipe.index('"$CC" -std=c11'))
+        source_digest = recipe.index("ACTUAL_SOURCE_SHA256=$(sha256sum")
+        preflight = recipe.index("compile_helper_preflight\n")
+        first_mutations = [
+            recipe.index('mkdir -p "$POOL_ROOT"'),
+            recipe.index("mkfs.ext4 -L"),
+            recipe.index('mount -t ext4 -o prjquota'),
+            recipe.index('chown duck-lint:duck-lint "$POOL_ROOT"'),
+            recipe.index('chmod 0750 "$POOL_ROOT"'),
+            recipe.index('FSTAB_TMP=$(mktemp /etc/'),
+            recipe.index('groupadd --system "$HELPER_GROUP"'),
+            recipe.index('install -d -o root -g "$HELPER_GROUP"'),
+            recipe.index('usermod --append --groups "$HELPER_GROUP" duck-lint'),
+            recipe.index('install -o root -g "$HELPER_GROUP" -m 4750'),
+        ]
+        self.assertLess(source_digest, preflight)
+        self.assertTrue(all(preflight < mutation for mutation in first_mutations))
+        self.assertIn('CC=/usr/bin/cc', recipe)
+        self.assertIn('[ -f "$CC" ] && [ -x "$CC" ]', recipe)
+        self.assertIn('/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin', recipe)
+        self.assertIn('-std=c11 -O2 -Wall -Wextra -Werror', recipe)
+        self.assertEqual(recipe.count('-std=c11 -O2 -Wall -Wextra -Werror'), 1)
+        self.assertIn('install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"', recipe)
+        self.assertIn('rm -f -- "$HELPER_TMP"', recipe)
         self.assertIn('[ "$ACTUAL_SOURCE_SHA256" = "$EXPECTED_SOURCE_SHA256" ]', recipe)
         self.assertIn('stat -c \'%a\' "$HELPER"', recipe)
         self.assertIn('HELPER_UID=$(stat -c \'%u\' "$HELPER")', recipe)
         self.assertIn('HELPER_GID=$(stat -c \'%g\' "$HELPER")', recipe)
+
+    def test_partial_state_recovery_reuses_identity_and_reaches_helper_install(self):
+        recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
+        existing_device = recipe.index('if [ -n "$DEVICE_TYPE" ]; then')
+        format_block = recipe.index('if [ -z "$DEVICE_TYPE" ]; then')
+        format_command = recipe.index('mkfs.ext4 -L')
+        existing_group = recipe.index('getent group "$HELPER_GROUP" >/dev/null 2>&1 || groupadd')
+        helper_install = recipe.index('install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"')
+        self.assertLess(existing_device, format_block)
+        self.assertLess(format_block, format_command)
+        self.assertIn('DEVICE_TYPE=$(blkid -o value -s TYPE "$POOL_DEVICE")', recipe)
+        self.assertIn('[ "$DEVICE_LABEL" = "$POOL_LABEL" ]', recipe)
+        self.assertIn('POOL_UUID=$(blkid -s UUID -o value "$POOL_DEVICE")', recipe)
+        self.assertIn('if [ -e "$STORAGE_IDENTITY" ]; then', recipe)
+        self.assertIn('if [ -e "$HELPER" ]; then', recipe)
+        self.assertLess(existing_group, helper_install)
+        self.assertIn('rm -f -- "$HELPER_TMP"', recipe)
+        self.assertNotIn('groupadd --force', recipe)
+
+    def _preflight_shell_function(self):
+        recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
+        match = re.search(
+            r"(?ms)^compile_helper_preflight\(\) \{\n.*?^\}\n",
+            recipe,
+        )
+        self.assertIsNotNone(match)
+        return match.group(0)
+
+    @unittest.skipUnless(
+        shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root POSIX shell unavailable",
+    )
+    def test_missing_compiler_preflight_stops_before_mutation(self):
+        preflight = self._preflight_shell_function()
+        with tempfile.TemporaryDirectory(prefix="symphony-preflight-missing-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "quota-admit-task.c"
+            source.write_text("int main(void) { return 0; }\n", encoding="ascii")
+            marker = root / "mutation-marker"
+            command = f'''#!/bin/sh
+set -eu
+fail() {{ echo "symphony storage provisioning stopped: $*" >&2; exit 78; }}
+CC="{root / "missing-cc"}"
+HELPER_SOURCE="{source}"
+HELPER_TMP=
+COMPILED_HELPER_SHA256=
+cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
+trap cleanup EXIT
+{preflight}
+touch "{marker}"
+'''
+            harness = root / "run.sh"
+            harness.write_text(command, encoding="ascii")
+            harness.chmod(0o700)
+            result = subprocess.run(
+                [shutil.which("sh"), str(harness)],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("trusted provisioning prerequisite /usr/bin/cc is unavailable", result.stderr)
+        self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(
+        shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root POSIX shell unavailable",
+    )
+    def test_failing_compiler_preflight_stops_before_mutation(self):
+        preflight = self._preflight_shell_function()
+        with tempfile.TemporaryDirectory(prefix="symphony-preflight-failing-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "quota-admit-task.c"
+            source.write_text("int main(void) { return 0; }\n", encoding="ascii")
+            compiler = root / "cc"
+            compiler.write_text("#!/bin/sh\nexit 17\n", encoding="ascii")
+            compiler.chmod(0o700)
+            marker = root / "mutation-marker"
+            command = f'''#!/bin/sh
+set -eu
+fail() {{ echo "symphony storage provisioning stopped: $*" >&2; exit 78; }}
+CC="{compiler}"
+HELPER_SOURCE="{source}"
+HELPER_TMP=
+COMPILED_HELPER_SHA256=
+cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
+trap cleanup EXIT
+{preflight}
+touch "{marker}"
+'''
+            harness = root / "run.sh"
+            harness.write_text(command, encoding="ascii")
+            harness.chmod(0o700)
+            result = subprocess.run(
+                [shutil.which("sh"), str(harness)],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("trusted provisioning prerequisite helper compilation failed", result.stderr)
+        self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(
+        shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root POSIX shell unavailable",
+    )
+    def test_successful_preflight_installs_same_binary_without_recompile(self):
+        preflight = self._preflight_shell_function()
+        with tempfile.TemporaryDirectory(prefix="symphony-preflight-success-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "quota-admit-task.c"
+            source.write_text("int main(void) { return 0; }\n", encoding="ascii")
+            compiler = root / "cc"
+            count = root / "compile-count"
+            count.write_text("0\n", encoding="ascii")
+            compiler.write_text(
+                f'''#!/bin/sh
+count=$(cat "{count}")
+count=$((count + 1))
+printf '%s\\n' "$count" > "{count}"
+output=
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+        shift
+        output=$1
+    fi
+    shift
+done
+printf 'preflight-compiled-helper\\n' > "$output"
+''',
+                encoding="ascii",
+            )
+            compiler.chmod(0o700)
+            installed = root / "installed-helper"
+            command = f'''#!/bin/sh
+set -eu
+fail() {{ echo "symphony storage provisioning stopped: $*" >&2; exit 78; }}
+CC="{compiler}"
+HELPER_SOURCE="{source}"
+HELPER_TMP=
+COMPILED_HELPER_SHA256=
+cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
+trap cleanup EXIT
+{preflight}
+install -m 4750 "$HELPER_TMP" "{installed}"
+if ! cmp -s "$HELPER_TMP" "{installed}"; then exit 1; fi
+if [ "$(cat "{count}")" != "1" ]; then exit 1; fi
+echo "preflight same-binary install: PASS"
+'''
+            harness = root / "run.sh"
+            harness.write_text(command, encoding="ascii")
+            harness.chmod(0o700)
+            result = subprocess.run(
+                [shutil.which("sh"), str(harness)],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("preflight same-binary install: PASS", result.stdout)
 
     def test_existing_mount_identity_is_verified_before_mutation(self):
         recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
