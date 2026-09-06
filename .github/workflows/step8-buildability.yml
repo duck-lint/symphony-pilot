@@ -27,10 +27,22 @@ jobs:
         run: mkdir -p artifacts/step8
 
       - name: Verify compatible Ubuntu contract
+        id: verify-ubuntu
         run: |
           python3 scripts/verify_step8_host.py \
             --tier ubuntu-buildability \
             --output artifacts/step8/ubuntu-host.json
+
+      - name: Report Ubuntu contract evidence on failure
+        if: always()
+        run: |
+          if [ -f artifacts/step8/ubuntu-host.json ]; then
+            cat artifacts/step8/ubuntu-host.json
+            failures=$(python3 -c 'import json; print("; ".join(json.load(open("artifacts/step8/ubuntu-host.json"))["failures"]))')
+            if [ -n "$failures" ] && [ "${{ steps.verify-ubuntu.outcome }}" = "failure" ]; then
+              echo "::error file=host-contract/symphony-target-v1.json::Tier A host contract failures: $failures"
+            fi
+          fi
 
       - name: Compile the exact production helper
         shell: bash
@@ -38,9 +50,18 @@ jobs:
           set -euo pipefail
           # Keep compiler stderr on the job log: this is the build diagnostic,
           # not an operator-facing summary that can erase the cause.
+          set +e
           /usr/bin/cc -std=c11 -O2 -Wall -Wextra -Werror \
             provisioning/quota-admit-task.c \
-            -o artifacts/step8/quota-admit-task
+            -o artifacts/step8/quota-admit-task \
+            2> >(tee artifacts/step8/compiler.stderr >&2)
+          compiler_status=$?
+          set -e
+          if [ "$compiler_status" -ne 0 ]; then
+            diagnostic=$(tr '\n' ' ' < artifacts/step8/compiler.stderr | cut -c1-2000)
+            echo "::error file=provisioning/quota-admit-task.c::Native helper compiler diagnostic: $diagnostic"
+            exit "$compiler_status"
+          fi
           file artifacts/step8/quota-admit-task
           readelf -h artifacts/step8/quota-admit-task
 

@@ -44,8 +44,16 @@ jobs:
           if ($errors.Count -ne 0) { $errors | Out-String | Write-Error; exit 1 }
 
       - name: Run Windows storage and ACL contract tests
+        id: windows-tests
         shell: pwsh
-        run: python -m unittest tests.test_quota_helper_contract -v
+        run: |
+          $output = & python -m unittest tests.test_quota_helper_contract -v 2>&1 | Tee-Object -FilePath artifacts/step8/windows-tests.log
+          if ($LASTEXITCODE -ne 0) {
+            $summary = (($output | Select-String -Pattern 'FAIL|ERROR|AssertionError|Traceback' | Select-Object -First 12) -join ' ')
+            if (-not $summary) { $summary = 'focused Windows storage contract suite failed; see windows-tests.log' }
+            Write-Output "::error file=tests/test_quota_helper_contract.py::$summary"
+            exit $LASTEXITCODE
+          }
 
       - name: Run non-mutating WSL grammar probe when WSL is present
         shell: pwsh
