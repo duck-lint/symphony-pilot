@@ -25,9 +25,16 @@ is used, WSL2 nested virtualization must be enabled. The runner must create
 
 The marker, labels, exact host verification, and trusted repository/ref guard
 are all required before fixture mutation. The target-twin workflow does not
-run for fork pull requests. After each run the runner must be reset or
-reimaged; it is never a production host and is not a generic privileged
-command broker.
+run for fork pull requests. After deployment, the workflow runs the real
+fixed-VHDX attach/provision path and the bounded
+`scripts/step8_target_twin_probe.py` acceptance harness. That harness creates
+one synthetic PREPARED T-N reservation, invokes the deployed quota admission
+control, requires project-ID inheritance plus byte/inode `EDQUOT`, reclaims a
+non-empty task tree through the descriptor-safe unprivileged primitive, and
+releases the reservation only after the fixed helper proves zero usage and
+removed limits. Attach/detach evidence must also prove that only the exact
+fixture device changed. After each run the runner must be reset or reimaged;
+it is never a production host and is not a generic privileged command broker.
 
 External infrastructure still required: one dedicated disposable
 self-hosted Windows runner with the labels and exact target capability above.

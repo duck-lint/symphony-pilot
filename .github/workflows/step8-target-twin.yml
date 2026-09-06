@@ -22,6 +22,9 @@ jobs:
     env:
       SYMPHONY_TARGET_MARKER: C:\SymphonyTargetRunner\runner-marker.json
       SYMPHONY_TARGET_VHDX: C:\ProgramData\SymphonyPilot\symphony-storage.vhdx
+      SYMPHONY_TARGET_SIDECAR: C:\ProgramData\SymphonyPilot\symphony-storage.vhdx.attachment.json
+      SYMPHONY_SOURCE_ROOT: /mnt/f/PROJECT-REPOS/symphony-pilot
+      SYMPHONY_DEPLOYMENT_ROOT: /home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary
     steps:
       - name: Checkout exact trusted branch SHA
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -50,39 +53,103 @@ jobs:
           python scripts/verify_step8_host.py --tier target-twin --observed-file artifacts/step8/target-host.json --output artifacts/step8/target-verification.json
 
       - name: Verify exact source and Runtime candidates
-        shell: bash
+        shell: pwsh
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test -d /home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary
-          test "$(git -C /home/duck-lint/symphony-runtime rev-parse HEAD)" = "c584331afafbb317861ecef338558d88db5a9f2c"
+          $sourceSha = (& wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/git -C $env:SYMPHONY_SOURCE_ROOT rev-parse HEAD).Trim()
+          if ($sourceSha -ne $env:GITHUB_SHA) { throw "target twin source SHA is not the exact workflow SHA" }
+          $runtimeSha = (& wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/git -C /mnt/f/PROJECT-REPOS/symphony-runtime rev-parse HEAD).Trim()
+          if ($runtimeSha -ne "c584331afafbb317861ecef338558d88db5a9f2c") { throw "target twin Runtime SHA is not frozen" }
+          if (-not (Test-Path -LiteralPath $env:SYMPHONY_TARGET_VHDX)) { }
+          elseif (Test-Path -LiteralPath $env:SYMPHONY_TARGET_VHDX -PathType Leaf) { throw "disposable VHDX fixture leaf already exists" }
+          else { throw "disposable VHDX fixture path is not a normal absent leaf" }
+          if (Test-Path -LiteralPath $env:SYMPHONY_TARGET_SIDECAR) { throw "disposable attachment sidecar is not absent" }
 
       - name: Run real Pilot deployment and frozen verifier
         shell: pwsh
         run: |
-          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 /mnt/f/PROJECT-REPOS/symphony-pilot/scripts/deploy.py --project symphony-canary
-          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 /mnt/f/PROJECT-REPOS/symphony-pilot/scripts/project.py --project symphony-canary test
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -B "$env:SYMPHONY_SOURCE_ROOT/scripts/deploy.py" --project symphony-canary
+          if ($LASTEXITCODE -ne 0) { throw "disposable deployment failed" }
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -B "$env:SYMPHONY_SOURCE_ROOT/scripts/project.py" --project symphony-canary test
+          if ($LASTEXITCODE -ne 0) { throw "frozen deployment verification failed" }
+
+      - name: Verify disposable fixture leaves before attachment
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath $env:SYMPHONY_TARGET_VHDX) { throw "disposable VHDX fixture is not clean" }
+          if (Test-Path -LiteralPath $env:SYMPHONY_TARGET_SIDECAR) { throw "disposable attachment cache is not clean" }
 
       - name: Run disposable storage lifecycle through reviewed operator paths
         shell: pwsh
         run: |
           # This job is the only reviewed location allowed to mutate its
           # disposable fixture. Production paths and credentials are absent.
-          $attachOutput = & ./scripts/provision_storage_vhdx.ps1 -Operation Attach
-          if ($LASTEXITCODE -ne 0) { throw "disposable VHDX Attach failed" }
+          $attachOutput = & ./scripts/provision_storage_vhdx.ps1 -Operation Attach 2>&1
+          $attachStatus = $LASTEXITCODE
+          $attachText = ($attachOutput -join [Environment]::NewLine)
+          $attachText | Set-Content -LiteralPath artifacts/step8/attach-output.txt -Encoding utf8NoBOM
+          if ($attachStatus -ne 0) { throw "disposable VHDX Attach failed" }
           $attach = ($attachOutput | Select-Object -Last 1 | ConvertFrom-Json)
+          $attach | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath artifacts/step8/attach-evidence.json -Encoding utf8NoBOM
           if ($attach.LinuxDevice -notmatch '^/dev/[^/]+$') { throw "Attach did not return a bounded Linux device identity" }
-          & wsl.exe -d Ubuntu-24.04 --user root -- /bin/sh /home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary/scripts/provision_storage_domain.sh $attach.LinuxDevice
+          $before = @($attach.LinuxDevicesBefore)
+          $after = @($attach.LinuxDevicesAfter)
+          $added = @($after | Where-Object { $_ -notin $before })
+          $removed = @($before | Where-Object { $_ -notin $after })
+          if ($added.Count -ne 1 -or $added[0] -ne $attach.LinuxDevice -or $removed.Count -ne 0) {
+            throw "Attach evidence does not prove one attributable new Linux whole disk"
+          }
+          if ($after -contains '/dev/sdd' -and $before -notcontains '/dev/sdd') { throw '/dev/sdd appeared during Attach' }
+          & wsl.exe -d Ubuntu-24.04 --user root -- /bin/sh "$env:SYMPHONY_DEPLOYMENT_ROOT/scripts/provision_storage_domain.sh" $attach.LinuxDevice
+          if ($LASTEXITCODE -ne 0) { throw "disposable Linux storage provisioning failed" }
+          $probeOutput = & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -B "$env:SYMPHONY_SOURCE_ROOT/scripts/step8_target_twin_probe.py" 2>&1
+          $probeStatus = $LASTEXITCODE
+          $probeText = ($probeOutput -join [Environment]::NewLine)
+          $probeText | Set-Content -LiteralPath artifacts/step8/storage-probe-output.txt -Encoding utf8NoBOM
+          if ($probeStatus -ne 0) { throw "disposable quota/reclamation probe failed" }
+          $probe = ($probeOutput | Select-Object -Last 1 | ConvertFrom-Json)
+          $probe | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath artifacts/step8/storage-probe-evidence.json -Encoding utf8NoBOM
+          if ($probe.schema -ne 'symphony-pilot-target-twin-storage-probe/v1' -or
+              $probe.workspace_reclaimed -ne $true -or $probe.workspace_absent -ne $true -or
+              $probe.release.quota_state -ne 'removed' -or $probe.release.growth_possible -ne $false -or
+              $probe.reservation_after.status -ne 'released') {
+            throw "disposable quota/reclamation evidence is incomplete"
+          }
 
       - name: Run exact deployment and storage evidence checks
         shell: pwsh
         run: |
-          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 /mnt/f/PROJECT-REPOS/symphony-pilot/scripts/project.py --project symphony-canary test
-          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -m unittest discover -s /mnt/f/PROJECT-REPOS/symphony-pilot/tests -v
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -B "$env:SYMPHONY_SOURCE_ROOT/scripts/project.py" --project symphony-canary test
+          if ($LASTEXITCODE -ne 0) { throw "post-provision deployment verification failed" }
+          & wsl.exe -d Ubuntu-24.04 --user duck-lint -- /usr/bin/python3 -B "$env:SYMPHONY_SOURCE_ROOT/scripts/run_step8_full_suite.py" --log /tmp/step8-target-twin-tests.log
+          if ($LASTEXITCODE -ne 0) { throw "target-twin full Pilot suite failed" }
 
       - name: Detach and clean disposable fixture
         if: always()
         shell: pwsh
-        run: ./scripts/provision_storage_vhdx.ps1 -Operation Detach
+        run: |
+          if (-not (Test-Path -LiteralPath $env:SYMPHONY_TARGET_VHDX -PathType Leaf)) { return }
+          $detachOutput = & ./scripts/provision_storage_vhdx.ps1 -Operation Detach 2>&1
+          $detachStatus = $LASTEXITCODE
+          $detachText = ($detachOutput -join [Environment]::NewLine)
+          $detachText | Set-Content -LiteralPath artifacts/step8/detach-output.txt -Encoding utf8NoBOM
+          if ($detachStatus -ne 0) { throw "disposable VHDX Detach failed" }
+          $detach = ($detachOutput | Select-Object -Last 1 | ConvertFrom-Json)
+          $detach | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath artifacts/step8/detach-evidence.json -Encoding utf8NoBOM
+          $attach = $null
+          if (Test-Path -LiteralPath artifacts/step8/attach-evidence.json -PathType Leaf) {
+            $attach = Get-Content -LiteralPath artifacts/step8/attach-evidence.json -Raw | ConvertFrom-Json
+          }
+          $before = @($detach.LinuxDevicesBefore)
+          $after = @($detach.LinuxDevicesAfter)
+          $removed = @($before | Where-Object { $_ -notin $after })
+          $added = @($after | Where-Object { $_ -notin $before })
+          if ($null -ne $attach -and ($detach.AttachmentAction -ne 'reconciled-detached' -or
+              $removed.Count -ne 1 -or $removed[0] -ne $attach.LinuxDevice -or $added.Count -ne 0)) {
+            throw "Detach evidence does not prove exact-path causal cleanup"
+          }
+          if (Test-Path -LiteralPath $env:SYMPHONY_TARGET_SIDECAR) { throw "attachment sidecar survived Detach" }
+          Remove-Item -LiteralPath $env:SYMPHONY_TARGET_VHDX -Force -ErrorAction Stop
+          if (Test-Path -LiteralPath $env:SYMPHONY_TARGET_VHDX) { throw "disposable VHDX fixture leaf survived cleanup" }
 
       - name: Write final exact-SHA evidence
         if: always()

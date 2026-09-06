@@ -5,9 +5,7 @@
     "windows": {
       "architecture": "AMD64",
       "build_family": "10.0.22631",
-      "build": "10.0.22631.6199",
-      "product_label": "Windows 10 Home",
-      "windows_version": "2009"
+      "build": "10.0.22631.6199"
     },
     "powershell": {
       "edition": "Core",

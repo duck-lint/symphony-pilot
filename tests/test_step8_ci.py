@@ -27,6 +27,9 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("windows", contract["exact_identity"])
         self.assertIn("ubuntu_linux", contract["compatible_buildability"])
         self.assertIn("target_windows_product_label", contract["informational"])
+        self.assertIn("target_windows_version", contract["informational"])
+        self.assertNotIn("product_label", contract["exact_identity"]["windows"])
+        self.assertNotIn("windows_version", contract["exact_identity"]["windows"])
         self.assertEqual(contract["disposable_runner"]["labels"][-1], "symphony-disposable")
 
     def test_host_contract_is_in_source_deployment_digest(self):
@@ -42,6 +45,15 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("windows.build", verify_exact_identity(contract, altered))
         del altered["windows"]["build"]
         self.assertIn("windows.build", verify_exact_identity(contract, altered))
+
+    def test_legacy_windows_labels_are_informational_only(self):
+        contract = load_contract()
+        observed = json.loads(json.dumps(contract["exact_identity"]))
+        observed["windows"].update({
+            "product_label": "Windows 11 Pro",
+            "windows_version": "23H2",
+        })
+        self.assertEqual(verify_exact_identity(contract, observed), [])
 
     def test_ubuntu_buildability_verifier_accepts_compatible_userspace(self):
         contract = load_contract()
@@ -93,6 +105,22 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("github.repository == 'duck-lint/symphony-pilot'", workflow)
         self.assertIn("disposable target runner marker is absent", workflow)
         self.assertIn("contents: read", workflow)
+
+    def test_tier_c_contains_real_storage_acceptance_probes_and_bounded_cleanup(self):
+        workflow = (ROOT / ".github/workflows/step8-target-twin.yml").read_text()
+        probe = (ROOT / "scripts/step8_target_twin_probe.py").read_text()
+        for token in (
+            "step8_target_twin_probe.py", "quota-admit-task", "quota-release-task",
+            "workspace_reclaimed", "reservation_after", "LinuxDevicesBefore",
+            "LinuxDevicesAfter", "reconciled-detached", "Remove-Item -LiteralPath $env:SYMPHONY_TARGET_VHDX",
+        ):
+            self.assertIn(token, workflow + probe)
+        for token in (
+            "task_quota_binding_from_evidence", "create_empty_task_workspace",
+            "reclaim_task_workspace", "storage_release_proof_from_evidence",
+            "PROJINHERIT", "EDQUOT",
+        ):
+            self.assertIn(token, probe)
 
     def test_evidence_writer_binds_sha_and_contract_digest(self):
         writer = (ROOT / "scripts/write_step8_evidence.py").read_text()
