@@ -74,8 +74,8 @@ jobs:
           python3 -m unittest discover -s tests -v 2>&1 | tee artifacts/step8/full-suite.log
           suite_status=${PIPESTATUS[0]}
           if [ "$suite_status" -ne 0 ]; then
-            failures=$(grep -E 'FAIL|ERROR|Traceback|AssertionError' artifacts/step8/full-suite.log | head -c 2000 | tr '\n' ' ' || true)
-            echo "::error file=tests::Tier A full-suite diagnostic: $failures"
+            diagnostic=$(tail -n 120 artifacts/step8/full-suite.log | tr '\n' ' ' | cut -c1-3000)
+            echo "::error file=tests::Tier A full-suite diagnostic: $diagnostic"
             exit "$suite_status"
           fi
 
