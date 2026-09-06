@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -32,9 +35,20 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertNotIn("windows_version", contract["exact_identity"]["windows"])
         self.assertEqual(contract["disposable_runner"]["labels"][-1], "symphony-disposable")
 
-    def test_host_contract_is_in_source_deployment_digest(self):
+    def test_host_contract_is_ci_metadata_not_production_deployment_authority(self):
         import deployment_contract
-        self.assertIn("host-contract/symphony-target-v1.json", deployment_contract.CONTRACT_FILES)
+        self.assertNotIn("host-contract/symphony-target-v1.json", deployment_contract.CONTRACT_FILES)
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            for relative in deployment_contract.CONTRACT_FILES:
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / relative).read_bytes())
+            before = deployment_contract.contract_digest(source)
+            host_metadata = source / "host-contract/symphony-target-v1.json"
+            host_metadata.parent.mkdir(parents=True, exist_ok=True)
+            host_metadata.write_text("{\"informational\":\"changed CI observation\"}\n", encoding="utf-8")
+            self.assertEqual(before, deployment_contract.contract_digest(source))
 
     def test_exact_identity_verifier_requires_every_exact_field(self):
         contract = load_contract()
@@ -100,6 +114,7 @@ class Step8CiContractTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/step8-target-twin.yml").read_text()
         trigger = workflow[workflow.index("on:"):workflow.index("permissions:")]
         self.assertNotIn("pull_request", trigger)
+        self.assertNotIn("push:", trigger)
         for label in ("self-hosted", "windows", "x64", "symphony-target", "symphony-disposable"):
             self.assertIn(label, workflow)
         self.assertIn("github.repository == 'duck-lint/symphony-pilot'", workflow)
@@ -136,6 +151,100 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("result.failure_records", runner)
         self.assertIn('"symphony-pilot-step8-test-result/v1"', runner)
         self.assertIn("::error file=tests::", runner)
+
+    def test_production_paths_do_not_require_observed_platform_patch_versions(self):
+        production_files = [
+            *(ROOT / "runtime").rglob("*.py"),
+            *(ROOT / "scripts").glob("*.py"),
+            *(ROOT / "scripts").glob("*.ps1"),
+            *(ROOT / "scripts").glob("*.sh"),
+            *(ROOT / "provisioning").glob("*.c"),
+        ]
+        forbidden_observations = (
+            "10.0.22631.6199", "2.7.12.0", "6.18.33.2-2",
+            "24.04.4 LTS", "13.3.0-6ubuntu2~24.04.1",
+            "2.39-0ubuntu8.8", "1.47.0", "2.39.3", "Windows 10 Home",
+        )
+        for path in production_files:
+            text = path.read_text(encoding="utf-8")
+            for observed in forbidden_observations:
+                self.assertNotIn(observed, text, f"patch identity leaked into production: {path}")
+
+    def test_recovery_operator_is_fixed_path_capability_driven_and_idempotent(self):
+        script = (ROOT / "scripts/recover_storage_after_boot.ps1").read_text(encoding="utf-8")
+        self.assertIn("param()", script)
+        self.assertIn('C:\\ProgramData\\SymphonyPilot\\symphony-storage.vhdx', script)
+        self.assertIn('$ExpectedOperatorRoot = Join-Path $ExpectedSourceRoot "scripts"', script)
+        self.assertIn('& $AttachScript -Operation Attach', script)
+        self.assertIn('Status = "reconciliation-required"', script)
+        self.assertIn('Get-MountedPoolEvidence -RequireIdentity', script)
+        self.assertIn('Invoke-DeployedProvisioner $device', script)
+        self.assertIn('Invoke-QuotaPoolVerification', script)
+        self.assertIn('storage-domain.identity.json', script)
+        self.assertIn('filesystem_uuid -ne $fields["UUID"]', script)
+        self.assertNotIn("mkfs.ext4", script)
+        self.assertNotIn("New-VHD", script)
+        self.assertNotIn("Mount-VHD", script)
+        self.assertNotIn("Dismount-VHD", script)
+        self.assertLess(script.index("Invoke-ReviewedAttach"), script.index("Invoke-DeployedProvisioner"))
+        self.assertLess(script.index("Invoke-DeployedProvisioner"), script.index("Invoke-QuotaPoolVerification"))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_recovery_operator_routes_attach_and_existing_mount_without_live_commands(self):
+        script_path = (ROOT / "scripts/recover_storage_after_boot.ps1").as_posix()
+        command = f'''$script = '{script_path}'; . $script
+$global:events = @()
+function Assert-Elevated {{}}
+function Assert-FixedOperatorPaths {{}}
+function Invoke-ReviewedAttach {{
+    [pscustomobject]@{{ Status = "attached"; Evidence = [pscustomobject]@{{
+        VhdPath = $ExpectedPath; VhdType = "Fixed"; VirtualSizeBytes = $ExpectedBytes;
+        ProviderSubtype = 2; AttachmentAction = "attached"; LinuxDevice = "/dev/sdf"
+    }} }}
+}}
+function Get-MountedPoolEvidence {{ param([switch]$RequireIdentity)
+    [pscustomobject]@{{ LinuxDevice = "/dev/sdf"; FilesystemUuid = "3fe37adf-5873-4cbe-a656-0820f93def0" }}
+}}
+function Invoke-DeployedProvisioner {{ param([string]$LinuxDevice) $global:events += "provision:$LinuxDevice" }}
+function Invoke-QuotaPoolVerification {{ $global:events += "verify-pool" }}
+$first = Invoke-StorageRecovery | ConvertFrom-Json
+if ($first.AttachmentRoute -ne "attached" -or ($global:events -join ",") -ne "provision:/dev/sdf,verify-pool") {{ exit 1 }}
+function Invoke-ReviewedAttach {{ [pscustomobject]@{{ Status = "reconciliation-required"; Evidence = $null }} }}
+$global:events = @()
+$second = Invoke-StorageRecovery | ConvertFrom-Json
+if ($second.AttachmentRoute -ne "reconciliation-required" -or ($global:events -join ",") -ne "provision:/dev/sdf,verify-pool") {{ exit 2 }}
+Write-Output "Recovery route harness: PASS"'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Recovery route harness: PASS", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_recovery_operator_rejects_changed_existing_uuid_before_provision(self):
+        script_path = (ROOT / "scripts/recover_storage_after_boot.ps1").as_posix()
+        command = f'''$script = '{script_path}'; . $script
+function Invoke-FixedLinuxCommand {{ param([string[]]$Arguments)
+    $output = switch ($Arguments[0]) {{
+        "/usr/bin/findmnt" {{ if ($Arguments[3] -eq "TARGET") {{ "/home/duck-lint/symphony-workspaces" }} elseif ($Arguments[3] -eq "SOURCE") {{ "/dev/sdf" }} elseif ($Arguments[3] -eq "FSTYPE") {{ "ext4" }} else {{ "rw,prjquota" }} }}
+        "/usr/sbin/blkid" {{ "TYPE=ext4`nLABEL=SYMPHONY-POOL`nUUID=3fe37adf-5873-4cbe-a656-0820f93def0f" }}
+        "/usr/sbin/blockdev" {{ "68719476736" }}
+        "/usr/sbin/tune2fs" {{ "Filesystem features:    has_journal project quota`nProject quota inode: 12`nReserved block count: 0" }}
+        "/usr/bin/cat" {{ '{{"schema":"symphony-pilot-storage-domain/v1","pool_label":"SYMPHONY-POOL","filesystem":"ext4","mount_target":"/home/duck-lint/symphony-workspaces","filesystem_uuid":"00000000-0000-0000-0000-000000000000"}}' }}
+    }}
+    [pscustomobject]@{{ ExitCode = 0; Output = [string]$output }}
+}}
+try {{ Get-MountedPoolEvidence -RequireIdentity; exit 1 }} catch {{
+    if ($_.Exception.Message -notmatch "UUID differs from the accepted storage identity") {{ throw }}
+}}
+Write-Output "Changed UUID harness: PASS"'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Changed UUID harness: PASS", result.stdout)
 
 
 if __name__ == "__main__":

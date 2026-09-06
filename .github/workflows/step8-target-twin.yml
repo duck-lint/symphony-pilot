@@ -1,9 +1,6 @@
 name: Symphony Step 8 disposable target twin
 
 on:
-  push:
-    branches:
-      - codex/step-8-deployment-immutability
   workflow_dispatch:
 
 permissions:
