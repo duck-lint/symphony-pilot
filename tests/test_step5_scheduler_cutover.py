@@ -24,6 +24,7 @@ import project
 import render_workflow
 import task
 import wsl_adapter
+import wsl_storage
 from storage import StorageAdmissionProof, VerifiedStorageDomain
 from tests.storage_support import admission_proof
 
@@ -224,7 +225,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         database.read_storage_reservation.return_value = {
             "status": "reserved", "project_slug": "alpha",
         }
-        with mock.patch.object(wsl_adapter, "admit_task_quota", return_value=evidence):
+        with mock.patch.object(wsl_storage, "admit_task_quota", return_value=evidence):
             admission = task.verify_profile_storage(
                 profile, "T-000001", database=database,
                 task_id="11111111-1111-1111-1111-111111111111",

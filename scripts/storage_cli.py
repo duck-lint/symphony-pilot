@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Trusted operator verification and cleanup of registered storage.
 
-Linux work is restricted to fixed quota capabilities exposed by the WSL
-adapter. This command never provisions devices, selects quota IDs, or accepts
-paths and limits from the caller. Release is a trusted PREPARED-admission
-recovery route: it destroys the exact task tree before asking the fixed helper
-to prove that the quota identity is empty and removed.
+Linux work is restricted to fixed quota capabilities exposed by the
+WSL-native storage transport. This command never provisions devices, selects
+quota IDs, or accepts paths and limits from the caller. Release is a trusted
+PREPARED-admission recovery route: it destroys the exact task tree before
+asking the fixed helper to prove that the quota identity is empty and removed.
 """
 from __future__ import annotations
 
@@ -25,19 +25,19 @@ from workspace_boundary import (WorkspaceBoundaryError,
 from storage import (StorageContractError, capacity_snapshot,
                      storage_release_proof_from_evidence,
                      verify_storage_evidence)  # noqa: E402
+import wsl_storage  # noqa: E402
 
 
 def verify(args: argparse.Namespace) -> int:
     profile = resolve_project(args.project, ROOT / "projects")
-    from wsl_adapter import WslAdapterError, inspect_quota
 
     try:
-        evidence = inspect_quota(profile.slug, request_id=f"storage-{profile.slug}-verify")
+        evidence = wsl_storage.inspect_quota(profile.slug, request_id=f"storage-{profile.slug}-verify")
         domain = verify_storage_evidence(
             profile.slug, evidence, profile.storage_policy,
             expected_target=str(profile.workspace_root.parent),
         )
-    except (WslAdapterError, StorageContractError) as exc:
+    except (wsl_storage.WslStorageError, StorageContractError) as exc:
         raise ControlPlaneError(f"storage domain verification failed closed: {exc}") from exc
     with ControlPlaneDatabase.open(default_database_path()) as database:
         saved = database.record_storage_domain(domain)
@@ -53,7 +53,6 @@ def verify(args: argparse.Namespace) -> int:
 
 def release(args: argparse.Namespace) -> int:
     profile = resolve_project(args.project, ROOT / "projects")
-    from wsl_adapter import WslAdapterError, release_task_quota
 
     with ControlPlaneDatabase.open(default_database_path()) as database:
         task = database.read_task_by_identifier(args.task, project_slug=profile.slug)
@@ -73,7 +72,7 @@ def release(args: argparse.Namespace) -> int:
                 profile.slug,
                 str(task["identifier"]),
             )
-            evidence = release_task_quota(
+            evidence = wsl_storage.release_task_quota(
                 profile.slug, str(task["identifier"]),
                 request_id=f"storage-{profile.slug}-{task['identifier']}-release",
             )
@@ -81,7 +80,7 @@ def release(args: argparse.Namespace) -> int:
                 evidence, project=profile.slug, identifier=str(task["identifier"]),
             )
             released = database.release_storage_reservation(task["id"], proof=proof)
-        except (WslAdapterError, StorageContractError, WorkspaceBoundaryError) as exc:
+        except (wsl_storage.WslStorageError, StorageContractError, WorkspaceBoundaryError) as exc:
             raise ControlPlaneError(f"storage cleanup failed closed: {exc}") from exc
     print(json.dumps({"project": profile.slug, "task": task["identifier"],
                       "reservation": released}, sort_keys=True))

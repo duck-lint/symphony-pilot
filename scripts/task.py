@@ -27,6 +27,7 @@ from workspace_boundary import (WorkspaceBoundaryError,
 from storage import (StorageAdmissionProof, StorageContractError,
                      task_quota_binding_from_evidence,
                      verify_storage_evidence)  # noqa: E402
+import wsl_storage  # noqa: E402
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -120,14 +121,13 @@ def verify_profile_storage(profile, identifier: str, *, database, task_id: str):
             reservation["project_slug"] != profile.slug):
         raise TaskCommandError("exact durable storage reservation is required before quota mutation")
     try:
-        from wsl_adapter import WslAdapterError, admit_task_quota
-        evidence = admit_task_quota(
+        evidence = wsl_storage.admit_task_quota(
             profile.slug, identifier,
             byte_limit=profile.storage_policy.task_bytes,
             inode_limit=profile.storage_policy.task_inodes,
             request_id=f"storage-{profile.slug}-{identifier}-admission",
         )
-    except WslAdapterError as exc:
+    except wsl_storage.WslStorageError as exc:
         raise TaskCommandError(f"trusted storage capability is unavailable: {exc.kind}") from exc
     try:
         pool_evidence = evidence.get("pool")
@@ -151,15 +151,14 @@ def verify_profile_storage(profile, identifier: str, *, database, task_id: str):
 def verify_profile_storage_pool(profile):
     """Obtain only the shared-pool proof before reserving capacity."""
     try:
-        from wsl_adapter import WslAdapterError, inspect_quota
-        evidence = inspect_quota(
+        evidence = wsl_storage.inspect_quota(
             profile.slug, request_id=f"storage-{profile.slug}-pool-admission",
         )
         return verify_storage_evidence(
             profile.slug, evidence, profile.storage_policy,
             expected_target=str(profile.workspace_root.parent),
         )
-    except (WslAdapterError, StorageContractError) as exc:
+    except (wsl_storage.WslStorageError, StorageContractError) as exc:
         raise TaskCommandError(f"trusted storage pool capability is unavailable: {exc}") from exc
 
 

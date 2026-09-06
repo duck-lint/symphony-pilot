@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import control_db
 import storage_cli
+import wsl_storage
 from storage import GIB, StoragePolicy, VerifiedStorageDomain
 from tests.storage_support import queue_task
 
@@ -57,12 +58,11 @@ class StorageReleaseLifecycleTests(unittest.TestCase):
         }
 
     def call_release(self, database_path, profile, *, reclaim=storage_cli.reclaim_task_workspace, helper=None):
-        import wsl_adapter
         args = argparse.Namespace(project="demo", task="T-000001")
         with mock.patch.object(storage_cli, "default_database_path", return_value=database_path), \
              mock.patch.object(storage_cli, "resolve_project", return_value=profile), \
              mock.patch.object(storage_cli, "reclaim_task_workspace", side_effect=reclaim) as reclaim_mock, \
-             mock.patch.object(wsl_adapter, "release_task_quota", side_effect=helper) as helper_mock:
+             mock.patch.object(wsl_storage, "release_task_quota", side_effect=helper) as helper_mock:
             result = storage_cli.release(args)
         return result, reclaim_mock, helper_mock
 
@@ -108,12 +108,11 @@ class StorageReleaseLifecycleTests(unittest.TestCase):
             workspace = root / "pool" / "demo" / "T-000001"
             workspace.mkdir(parents=True)
             (workspace / "partial").write_text("partial", encoding="utf-8")
-            import wsl_adapter
             with self.assertRaises(control_db.ControlPlaneError):
                 self.call_release(
                     database_path, self.profile(root / "pool"),
                     helper=lambda *args, **kwargs: (_ for _ in ()).throw(
-                        wsl_adapter.WslAdapterError("quota_cleanup", "failed")
+                        wsl_storage.WslStorageError("quota_cleanup", "failed")
                     ),
                 )
             self.assertFalse(workspace.exists())

@@ -25,6 +25,7 @@ CONTRACT_FILES = (
     "scripts/project.py",
     "scripts/task.py",
     "scripts/storage_cli.py",
+    "scripts/wsl_storage.py",
     "runtime/after_run.py",
     "runtime/before_run.py",
     "runtime/lifecycle.py",
