@@ -294,6 +294,40 @@ Write-Output "Changed UUID harness: PASS"'''
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Changed UUID harness: PASS", result.stdout)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_recovery_blockdev_uses_supported_argument_grammar(self):
+        script_path = (ROOT / "scripts/recover_storage_after_boot.ps1").as_posix()
+        command = f'''$script = '{script_path}'; . $script
+$global:invocations = @()
+function Invoke-FixedLinuxCommand {{ param([string[]]$Arguments)
+    $global:invocations += ,$Arguments
+    $output = switch ($Arguments[0]) {{
+        "/usr/bin/findmnt" {{
+            if ($Arguments[3] -eq "TARGET") {{ "/home/duck-lint/symphony-workspaces" }}
+            elseif ($Arguments[3] -eq "SOURCE") {{ "/dev/sdf" }}
+            elseif ($Arguments[3] -eq "FSTYPE") {{ "ext4" }}
+            else {{ "rw,prjquota" }}
+        }}
+        "/usr/sbin/blkid" {{ "TYPE=ext4`nLABEL=SYMPHONY-POOL`nUUID=3fe37adf-5873-4cbe-a656-0820f93def0f" }}
+        "/usr/sbin/blockdev" {{ "68719476736" }}
+        "/usr/sbin/tune2fs" {{ "Filesystem features:    has_journal project quota`nProject quota inode: 12`nReserved block count: 0" }}
+        "/usr/bin/cat" {{ $null }}
+    }}
+    [pscustomobject]@{{ ExitCode = if ($Arguments[0] -eq "/usr/bin/cat") {{ 1 }} else {{ 0 }}; Output = [string]$output }}
+}}
+Get-MountedPoolEvidence
+$blockdev = @($global:invocations | Where-Object {{ $_[0] -eq "/usr/sbin/blockdev" }})
+if ($blockdev.Count -ne 1) {{ exit 1 }}
+if (($blockdev[0] -join "|") -ne "/usr/sbin/blockdev|--getsize64|/dev/sdf") {{ exit 2 }}
+if ($blockdev[0] -contains "--") {{ exit 3 }}
+Write-Output "blockdev grammar harness: PASS"'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("blockdev grammar harness: PASS", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

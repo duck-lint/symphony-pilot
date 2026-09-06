@@ -128,7 +128,7 @@ function Get-MountedPoolEvidence {
         $fields["UUID"] -notmatch '^[0-9a-fA-F-]{36}$') {
         Fail-Recovery "the existing filesystem identity is not the accepted Symphony pool"
     }
-    $size = Invoke-FixedLinuxCommand @("/usr/sbin/blockdev", "--getsize64", "--", $device)
+    $size = Invoke-FixedLinuxCommand @("/usr/sbin/blockdev", "--getsize64", $device)
     if ($size.ExitCode -ne 0 -or $size.Output.Trim() -ne [string]$ExpectedBytes) {
         Fail-Recovery "the mounted dedicated device is not exactly 64 GiB"
     }
