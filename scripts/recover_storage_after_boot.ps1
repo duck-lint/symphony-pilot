@@ -16,7 +16,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ExpectedSourceRoot = "F:\PROJECT-REPOS\symphony-pilot"
+$ExpectedSourceRoot = "F:\PROJECT-REPOS\SYMPHONY\symphony-pilot"
 $ExpectedOperatorRoot = Join-Path $ExpectedSourceRoot "scripts"
 $ExpectedPath = "C:\ProgramData\SymphonyPilot\symphony-storage.vhdx"
 $ExpectedBytes = [int64]64GB
