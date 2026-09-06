@@ -175,7 +175,12 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("param()", script)
         self.assertIn('C:\\ProgramData\\SymphonyPilot\\symphony-storage.vhdx', script)
         self.assertIn('$ExpectedOperatorRoot = Join-Path $ExpectedSourceRoot "scripts"', script)
-        self.assertIn('& $AttachScript -Operation Attach', script)
+        self.assertIn('function Invoke-IsolatedAttachOperator', script)
+        self.assertIn('"-NoProfile", "-NonInteractive", "-File", $AttachScript', script)
+        self.assertIn('"-Operation", "Attach"', script)
+        self.assertIn('$start.ArgumentList.Add($argument)', script)
+        self.assertIn('Stdout = $stdoutTask.GetAwaiter().GetResult().Trim()', script)
+        self.assertIn('Stderr = $stderrTask.GetAwaiter().GetResult().Trim()', script)
         self.assertIn('Status = "reconciliation-required"', script)
         self.assertIn('Get-MountedPoolEvidence -RequireIdentity', script)
         self.assertIn('Invoke-DeployedProvisioner $device', script)
@@ -188,6 +193,49 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertNotIn("Dismount-VHD", script)
         self.assertLess(script.index("Invoke-ReviewedAttach"), script.index("Invoke-DeployedProvisioner"))
         self.assertLess(script.index("Invoke-DeployedProvisioner"), script.index("Invoke-QuotaPoolVerification"))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_isolated_attach_child_process_composition_is_bounded(self):
+        script_path = (ROOT / "scripts/recover_storage_after_boot.ps1").as_posix()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_root = pathlib.Path(directory)
+            success_fixture = fixture_root / "success.ps1"
+            success_fixture.write_text(
+                "$evidence = [ordered]@{ VhdPath = 'C:\\ProgramData\\SymphonyPilot\\symphony-storage.vhdx'; "
+                "VhdType = 'Fixed'; VirtualSizeBytes = 68719476736; ProviderSubtype = 2; "
+                "AttachmentAction = 'attached'; LinuxDevice = '/dev/sdf' }\n"
+                "$evidence | ConvertTo-Json -Compress\nexit 0\n", encoding="utf-8",
+            )
+            reconciliation_fixture = fixture_root / "reconciliation.ps1"
+            reconciliation_fixture.write_text(
+                '$exception = New-Object System.InvalidOperationException -ArgumentList '
+                '"attachment reconciliation required before Attach can proceed"\n'
+                '$record = New-Object System.Management.Automation.ErrorRecord -ArgumentList @('
+                '$exception, "VhdxReconciliationRequired", '
+                '[System.Management.Automation.ErrorCategory]::ResourceBusy, "fixed-vhdx")\n'
+                'throw $record\n', encoding="utf-8",
+            )
+            unrelated_fixture = fixture_root / "unrelated.ps1"
+            unrelated_fixture.write_text('throw "unrelated terminating failure"\n', encoding="utf-8")
+            command = f'''$script = '{script_path}'; . $script
+$PowerShell = [IO.Path]::Combine($PSHOME, "pwsh.exe")
+$AttachScript = '{success_fixture.as_posix()}'
+$success = Invoke-ReviewedAttach
+if ($success.Status -ne "attached" -or $success.Evidence.LinuxDevice -ne "/dev/sdf") {{ exit 1 }}
+$AttachScript = '{reconciliation_fixture.as_posix()}'
+$reconciled = Invoke-ReviewedAttach
+if ($reconciled.Status -ne "reconciliation-required") {{ exit 2 }}
+$AttachScript = '{unrelated_fixture.as_posix()}'
+try {{ Invoke-ReviewedAttach; exit 3 }} catch {{
+    if ($_.Exception.Message -notmatch "reviewed VHDX Attach failed") {{ throw }}
+}}
+Write-Output "Isolated Attach harness: PASS"'''
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Isolated Attach harness: PASS", result.stdout)
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
     def test_recovery_operator_routes_attach_and_existing_mount_without_live_commands(self):

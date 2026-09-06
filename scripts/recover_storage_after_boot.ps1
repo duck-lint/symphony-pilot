@@ -22,6 +22,7 @@ $ExpectedPath = "C:\ProgramData\SymphonyPilot\symphony-storage.vhdx"
 $ExpectedBytes = [int64]64GB
 $Distribution = "Ubuntu-24.04"
 $Wsl = [IO.Path]::Combine($env:SystemRoot, "System32", "wsl.exe")
+$PowerShell = [IO.Path]::Combine($PSHOME, "pwsh.exe")
 $AttachScript = Join-Path $ExpectedOperatorRoot "provision_storage_vhdx.ps1"
 $Provisioner = "/home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary/scripts/provision_storage_domain.sh"
 $PoolRoot = "/home/duck-lint/symphony-workspaces"
@@ -163,9 +164,55 @@ function Get-MountedPoolEvidence {
     }
 }
 
+function Invoke-IsolatedAttachOperator {
+    if (-not (Test-Path -LiteralPath $PowerShell -PathType Leaf)) {
+        Fail-Recovery "the current trusted PowerShell 7 executable is unavailable"
+    }
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $PowerShell
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    # ArgumentList performs native argv construction.  There is no shell,
+    # caller-provided text, or selectable operation/path in this entry point.
+    foreach ($argument in @(
+        "-NoProfile", "-NonInteractive", "-File", $AttachScript,
+        "-Operation", "Attach"
+    )) {
+        [void]$start.ArgumentList.Add($argument)
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) {
+            Fail-Recovery "the isolated VHDX Attach operator could not be started"
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            Stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+            Stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+        }
+    }
+    catch [System.Management.Automation.RuntimeException] {
+        throw
+    }
+    catch {
+        Fail-Recovery "the isolated VHDX Attach operator failed to execute"
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Invoke-ReviewedAttach {
-    $output = (& $AttachScript -Operation Attach 2>&1 | Out-String).Trim()
-    $exitCode = [int]$LASTEXITCODE
+    $child = Invoke-IsolatedAttachOperator
+    $output = $child.Stdout
+    $diagnostic = ($child.Stdout + "`n" + $child.Stderr).Trim()
+    $exitCode = $child.ExitCode
     if ($exitCode -eq 0) {
         $jsonLine = ($output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
         try { $evidence = $jsonLine | ConvertFrom-Json }
@@ -183,8 +230,15 @@ function Invoke-ReviewedAttach {
     # Existing Attach intentionally refuses cached/ambiguous attachment
     # identity.  Only that typed reconciliation route may fall through to a
     # read-only accepted-mount proof; every other Attach failure is fatal.
-    if ($output -match "attachment reconciliation required before Attach can proceed" -or
-        $output -match "untracked exact-size Linux disk is a conflicting attachment") {
+    # Native child-process formatting preserves the reviewed terminating
+    # message, but not PowerShell's in-process ErrorRecord metadata.  The
+    # exact message is therefore the bounded cross-process representation of
+    # VhdxReconciliationRequired here; no broader error text is accepted.
+    $reconciliationMessage = $child.Stderr -match
+        "attachment reconciliation required before Attach can proceed"
+    $messageReconciliation = $diagnostic -match
+        "untracked exact-size Linux disk is a conflicting attachment"
+    if ($reconciliationMessage -or $messageReconciliation) {
         return [pscustomobject]@{ Status = "reconciliation-required"; Evidence = $null }
     }
     Fail-Recovery "the reviewed VHDX Attach failed"
