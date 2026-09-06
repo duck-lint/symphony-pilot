@@ -38,13 +38,16 @@ jobs:
       - name: Record hosted WSL grammar availability
         shell: pwsh
         run: |
-          $wsl = Join-Path $env:SystemRoot "System32\wsl.exe"
           $available = $false
-          $help = ""
-          if (Test-Path -LiteralPath $wsl -PathType Leaf) {
-            $help = (& $wsl --help 2>&1 | Out-String)
-            $available = $help -match '(?m)--mount' -and $help -match '(?m)--vhd' -and
-              $help -match '(?m)--bare' -and $help -match '(?m)--unmount'
+          try {
+            $wsl = Join-Path $env:SystemRoot "System32\wsl.exe"
+            if (Test-Path -LiteralPath $wsl -PathType Leaf) {
+              $help = (& $wsl --help 2>&1 | Out-String)
+              $available = $help -match '(?m)--mount' -and $help -match '(?m)--vhd' -and
+                $help -match '(?m)--bare' -and $help -match '(?m)--unmount'
+            }
+          } catch {
+            Write-Warning "hosted WSL grammar probe raised a bounded platform error: $($_.Exception.Message)"
           }
           $document = Get-Content -LiteralPath artifacts/step8/windows-host.json -Raw | ConvertFrom-Json
           $document | Add-Member -NotePropertyName wsl_grammar -NotePropertyValue ([ordered]@{
