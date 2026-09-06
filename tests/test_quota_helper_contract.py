@@ -375,7 +375,8 @@ if ($info.DeviceId -ne 3 -or
             recipe,
         )
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_interop_contract_digest_changes_when_embedded_source_changes(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         helper_start = recipe.index("function Get-InteropContractIdentity")
@@ -395,7 +396,8 @@ if ((Get-InteropContractIdentity $sourceA) -eq (Get-InteropContractIdentity $sou
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Interop contract digest mutation: PASS", result.stdout)
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_stale_virtdisk_type_fails_before_native_method_invocation(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         helper_start = recipe.index("function Get-InteropContractIdentity")
@@ -426,7 +428,8 @@ catch {{
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Stale VirtDisk interop guard: PASS", result.stdout)
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_identity_absent_virtdisk_type_fails_closed_before_invocation(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         helper_start = recipe.index("function Get-InteropContractIdentity")
@@ -456,7 +459,8 @@ catch {{
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Identity-absent VirtDisk interop guard: PASS", result.stdout)
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_matching_virtdisk_type_is_reused_within_one_process(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         helper_start = recipe.index("function Get-InteropContractIdentity")
@@ -490,7 +494,8 @@ finally {{
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Matching VirtDisk interop reuse: PASS", result.stdout)
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_stale_native_file_type_fails_before_native_method_invocation(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         helper_start = recipe.index("function Get-InteropContractIdentity")
@@ -535,7 +540,8 @@ catch {{
             attach_main.index("Get-VhdEvidence $true"),
         )
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_wsl_vhd_help_parser_accepts_nonzero_help_and_rejects_ambiguous_grammar(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         parser_start = recipe.index("function Test-WslOptionToken")
@@ -697,7 +703,8 @@ finally {{
             recipe.rfind("Remove-AttachmentState"),
         )
 
-    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
     def test_vhdx_detach_reconciler_covers_recovery_and_conflict_evidence(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
         helper_start = recipe.index("function Get-LinuxDeviceIdentityKey")

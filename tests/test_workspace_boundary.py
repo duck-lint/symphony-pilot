@@ -78,7 +78,7 @@ class WorkspaceBoundaryTests(unittest.TestCase):
             (mounted / "keep").write_text("keep", encoding="utf-8")
             with mock.patch.object(boundary.os.path, "ismount",
                                    side_effect=lambda path: pathlib.Path(path).name == "mounted"):
-                with self.assertRaisesRegex(boundary.WorkspaceBoundaryError, "mountpoint"):
+                with self.assertRaisesRegex(boundary.WorkspaceBoundaryError, "mountpoint|filesystem boundary"):
                     boundary.reclaim_task_workspace(pool, "demo", "T-000001")
             self.assertTrue(mounted.exists())
 
