@@ -80,6 +80,7 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("runs-on: windows-2022", workflow)
         self.assertIn("collect_step8_windows_observation.ps1", workflow)
         self.assertIn("--tier windows-native", workflow)
+        self.assertIn("continue-on-error: true", workflow)
         self.assertIn("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", workflow)
         self.assertIn("contents: read", workflow)
 

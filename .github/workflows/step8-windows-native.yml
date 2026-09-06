@@ -36,6 +36,7 @@ jobs:
         run: ./scripts/collect_step8_windows_observation.ps1 -OutputPath artifacts/step8/windows-host.json
 
       - name: Record hosted WSL grammar availability
+        continue-on-error: true
         shell: pwsh
         run: |
           $available = $false
