@@ -604,6 +604,10 @@ if (Test-WslVhdHelpGrammar "") {{ exit 1 }}
         self.assertIn("AreAccessRulesProtected", recipe)
         self.assertIn("SetAccessRuleProtection($true, $false)", recipe)
         self.assertIn("FileSystemRights]::FullControl", recipe)
+        self.assertIn("function Assert-VhdxFileAcl", recipe)
+        self.assertIn("S-1-5-83-[0-9-]+", recipe)
+        self.assertIn("S-1-15-3-[0-9-]+", recipe)
+        self.assertIn("Assert-VhdxFileAcl $ExpectedPath", recipe)
         self.assertIn("NTAccount", recipe)
         self.assertIn("IdentityReference", recipe)
         self.assertIn("IsNullOrWhiteSpace", recipe)
@@ -683,6 +687,60 @@ finally {{
             self.skipTest("temporary ACL smoke test requires elevation")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ACL normalization smoke: PASS", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_vhdx_file_acl_accepts_only_reviewed_windows_managed_identities(self):
+        recipe = (ROOT / "scripts/provision_storage_vhdx.ps1").read_text()
+        convert_start = recipe.index("function ConvertTo-SidValue")
+        set_start = recipe.index("function Set-OperatorStateAcl")
+        functions = recipe[convert_start:set_start]
+        command = f'''$ErrorActionPreference = "Stop"
+$OperatorAdminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+$OperatorSystemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+{functions}
+function Get-Item {{ [pscustomobject]@{{ PSIsContainer = $false; Attributes = [IO.FileAttributes]::Normal }} }}
+function Get-Acl {{ $script:fakeAcl }}
+function New-Rule($sid, $type = "Allow", $inherit = 0, $propagation = 0, $rights = ([int][System.Security.AccessControl.FileSystemRights]::FullControl)) {{
+    [pscustomobject]@{{
+        IdentityReference = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        AccessControlType = [System.Security.AccessControl.AccessControlType]::$type
+        InheritanceFlags = [System.Security.AccessControl.InheritanceFlags]$inherit
+        PropagationFlags = [System.Security.AccessControl.PropagationFlags]$propagation
+        FileSystemRights = [System.Security.AccessControl.FileSystemRights]$rights
+    }}
+}}
+$stable = @(
+    (New-Rule "S-1-5-18" -rights ([int][System.Security.AccessControl.FileSystemRights]::FullControl)),
+    (New-Rule "S-1-5-32-544" -rights ([int][System.Security.AccessControl.FileSystemRights]::FullControl))
+)
+$script:fakeAcl = [pscustomobject]@{{ AreAccessRulesProtected = $true; Owner = $OperatorAdminSid; Access = $stable }}
+Assert-VhdxFileAcl "C:\\ProgramData\\SymphonyPilot\\symphony-storage.vhdx"
+$script:fakeAcl.Access = $stable + @(
+    (New-Rule "S-1-5-83-123456789-987654321-111111111-222222222"),
+    (New-Rule "S-1-15-3-1024-999999999-888888888-777777777")
+)
+Assert-VhdxFileAcl "C:\\ProgramData\\SymphonyPilot\\symphony-storage.vhdx"
+function Expect-Reject($rules, $protected = $true) {{
+    $script:fakeAcl = [pscustomobject]@{{ AreAccessRulesProtected = $protected; Owner = $OperatorAdminSid; Access = $rules }}
+    $accepted = $false
+    try {{ Assert-VhdxFileAcl "C:\\ProgramData\\SymphonyPilot\\symphony-storage.vhdx" }} catch {{ $accepted = $true }}
+    if (-not $accepted) {{ exit 1 }}
+}}
+Expect-Reject ($stable + (New-Rule "S-1-5-21-111-222-333-1001"))
+Expect-Reject ($stable + (New-Rule "S-1-1-0"))
+Expect-Reject ($stable + (New-Rule "S-1-5-32-545"))
+Expect-Reject ($stable + (New-Rule "S-1-5-80-12345"))
+Expect-Reject ($stable + (New-Rule "S-1-5-83-123" "Deny"))
+Expect-Reject ($stable + (New-Rule "S-1-15-3-1024" "Allow" 1))
+Expect-Reject $stable $false
+Write-Output "VHDX ACL family harness: PASS"'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VHDX ACL family harness: PASS", result.stdout)
 
     def test_fixed_vhdx_recovery_contract_is_bounded_and_evidence_driven(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()

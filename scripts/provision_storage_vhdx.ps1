@@ -127,6 +127,10 @@ function ConvertTo-SidValue {
 }
 
 function Assert-OperatorStateAcl {
+    # The namespace and pre-attachment leaf contract is deliberately strict:
+    # only the operator's two stable local SIDs are allowed.  VHDX files that
+    # already passed through WSL use Assert-VhdxFileAcl below because Windows
+    # may add OS-managed virtualization identities while attaching them.
     param(
         [string]$Path,
         [bool]$Directory
@@ -171,6 +175,49 @@ function Assert-OperatorStateAcl {
     if (-not $seen.ContainsKey($OperatorAdminSid.Value) -or
         -not $seen.ContainsKey($OperatorSystemSid.Value)) {
         throw "operator-state ACL is missing SYSTEM or Administrators"
+    }
+}
+
+function Assert-VhdxFileAcl {
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "VHDX ACL target is not a normal non-reparse file"
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) {
+        throw "VHDX ACL must disable inheritance"
+    }
+    if ((ConvertTo-SidValue $acl.Owner) -ne $OperatorAdminSid.Value) {
+        throw "VHDX ACL owner must be local Administrators"
+    }
+    $seen = @{}
+    foreach ($rule in @($acl.Access)) {
+        $sid = ConvertTo-SidValue $rule.IdentityReference
+        $stable = $sid -eq $OperatorAdminSid.Value -or $sid -eq $OperatorSystemSid.Value
+        $managed = $sid -match '^S-1-5-83-[0-9-]+$' -or
+            $sid -match '^S-1-15-3-[0-9-]+$'
+        if (-not $stable -and -not $managed) {
+            throw "VHDX ACL grants an unexpected identity"
+        }
+        if ($rule.AccessControlType -ne
+            [System.Security.AccessControl.AccessControlType]::Allow -or
+            [int]$rule.InheritanceFlags -ne
+            [int][System.Security.AccessControl.InheritanceFlags]::None -or
+            [int]$rule.PropagationFlags -ne
+            [int][System.Security.AccessControl.PropagationFlags]::None) {
+            throw "VHDX ACL grants unexpected type or inheritance"
+        }
+        if ($stable -and [int64]$rule.FileSystemRights -ne
+            [int64][System.Security.AccessControl.FileSystemRights]::FullControl) {
+            throw "VHDX ACL stable identity rights are not FullControl"
+        }
+        $seen[$sid] = $true
+    }
+    if (-not $seen.ContainsKey($OperatorAdminSid.Value) -or
+        -not $seen.ContainsKey($OperatorSystemSid.Value)) {
+        throw "VHDX ACL is missing SYSTEM or Administrators"
     }
 }
 
@@ -691,7 +738,7 @@ function Get-VhdEvidence {
         if ($created) {
             Set-OperatorStateAcl $ExpectedPath $false
         } else {
-            Assert-OperatorStateAcl $ExpectedPath $false
+            Assert-VhdxFileAcl $ExpectedPath
         }
         $fileItem = Get-Item -LiteralPath $ExpectedPath -Force -ErrorAction Stop
         $nativeInfo = Get-NativeVhdxInformation $ExpectedPath
