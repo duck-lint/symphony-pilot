@@ -812,6 +812,19 @@ int main(void) {{
         self.assertIn('stat -c \'%a\' "$HELPER"', recipe)
         self.assertIn('HELPER_UID=$(stat -c \'%u\' "$HELPER")', recipe)
         self.assertIn('HELPER_GID=$(stat -c \'%g\' "$HELPER")', recipe)
+        install_helper = recipe.index("install_verified_helper()")
+        identity_record = recipe.rindex('if [ -e "$IDENTITY" ]; then')
+        verify_pool = recipe.index('"$HELPER" --operation verify-pool')
+        self.assertLess(install_helper, identity_record)
+        self.assertLess(identity_record, verify_pool)
+        install_body = recipe[install_helper:identity_record]
+        self.assertIn('HELPER_SHA256=$(sha256sum "$HELPER"', install_body)
+        self.assertIn('[ "$HELPER_SHA256" = "$COMPILED_HELPER_SHA256" ]', install_body)
+        self.assertIn('cmp -s "$HELPER_TMP" "$HELPER"', install_body)
+        self.assertLess(install_body.index('cmp -s'), install_body.index('rm -f -- "$HELPER_TMP"'))
+        self.assertLess(install_body.index('rm -f -- "$HELPER_TMP"'), install_body.index('HELPER_TMP='))
+        self.assertIn('trap cleanup EXIT HUP INT TERM', recipe)
+        self.assertIn('[ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"', recipe)
 
     def test_partial_state_recovery_reuses_identity_and_reaches_helper_install(self):
         recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
@@ -839,6 +852,135 @@ int main(void) {{
         )
         self.assertIsNotNone(match)
         return match.group(0)
+
+    def _verified_helper_install_shell_function(self):
+        recipe = (ROOT / "scripts" / "provision_storage_domain.sh").read_text()
+        match = re.search(
+            r"(?ms)^install_verified_helper\(\) \{\n.*?^\}\n",
+            recipe,
+        )
+        self.assertIsNotNone(match)
+        return match.group(0)
+
+    @unittest.skipUnless(shutil.which("sh"), "POSIX shell unavailable")
+    def test_exact_copy_is_proven_before_identity_and_execution(self):
+        install_function = self._verified_helper_install_shell_function()
+        with tempfile.TemporaryDirectory(prefix="symphony-helper-copy-") as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_install = fake_bin / "install"
+            fake_install.write_text(
+                """#!/bin/sh
+last=
+previous=
+for argument in "$@"; do
+    previous=$last
+    last=$argument
+done
+cp "$previous" "$last"
+""",
+                encoding="ascii",
+            )
+            fake_install.chmod(0o700)
+            preflight = root / "preflight-helper"
+            preflight.write_bytes(b"exact preflight helper bytes\n")
+            helper = root / "quota-admit-task"
+            identity = root / "identity"
+            executed = root / "executed"
+            command = f'''#!/bin/sh
+set -eu
+fail() {{ echo "symphony storage provisioning stopped: $*" >&2; exit 78; }}
+PATH="{fake_bin}:/usr/bin:/bin"
+HELPER_GROUP=symphony-pilot
+EXPECTED_GID=0
+HELPER_TMP="{preflight}"
+HELPER="{helper}"
+COMPILED_HELPER_SHA256=$(sha256sum "$HELPER_TMP" | awk '{{print $1}}')
+cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
+trap cleanup EXIT
+{install_function}
+install_verified_helper
+if [ -e "$HELPER_TMP" ]; then exit 1; fi
+printf 'reviewed helper identity\\n' > "{identity}"
+touch "{executed}"
+echo "exact-copy install: PASS"
+'''
+            harness = root / "run.sh"
+            harness.write_text(command, encoding="ascii")
+            harness.chmod(0o700)
+            result = subprocess.run(
+                [shutil.which("sh"), str(harness)],
+                capture_output=True, text=True, check=False,
+            )
+            installed_bytes = helper.read_bytes()
+            identity_exists = identity.exists()
+            executed_exists = executed.exists()
+            temp_exists = preflight.exists()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("exact-copy install: PASS", result.stdout)
+        self.assertEqual(installed_bytes, b"exact preflight helper bytes\n")
+        self.assertTrue(identity_exists)
+        self.assertTrue(executed_exists)
+        self.assertFalse(temp_exists)
+
+    @unittest.skipUnless(shutil.which("sh"), "POSIX shell unavailable")
+    def test_corrupt_install_fails_before_identity_or_helper_execution(self):
+        install_function = self._verified_helper_install_shell_function()
+        with tempfile.TemporaryDirectory(prefix="symphony-helper-corrupt-") as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_install = fake_bin / "install"
+            fake_install.write_text(
+                """#!/bin/sh
+last=
+for argument in "$@"; do
+    last=$argument
+done
+printf 'corrupt installed bytes\\n' > "$last"
+""",
+                encoding="ascii",
+            )
+            fake_install.chmod(0o700)
+            preflight = root / "preflight-helper"
+            preflight.write_bytes(b"exact preflight helper bytes\n")
+            helper = root / "quota-admit-task"
+            identity = root / "identity"
+            executed = root / "executed"
+            command = f'''#!/bin/sh
+set -eu
+fail() {{ echo "symphony storage provisioning stopped: $*" >&2; exit 78; }}
+PATH="{fake_bin}:/usr/bin:/bin"
+HELPER_GROUP=symphony-pilot
+EXPECTED_GID=0
+HELPER_TMP="{preflight}"
+HELPER="{helper}"
+COMPILED_HELPER_SHA256=$(sha256sum "$HELPER_TMP" | awk '{{print $1}}')
+cleanup() {{ [ -z "$HELPER_TMP" ] || rm -f -- "$HELPER_TMP"; }}
+trap cleanup EXIT
+{install_function}
+install_verified_helper
+printf 'reviewed helper identity\\n' > "{identity}"
+touch "{executed}"
+'''
+            harness = root / "run.sh"
+            harness.write_text(command, encoding="ascii")
+            harness.chmod(0o700)
+            result = subprocess.run(
+                [shutil.which("sh"), str(harness)],
+                capture_output=True, text=True, check=False,
+            )
+            installed_bytes = helper.read_bytes()
+            identity_exists = identity.exists()
+            executed_exists = executed.exists()
+            temp_exists = preflight.exists()
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("installed quota helper bytes differ from the preflight build", result.stderr)
+        self.assertNotEqual(installed_bytes, b"exact preflight helper bytes\n")
+        self.assertFalse(identity_exists)
+        self.assertFalse(executed_exists)
+        self.assertFalse(temp_exists)
 
     @unittest.skipUnless(
         shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,

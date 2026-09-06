@@ -263,18 +263,24 @@ verify_capacity
 verify_storage_identity
 
 usermod --append --groups "$HELPER_GROUP" duck-lint
-if [ -e "$HELPER" ]; then
-    [ ! -L "$HELPER" ] || fail "existing quota helper is a symlink"
-    [ "$(stat -c '%u %g %a' "$HELPER")" = "0 $EXPECTED_GID 4750" ] || \
-        fail "existing quota helper privilege state conflicts"
-    [ "$(sha256sum "$HELPER" | awk '{print $1}')" = "$COMPILED_HELPER_SHA256" ] || \
-        fail "existing quota helper bytes differ from the reviewed build"
+install_verified_helper() {
+    if [ -e "$HELPER" ]; then
+        [ ! -L "$HELPER" ] || fail "existing quota helper is a symlink"
+        [ "$(stat -c '%u %g %a' "$HELPER")" = "0 $EXPECTED_GID 4750" ] || \
+            fail "existing quota helper privilege state conflicts"
+    else
+        install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"
+    fi
+    HELPER_SHA256=$(sha256sum "$HELPER" | awk '{print $1}')
+    [ "$HELPER_SHA256" = "$COMPILED_HELPER_SHA256" ] || \
+        fail "installed quota helper bytes differ from the preflight build"
+    cmp -s "$HELPER_TMP" "$HELPER" || \
+        fail "installed quota helper bytes differ from the preflight object"
     rm -f -- "$HELPER_TMP"
     HELPER_TMP=
-else
-    install -o root -g "$HELPER_GROUP" -m 4750 "$HELPER_TMP" "$HELPER"
-    rm -f -- "$HELPER_TMP"
-fi
+}
+
+install_verified_helper
 
 HELPER_UID=$(stat -c '%u' "$HELPER")
 HELPER_GID=$(stat -c '%g' "$HELPER")
@@ -283,7 +289,6 @@ EXPECTED_GID=$(getent group "$HELPER_GROUP" | awk -F: '{print $3}')
 [ "$HELPER_GID" = "$EXPECTED_GID" ] || fail "quota helper group is not the reviewed group"
 [ "$(stat -c '%a' "$HELPER")" = "4750" ] || fail "quota helper is not exactly setuid-root mode 4750"
 
-HELPER_SHA256=$(sha256sum "$HELPER" | awk '{print $1}')
 if [ -e "$IDENTITY" ]; then
     [ ! -L "$IDENTITY" ] || fail "existing quota helper identity is a symlink"
     [ "$(stat -c '%u %g %a' "$IDENTITY")" = "0 $EXPECTED_GID 640" ] || \
