@@ -85,9 +85,9 @@ if ($IncludeWsl) {
         quotactl_fd = $quotactlValue
     }
     $observed.paths = [ordered]@{
-        pilot_source_root = "F:\\PROJECT-REPOS\\symphony-pilot"
-        runtime_source_root = "F:\\PROJECT-REPOS\\symphony-runtime"
-        canary_source_root = "F:\\PROJECT-REPOS\\symphony-canary"
+        pilot_source_root = "F:\\PROJECT-REPOS\\SYMPHONY\\symphony-pilot"
+        runtime_source_root = "F:\\PROJECT-REPOS\\SYMPHONY\\symphony-runtime"
+        canary_source_root = "F:\\PROJECT-REPOS\\SYMPHONY\\symphony-canary"
         wsl_distribution = "Ubuntu-24.04"
         wsl_user = "duck-lint"
         deployed_pilot_root = "/home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary"

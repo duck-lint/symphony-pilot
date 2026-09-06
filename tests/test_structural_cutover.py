@@ -20,7 +20,6 @@ import prepare_workspace as pw
 import rulesets
 import publication
 import runtime_lock
-import task_admission
 
 
 class StructuralCutoverTests(unittest.TestCase):
@@ -32,33 +31,12 @@ class StructuralCutoverTests(unittest.TestCase):
         item = {"executable": "/reviewed/tool", "version": "tool 1", "sha256": "a" * 64}
         return {"symphony": item, "codex": item, "containment": item}
 
-    def task(self):
-        return task_admission.create_task(task_admission.ServerAdmission(
-            repository="example/project", project_slug="demo", issue_number=10,
-            dispatch_provenance=[{"label": "symphony:auto", "actor": "duck-lint", "event_id": 1, "created_at": "2026-01-01T00:00:00Z"}],
-            default_ref="master", base_sha="b" * 40,
-            workpad_comment_id=42, runtime_identity=self.runtime_identity(),
-        ), task_id="c" * 32)
-
-    def test_branch_is_host_derived_and_prose_cannot_supply_it(self):
-        task = self.task()
-        self.assertEqual(task["issue_branch"], "codex/gh-10-cccccccccccc")
-        tampered = dict(task, issue_branch="master")
-        with self.assertRaises(task_admission.TaskAdmissionError):
-            task_admission.validate_task_record(tampered)
-
-    def test_task_record_is_strict_and_round_trips_outside_workspace(self):
-        task = self.task()
-        with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "tasks" / "GH-10" / "task.json"
-            task_admission.write_task(path, task)
-            self.assertEqual(task_admission.read_task(path), task)
-            malformed = dict(task, attacker_control="master")
-            with self.assertRaises(task_admission.TaskAdmissionError):
-                task_admission.validate_task_record(malformed)
+    @staticmethod
+    def outbox_task():
+        return {"task_id": "c" * 32}
 
     def test_outbox_rejects_unknown_fields_and_wrong_task(self):
-        task = self.task()
+        task = self.outbox_task()
         request = {"schema": outbox.OUTBOX_SCHEMA, "task_id": task["task_id"],
                    "head": "d" * 40, "workpad_body": "ok",
                    "disposition": "ready_for_human_merge", "summary": "ok"}

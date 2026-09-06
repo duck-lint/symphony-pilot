@@ -52,7 +52,7 @@ The host-side diagnostic form is:
 ```powershell
 python scripts/wsl_adapter.py `
   --project symphony-runtime `
-  --cwd /mnt/f/PROJECT-REPOS/symphony-runtime/elixir `
+  --cwd /mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/elixir `
   -- /usr/bin/id -un
 ```
 

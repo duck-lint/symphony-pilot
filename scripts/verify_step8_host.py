@@ -39,7 +39,7 @@ def _write(path: pathlib.Path, evidence: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tier", choices=("ubuntu-buildability", "windows-native", "target-twin"), required=True)
+    parser.add_argument("--tier", choices=("ubuntu-buildability", "windows-native"), required=True)
     parser.add_argument("--observed-file", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
@@ -57,9 +57,6 @@ def main() -> int:
     if args.tier == "ubuntu-buildability":
         failures = verify_ubuntu_buildability(contract, observed)
         tier_name = "Tier A: native Ubuntu buildability"
-    elif args.tier == "target-twin":
-        failures = verify_exact_identity(contract, observed)
-        tier_name = "Tier C: disposable Windows + WSL2 target twin"
     else:
         expected = contract["compatible_buildability"]["windows_native"]
         failures = [] if observed.get("windows", {}).get("architecture") == expected["architecture"] else ["windows.architecture"]

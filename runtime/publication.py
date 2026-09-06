@@ -321,7 +321,7 @@ def _publish_branch(profile: Profile, task: dict[str, object], bundle: pathlib.P
 
 def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathlib.Path,
                          deployment_check=None, github_call=github, snapshot_fn=None) -> dict[str, object]:
-    """Publish one exact ARCHIVIST task; all selectors and destinations are host-derived."""
+    """Publish one exact final-acceptance task; selectors and destinations are host-derived."""
     intent_started = False
     eligibility_established = False
     task: dict[str, object] | None = None
@@ -337,7 +337,7 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                 publication = database.read_publication(task["id"])
                 if publication and publication["publication_status"] == "published":
                     return {"task": task, "publication": publication, "idempotent": True}
-            if (task["state"] != "ARCHIVIST" or not task["current_head"] or
+            if (task["state"] != "FINAL_MECHANICAL_ACCEPTANCE" or not task["current_head"] or
                     database.connection.execute("SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)).fetchone() or
                     database.connection.execute("SELECT 1 FROM role_runs WHERE task_id = ? AND role = 'ARCHITECT' AND status = 'started' LIMIT 1", (task["id"],)).fetchone()):
                 raise StateConflict("task is not eligible for publication")

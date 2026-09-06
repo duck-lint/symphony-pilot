@@ -12,7 +12,6 @@ import argparse
 import json
 import pathlib
 import re
-import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,6 +21,7 @@ from control_db import (ControlPlaneDatabase, ControlPlaneError,
                         default_database_path)  # noqa: E402
 from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
+from prepare_workspace import github, read_secret  # noqa: E402
 from workspace_boundary import (WorkspaceBoundaryError,
                                 create_empty_task_workspace)  # noqa: E402
 from storage import (StorageAdmissionProof, StorageContractError,
@@ -40,41 +40,30 @@ class TaskCommandError(RuntimeError):
     pass
 
 
-def resolve_remote_head(git_remote: str) -> tuple[str, str]:
-    """Resolve an unambiguous remote HEAD using structured Git argv."""
-    result = subprocess.run(
-        ["git", "ls-remote", "--symref", git_remote, "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode:
-        raise TaskCommandError("registered Git remote HEAD could not be resolved")
-    symbolic: list[str] = []
-    heads: list[str] = []
-    for raw_line in result.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        fields = line.split("\t")
-        if len(fields) != 2:
-            raise TaskCommandError("registered Git remote HEAD response is ambiguous")
-        value, name = fields
-        if name != "HEAD":
-            raise TaskCommandError("registered Git remote returned an unexpected HEAD record")
-        if value.startswith("ref: refs/heads/"):
-            symbolic.append(value.removeprefix("ref: refs/heads/"))
-        elif SHA_RE.fullmatch(value):
-            heads.append(value)
-        else:
-            raise TaskCommandError("registered Git remote HEAD response is invalid")
-    if (len(symbolic), len(heads)) != (1, 1):
-        raise TaskCommandError("registered Git remote default ref/HEAD is not unambiguous")
-    base_ref = symbolic[0]
-    if (not REF_RE.fullmatch(base_ref) or ".." in base_ref or "//" in base_ref or
-            base_ref.endswith(("/", ".")) or "@{" in base_ref):
-        raise TaskCommandError("registered Git remote default ref is invalid")
-    return base_ref, heads[0]
+def resolve_github_head(profile) -> tuple[str, str]:
+    """Read repository authority from the official GitHub API.
+
+    The registered profile selects the repository identity and the host owns
+    the credential. Git remotes remain a byte-materialization concern for the
+    later workspace path; they cannot establish task authority here.
+    """
+    token = read_secret(profile)
+    repository = github(profile, token, "GET", "")
+    if not isinstance(repository, dict):
+        raise TaskCommandError("trusted GitHub repository facts are malformed")
+    base_ref = repository.get("default_branch")
+    if (not isinstance(base_ref, str) or not REF_RE.fullmatch(base_ref) or
+            ".." in base_ref or "//" in base_ref or base_ref.endswith(("/", ".")) or
+            "@{" in base_ref):
+        raise TaskCommandError("trusted GitHub default ref is invalid")
+    ref = github(profile, token, "GET", f"/git/ref/heads/{base_ref}")
+    if not isinstance(ref, dict) or ref.get("ref") != f"refs/heads/{base_ref}":
+        raise TaskCommandError("trusted GitHub branch facts are malformed")
+    object_data = ref.get("object")
+    base_sha = object_data.get("sha") if isinstance(object_data, dict) else None
+    if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha.lower()):
+        raise TaskCommandError("trusted GitHub default ref SHA is invalid")
+    return base_ref, base_sha.lower()
 
 
 def _emit(value: object) -> None:
@@ -100,7 +89,7 @@ def _task_selector(value: str) -> tuple[str, str]:
 
 def create(args: argparse.Namespace) -> int:
     profile = _profile(args.project)
-    base_ref, base_sha = resolve_remote_head(profile.git_remote)
+    base_ref, base_sha = resolve_github_head(profile)
     with ControlPlaneDatabase.open(default_database_path()) as database:
         task = database.create_task(
             project_slug=profile.slug,
@@ -280,7 +269,7 @@ def bind_publication_key(args: argparse.Namespace) -> int:
 
 
 def publish(args: argparse.Namespace) -> int:
-    """Publish one exact ARCHIVIST head through the trusted host broker."""
+    """Publish one exact final-acceptance head through the trusted host broker."""
     from project import verify_deployment
     from publication import publish_task
 
@@ -340,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     bind_parser.add_argument("--project", required=True)
     bind_parser.set_defaults(handler=bind_publication_key)
 
-    publish_parser = subparsers.add_parser("publish", help="publish one exact ARCHIVIST task head")
+    publish_parser = subparsers.add_parser("publish", help="publish one exact final-acceptance task head")
     publish_parser.add_argument("--project", required=True)
     publish_parser.add_argument("--task", required=True)
     publish_parser.set_defaults(handler=publish)

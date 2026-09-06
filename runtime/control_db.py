@@ -40,7 +40,6 @@ TASK_STATES = frozenset({
     "REVIEW",
     "ADVERSARIAL_REVIEW",
     "FINAL_MECHANICAL_ACCEPTANCE",
-    "ARCHIVIST",
     "READY_FOR_HUMAN_MERGE",
     "HUMAN_BLOCKED",
     "INFRASTRUCTURE_BLOCKED",
@@ -246,7 +245,7 @@ MIGRATIONS = (
                 state TEXT NOT NULL CHECK (state IN (
                     'PREPARED', 'QUEUED', 'PLANNED', 'IMPLEMENTED', 'REVIEW',
                     'ADVERSARIAL_REVIEW', 'FINAL_MECHANICAL_ACCEPTANCE',
-                    'ARCHIVIST', 'READY_FOR_HUMAN_MERGE', 'HUMAN_BLOCKED',
+                    'READY_FOR_HUMAN_MERGE', 'HUMAN_BLOCKED',
                     'INFRASTRUCTURE_BLOCKED'
                 )),
                 base_ref TEXT NOT NULL CHECK (length(trim(base_ref)) > 0),
@@ -1576,8 +1575,8 @@ class ControlPlaneDatabase:
         result: dict[str, object] | None = None
         with self._transaction():
             task = self.read_task(task_id)
-            if task["state"] != "ARCHIVIST" or task["current_head"] != head_sha:
-                raise StateConflict("publication requires the exact current ARCHIVIST head")
+            if task["state"] != "FINAL_MECHANICAL_ACCEPTANCE" or task["current_head"] != head_sha:
+                raise StateConflict("publication requires the exact final-acceptance head")
             if self.connection.execute(
                 "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task_id,)
             ).fetchone():
@@ -1651,7 +1650,7 @@ class ControlPlaneDatabase:
         evidence: dict[str, object],
         published_at: str | None = None,
     ) -> dict[str, object]:
-        """Atomically publish and move ARCHIVIST to READY_FOR_HUMAN_MERGE."""
+        """Atomically publish and move final acceptance to READY_FOR_HUMAN_MERGE."""
         task_id = _uuid(task_id, "task_id")
         head_sha = _sha(head_sha, "head_sha")
         remote_branch = _text(remote_branch, "remote_branch")
@@ -1663,8 +1662,8 @@ class ControlPlaneDatabase:
         result: dict[str, dict[str, object]] | None = None
         with self._transaction():
             task = self.read_task(task_id)
-            if task["state"] != "ARCHIVIST" or task["current_head"] != head_sha:
-                raise StateConflict("publication finalization requires the exact current ARCHIVIST head")
+            if task["state"] != "FINAL_MECHANICAL_ACCEPTANCE" or task["current_head"] != head_sha:
+                raise StateConflict("publication finalization requires the exact final-acceptance head")
             if self.connection.execute(
                 "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task_id,)
             ).fetchone():
@@ -1686,11 +1685,11 @@ class ControlPlaneDatabase:
             self._insert_event(task_id, "publication_finished", payload, occurred_at=timestamp)
             changed = self.connection.execute(
                 "UPDATE tasks SET state = 'READY_FOR_HUMAN_MERGE', updated_at = ? "
-                "WHERE id = ? AND state = 'ARCHIVIST'",
+                "WHERE id = ? AND state = 'FINAL_MECHANICAL_ACCEPTANCE'",
                 (timestamp, task_id),
             ).rowcount
             if changed != 1:
-                raise StateConflict("ARCHIVIST state changed during publication finalization")
+                raise StateConflict("final-acceptance state changed during publication finalization")
             self._insert_event(
                 task_id, "ready_for_human_merge", payload, occurred_at=timestamp,
             )
@@ -1727,7 +1726,7 @@ class ControlPlaneDatabase:
         with self._transaction():
             task = self.read_task(task_id)
             current = self.read_publication(task_id)
-            if task["state"] != "ARCHIVIST" or task["published_head"] is not None:
+            if task["state"] != "FINAL_MECHANICAL_ACCEPTANCE" or task["published_head"] is not None:
                 raise StateConflict("publication failure cannot alter a finalized task")
             if current and current["publication_status"] == "published":
                 raise StateConflict("publication failure cannot downgrade published state")
@@ -1823,13 +1822,13 @@ class ControlPlaneDatabase:
         task_id = _uuid(task_id, "task_id")
         expected_state = _state(expected_state)
         new_state = _state(new_state)
-        if expected_state == "ARCHIVIST" and new_state == "READY_FOR_HUMAN_MERGE":
+        if expected_state == "FINAL_MECHANICAL_ACCEPTANCE" and new_state == "READY_FOR_HUMAN_MERGE":
             task = self.read_task(task_id)
             publication = self.read_publication(task_id)
             if (not publication or publication["publication_status"] != "published" or
                     publication["head_sha"] != task["current_head"]):
                 raise StateConflict(
-                    "ARCHIVIST cannot transition to READY_FOR_HUMAN_MERGE without "
+                    "final acceptance cannot transition to READY_FOR_HUMAN_MERGE without "
                     "successful exact-current-HEAD publication"
                 )
         if event_type not in EVENT_TYPES:

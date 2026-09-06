@@ -171,8 +171,8 @@ def _load_containment(root: pathlib.Path):
 
 
 PROJECT_ROOTS = {
-    "symphony-pilot": pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-pilot"),
-    "symphony-runtime": pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime"),
+    "symphony-pilot": pathlib.Path("/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-pilot"),
+    "symphony-runtime": pathlib.Path("/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime"),
 }
 STORAGE_PROJECTS = frozenset({"cleanroom", "symphony-pilot", "symphony-runtime", "symphony-canary"})
 

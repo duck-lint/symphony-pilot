@@ -9,8 +9,8 @@ validation, and stop conditions.
 
 Step 5: SQLite determines what work exists. Step 6: SQLite determines what
 has happened to that work. Lifecycle reconciliation is host-only; Runtime
-remains read-only, and ARCHIVIST is the Step-6 endpoint pending Step 7
-publication.
+remains read-only, and the Archivist role closes out final mechanical
+acceptance before Step 7 publication.
 
 The trusted host owns project admission, server-derived Git identity, runtime
 locks, process state, credentials, logs, recovery, branch-protection preflight,
@@ -18,8 +18,10 @@ and publication. A T-N task receives only its current source checkout and a
 fresh task-local Codex policy home. Task output is an untrusted strict outbox.
 
 Task branches are host-derived as
-codex/t-<identifier>-<task-id-prefix>. The registered Git remote supplies the
-default ref and exact base SHA; both are stored in a strict host task record.
+codex/t-<identifier>-<task-id-prefix>. The trusted host reads the registered
+repository's default ref and exact authoritative SHA from the official GitHub
+API; both are stored in a strict host task record. Git transport materializes
+bytes only and cannot choose repository authority.
 GitHub Issue and workpad prose never controls checkout, branch, ref, SHA,
 remote, credential, or process state.
 

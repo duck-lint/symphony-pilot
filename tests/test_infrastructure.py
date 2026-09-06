@@ -23,7 +23,6 @@ import rulesets
 import publication
 import project_registry
 import runtime_lock
-import task_admission
 
 
 class InfrastructureTests(unittest.TestCase):
@@ -42,13 +41,9 @@ class InfrastructureTests(unittest.TestCase):
         item = {"executable": "/reviewed/tool", "version": "tool 1", "sha256": "a" * 64}
         return {"symphony": item, "codex": item, "containment": item}
 
-    def task(self):
-        return task_admission.create_task(task_admission.ServerAdmission(
-            repository="example/project", project_slug="demo", issue_number=10,
-            dispatch_provenance=[{"label": "symphony:auto", "actor": "duck-lint", "event_id": 1, "created_at": "2026-01-01T00:00:00Z"}],
-            default_ref="master", base_sha="b" * 40,
-            workpad_comment_id=42, runtime_identity=self.runtime_identity(),
-        ), task_id="c" * 32)
+    @staticmethod
+    def outbox_task():
+        return {"task_id": "c" * 32}
 
     def test_canonical_registry_is_arbitrary_and_collision_checked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -205,23 +200,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertFalse(schema["additionalProperties"])
         self.assertNotIn("token", schema["properties"])
 
-    def test_task_admission_ignores_prose_and_derives_branch(self):
-        task = self.task()
-        self.assertEqual(task["issue_branch"], "codex/gh-10-cccccccccccc")
-        with self.assertRaises(task_admission.TaskAdmissionError):
-            task_admission.validate_task_record(dict(task, issue_branch="master"))
-
-    def test_task_record_is_strict_and_host_owned(self):
-        task = self.task()
-        with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "tasks" / "GH-10" / "task.json"
-            task_admission.write_task(path, task)
-            self.assertEqual(task_admission.read_task(path), task)
-            with self.assertRaises(task_admission.TaskAdmissionError):
-                task_admission.validate_task_record(dict(task, attacker_control="master"))
-
     def test_outbox_and_ruleset_fail_closed(self):
-        task = self.task()
+        task = self.outbox_task()
         request = {"schema": outbox.OUTBOX_SCHEMA, "task_id": task["task_id"],
                    "head": "d" * 40, "workpad_body": "ok", "disposition": "ready_for_human_merge", "summary": "ok"}
         self.assertEqual(outbox.validate_request(request, task), request)

@@ -19,8 +19,9 @@ inspection.
 Missing, malformed, stale, or identity-mismatched lifecycle results fail
 closed and produce an SQLite blocker when the database is available. Do not
 repair by deleting the result, role run, workpad history, or events.
-`ARCHIVIST` is a valid Step-6 parked endpoint awaiting the explicit Step-7
-`task.py publish` operation. A durable `started` publication row records the
+Archivist is a Step-6 role closeout recorded while the task remains at
+`FINAL_MECHANICAL_ACCEPTANCE`, awaiting the explicit Step-7 `task.py publish`
+operation. A durable `started` publication row records the
 exact task UUID, head, and branch before external mutation. Retries may adopt
 only the exact branch and one exact open draft PR; contradictions are blockers,
 not repair requests. Final SQLite publication and READY transition are one

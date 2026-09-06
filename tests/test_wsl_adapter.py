@@ -48,15 +48,15 @@ class StreamErrorProcess(FakeProcess):
 
 class WslAdapterTests(unittest.TestCase):
     def test_fixed_distribution_and_user_are_structured(self):
-        command = wsl_adapter._raw_command(pathlib.Path("C:/Windows/System32/wsl.exe"), ["/usr/bin/id"], "/mnt/f/PROJECT-REPOS/symphony-runtime")
+        command = wsl_adapter._raw_command(pathlib.Path("C:/Windows/System32/wsl.exe"), ["/usr/bin/id"], "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime")
         self.assertEqual(command[:8], [
             str(pathlib.Path("C:/Windows/System32/wsl.exe")), "--distribution", "Ubuntu-24.04",
-            "--user", "duck-lint", "--cd", "/mnt/f/PROJECT-REPOS/symphony-runtime", "--exec",
+            "--user", "duck-lint", "--cd", "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime", "--exec",
         ])
 
     def test_other_distribution_is_rejected(self):
         with self.assertRaisesRegex(wsl_adapter.WslAdapterError, "only Ubuntu-24.04"):
-            wsl_adapter.execute("symphony-runtime", "/mnt/f/PROJECT-REPOS/symphony-runtime", ["/usr/bin/id"], distro="Debian")
+            wsl_adapter.execute("symphony-runtime", "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime", ["/usr/bin/id"], distro="Debian")
 
     def test_quota_inspection_uses_fixed_deployed_control_operation(self):
         process = FakeProcess(stdout=b'{"schema":"symphony-pilot-quota-inspection/v1"}', returncode=0)
@@ -73,8 +73,8 @@ class WslAdapterTests(unittest.TestCase):
 
     def test_cwd_traversal_aliases_and_windows_forms_are_rejected(self):
         cases = (
-            "/mnt/f/PROJECT-REPOS/symphony-runtime/../../etc",
-            r"F:\\PROJECT-REPOS\\symphony-runtime",
+            "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/../../etc",
+            r"F:\\PROJECT-REPOS\\SYMPHONY\\symphony-runtime",
             r"\\\\wsl.localhost\\Ubuntu-24.04\\mnt\\f",
             "/mnt/c/Users/madis",
         )
@@ -93,7 +93,7 @@ class WslAdapterTests(unittest.TestCase):
         with mock.patch.object(wsl_adapter, "_bounded_process", return_value=escape):
             with self.assertRaisesRegex(wsl_adapter.WslAdapterError, "leaves the approved"):
                 wsl_adapter._canonicalize_cwd(
-                    "symphony-runtime", "/mnt/f/PROJECT-REPOS/symphony-runtime", pathlib.Path("wsl.exe"), "test"
+                    "symphony-runtime", "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime", pathlib.Path("wsl.exe"), "test"
                 )
         with self.assertRaises(wsl_adapter.WslAdapterError) as raised:
             wsl_adapter._validate_project("unknown")
@@ -131,13 +131,13 @@ class WslAdapterTests(unittest.TestCase):
         command = containment.acceptance_domain_command(
             containment.BackendIdentity("schema", "linux-unshare", "/usr/bin/unshare", "v", "a" * 64),
             pathlib.Path("/tmp/domain-root"),
-            pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime"),
+            pathlib.Path("/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime"),
             pathlib.Path("/home/duck-lint/.local/state/symphony-pilot/wsl-build/runtime"),
             pathlib.Path("/home/duck-lint/.local/bin/mise"),
             pathlib.Path("/home/duck-lint/.local/share/mise"),
             "/project/elixir",
             ["bash", "-lc", "cat /home/duck-lint/.ssh/id_rsa"],
-            [(pathlib.Path("/mnt/f/PROJECT-REPOS/symphony-runtime/bin"), "/project/bin")],
+            [(pathlib.Path("/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/bin"), "/project/bin")],
         )
         setup = command[-1]
         self.assertIn("mount --make-rprivate /", setup)
@@ -156,20 +156,20 @@ class WslAdapterTests(unittest.TestCase):
     def test_execution_uses_sterile_environment_and_returns_structured_result(self):
         process = FakeProcess(stdout=b"ok\n", stderr=b"", returncode=7)
         with mock.patch.object(wsl_adapter, "_host_wsl_executable", return_value=pathlib.Path("C:/Windows/System32/wsl.exe")), \
-             mock.patch.object(wsl_adapter, "_canonicalize_cwd", return_value="/mnt/f/PROJECT-REPOS/symphony-runtime/elixir"), \
+             mock.patch.object(wsl_adapter, "_canonicalize_cwd", return_value="/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/elixir"), \
              mock.patch.object(wsl_adapter, "_sterile_windows_environment", return_value={"SystemRoot": r"C:\Windows", "WINDIR": r"C:\Windows"}), \
              mock.patch.object(wsl_adapter.subprocess, "Popen", return_value=process) as popen, \
              mock.patch.dict(wsl_adapter.os.environ, {"SystemRoot": r"C:\Windows", "GITHUB_TOKEN": "must-not-cross"}, clear=True):
             result = wsl_adapter.execute(
                 "symphony-runtime",
-                "/mnt/f/PROJECT-REPOS/symphony-runtime/elixir",
+                "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/elixir",
                 ["/usr/bin/printf", "safe;still-one-arg"],
                 request_id="test-1",
                 timeout_seconds=1,
             )
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.distro, "Ubuntu-24.04")
-        self.assertEqual(result.cwd, "/mnt/f/PROJECT-REPOS/symphony-runtime/elixir")
+        self.assertEqual(result.cwd, "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/elixir")
         self.assertEqual(result.termination, "completed")
         invocation = popen.call_args
         self.assertFalse(invocation.kwargs["shell"])
@@ -189,12 +189,12 @@ class WslAdapterTests(unittest.TestCase):
         """Two fixed supervisor-style runs cannot create deployment bytecode."""
         process = FakeProcess(stdout=b"ok\n", stderr=b"", returncode=0)
         with mock.patch.object(wsl_adapter, "_host_wsl_executable", return_value=pathlib.Path("C:/Windows/System32/wsl.exe")), \
-             mock.patch.object(wsl_adapter, "_canonicalize_cwd", return_value="/mnt/f/PROJECT-REPOS/symphony-pilot"), \
+             mock.patch.object(wsl_adapter, "_canonicalize_cwd", return_value="/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-pilot"), \
              mock.patch.object(wsl_adapter, "_sterile_windows_environment", return_value={}), \
              mock.patch.object(wsl_adapter.subprocess, "Popen", return_value=process) as popen:
             for index in range(2):
                 wsl_adapter.execute(
-                    "symphony-pilot", "/mnt/f/PROJECT-REPOS/symphony-pilot", ["/usr/bin/true"],
+                    "symphony-pilot", "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-pilot", ["/usr/bin/true"],
                     request_id=f"no-bytecode-{index}", timeout_seconds=1,
                 )
                 command = popen.call_args.args[0]
@@ -260,7 +260,7 @@ class WslAdapterTests(unittest.TestCase):
         with mock.patch.object(wsl_adapter, "_bounded_process", return_value=missing):
             with self.assertRaisesRegex(wsl_adapter.WslAdapterError, "could not be canonicalized"):
                 wsl_adapter._canonicalize_cwd(
-                    "symphony-runtime", "/mnt/f/PROJECT-REPOS/symphony-runtime/missing", pathlib.Path("wsl.exe"), "test"
+                    "symphony-runtime", "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime/missing", pathlib.Path("wsl.exe"), "test"
                 )
 
     def test_wsl_service_failure_is_not_reported_as_cwd_failure(self):
@@ -274,7 +274,7 @@ class WslAdapterTests(unittest.TestCase):
         with mock.patch.object(wsl_adapter, "_bounded_process", return_value=unavailable):
             with self.assertRaisesRegex(wsl_adapter.WslAdapterError, "fixed WSL distribution is unavailable") as raised:
                 wsl_adapter._canonicalize_cwd(
-                    "symphony-runtime", "/mnt/f/PROJECT-REPOS/symphony-runtime", pathlib.Path("wsl.exe"), "test"
+                    "symphony-runtime", "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime", pathlib.Path("wsl.exe"), "test"
                 )
         self.assertEqual(raised.exception.kind, "wsl_unavailable")
 

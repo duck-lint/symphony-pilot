@@ -35,7 +35,7 @@ kept distinct:
 | Existing seam | Step 2 classification |
 |---|---|
 | `projects/<slug>/profile.toml` and `project_registry.py` | Current project-registration authority; stays outside SQLite |
-| `task_admission.py` task records and server-derived GitHub facts | Retired scheduler admission seam; retained only as non-deployed legacy source pending lifecycle/publication cleanup |
+| Historical `task_admission.py` task records and server-derived GitHub facts | Retired scheduler admission seam; deleted from the production tree under the authorized cleanup, with provenance retained in Git history |
 | `workflow/architect_policy.md` and role-policy files | Accepted lifecycle and role semantics; generated policy payload, not durable state |
 | Workpad comments, task outboxes, task JSON, logs, and process markers | Current integration/transient or generated state; not copied wholesale into relational tables |
 | `runtime/lifecycle.py` and the rendered hooks | Step-6 host lifecycle broker; no GitHub lifecycle API |
@@ -146,7 +146,6 @@ IMPLEMENTED
 REVIEW
 ADVERSARIAL_REVIEW
 FINAL_MECHANICAL_ACCEPTANCE
-ARCHIVIST
 READY_FOR_HUMAN_MERGE
 HUMAN_BLOCKED
 INFRASTRUCTURE_BLOCKED
@@ -158,7 +157,9 @@ result outcome. The contained task never writes SQLite and never chooses the
 next state. The `ARCHITECT` role is represented in
 `role_runs` and event provenance; the specialized worker role set remains
 `PROJECT-MANAGER`, `PLANNER`, `IMPLEMENTER`, `REVIEWER`, `ADVERSARY`, and
-`ARCHIVIST`.
+The Archivist is represented by its role-run and evidence records while the
+task remains in `FINAL_MECHANICAL_ACCEPTANCE` until trusted publication moves
+it to `READY_FOR_HUMAN_MERGE`.
 
 Step-6 result findings carry the finite `blocker_kind` value `human`,
 `project`, `infrastructure`, or `null`. `unresolved project decision` requires
@@ -268,7 +269,8 @@ Runtime remains an observation/read-only consumer. The host reconciliation
 operation is the only lifecycle writer; `after_run` exit status is not the
 barrier because SQLite blocker side effects govern later routing. Role-run
 records are lifecycle records of accepted orchestrator results, not proof of
-real custom-agent invocation. ARCHIVIST is the Step-6 endpoint. Step 7 owns
-publication and the final READY transition. Existing Step-8
+real custom-agent invocation. Archivist closeout is a role action at the
+`FINAL_MECHANICAL_ACCEPTANCE` state. Step 7 owns publication and the final
+READY transition. Existing Step-8
 credential-isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live
 WSL containment blockers remain open.

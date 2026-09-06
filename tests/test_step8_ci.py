@@ -33,7 +33,7 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("target_windows_version", contract["informational"])
         self.assertNotIn("product_label", contract["exact_identity"]["windows"])
         self.assertNotIn("windows_version", contract["exact_identity"]["windows"])
-        self.assertEqual(contract["disposable_runner"]["labels"][-1], "symphony-disposable")
+        self.assertNotIn("disposable_runner", contract)
 
     def test_host_contract_is_ci_metadata_not_production_deployment_authority(self):
         import deployment_contract
@@ -109,33 +109,6 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", workflow)
         self.assertIn("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", workflow)
         self.assertIn("contents: read", workflow)
-
-    def test_tier_c_is_guarded_disposable_and_not_pull_request_triggered(self):
-        workflow = (ROOT / ".github/workflows/step8-target-twin.yml").read_text()
-        trigger = workflow[workflow.index("on:"):workflow.index("permissions:")]
-        self.assertNotIn("pull_request", trigger)
-        self.assertNotIn("push:", trigger)
-        for label in ("self-hosted", "windows", "x64", "symphony-target", "symphony-disposable"):
-            self.assertIn(label, workflow)
-        self.assertIn("github.repository == 'duck-lint/symphony-pilot'", workflow)
-        self.assertIn("disposable target runner marker is absent", workflow)
-        self.assertIn("contents: read", workflow)
-
-    def test_tier_c_contains_real_storage_acceptance_probes_and_bounded_cleanup(self):
-        workflow = (ROOT / ".github/workflows/step8-target-twin.yml").read_text()
-        probe = (ROOT / "scripts/step8_target_twin_probe.py").read_text()
-        for token in (
-            "step8_target_twin_probe.py", "quota-admit-task", "quota-release-task",
-            "workspace_reclaimed", "reservation_after", "LinuxDevicesBefore",
-            "LinuxDevicesAfter", "reconciled-detached", "Remove-Item -LiteralPath $env:SYMPHONY_TARGET_VHDX",
-        ):
-            self.assertIn(token, workflow + probe)
-        for token in (
-            "task_quota_binding_from_evidence", "create_empty_task_workspace",
-            "reclaim_task_workspace", "storage_release_proof_from_evidence",
-            "PROJINHERIT", "EDQUOT",
-        ):
-            self.assertIn(token, probe)
 
     def test_evidence_writer_binds_sha_and_contract_digest(self):
         writer = (ROOT / "scripts/write_step8_evidence.py").read_text()

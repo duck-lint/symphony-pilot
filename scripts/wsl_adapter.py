@@ -34,8 +34,8 @@ MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_ARGUMENT_BYTES = 1024 * 1024
 
 PROJECT_ROOTS = {
-    "symphony-pilot": "/mnt/f/PROJECT-REPOS/symphony-pilot",
-    "symphony-runtime": "/mnt/f/PROJECT-REPOS/symphony-runtime",
+    "symphony-pilot": "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-pilot",
+    "symphony-runtime": "/mnt/f/PROJECT-REPOS/SYMPHONY/symphony-runtime",
 }
 # Storage inspection is a separate fixed capability. It does not expand the
 # executable project-root map or permit a caller-selected Linux path.

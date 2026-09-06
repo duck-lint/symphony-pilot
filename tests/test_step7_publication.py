@@ -66,7 +66,7 @@ class Step7PublicationTests(unittest.TestCase):
             for old, new in (("QUEUED", "PLANNED"), ("PLANNED", "IMPLEMENTED"),
                              ("IMPLEMENTED", "REVIEW"), ("REVIEW", "ADVERSARIAL_REVIEW"),
                              ("ADVERSARIAL_REVIEW", "FINAL_MECHANICAL_ACCEPTANCE"),
-                             ("FINAL_MECHANICAL_ACCEPTANCE", "ARCHIVIST")):
+                             ("FINAL_MECHANICAL_ACCEPTANCE", "FINAL_MECHANICAL_ACCEPTANCE")):
                 database.transition_task(self.task["id"], expected_state=old, new_state=new,
                                          event_type="validation_passed" if new == "FINAL_MECHANICAL_ACCEPTANCE" else "task_created")
             database.record_event(self.task["id"], "review_accepted", {"head_sha": self.head})
@@ -350,7 +350,7 @@ class Step7PublicationTests(unittest.TestCase):
                         publication.publish_task(self.profile, self.task["id"], database_path=database_path,
                                                  github_call=api)
                 with control_db.ControlPlaneDatabase.open_readonly(database_path) as database:
-                    self.assertEqual(database.read_task(self.task["id"])["state"], "ARCHIVIST")
+                    self.assertEqual(database.read_task(self.task["id"])["state"], "FINAL_MECHANICAL_ACCEPTANCE")
                     self.assertTrue(database.connection.execute(
                         "SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open'",
                         (self.task["id"],),

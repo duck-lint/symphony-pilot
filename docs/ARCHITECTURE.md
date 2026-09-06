@@ -36,9 +36,10 @@ the project slug. Legacy dispatch fields are not Runtime scheduler input.
 
 The trusted operator CLI creates local tasks in the host-wide
 `control.sqlite3`. It accepts only a registered project slug, title, and
-objective. Pilot resolves the registered Git remote's symbolic `HEAD` and
-exact commit with `git ls-remote --symref <remote> HEAD`; ambiguity fails
-closed. The database transaction derives the UUID, next unique `T-000001`
+objective. Pilot reads the registered repository's default ref and exact
+authoritative commit from the official GitHub API; malformed or unavailable
+facts fail closed. Git transport is used only to materialize bytes. The
+database transaction derives the UUID, next unique `T-000001`
 identifier, and `codex/t-000001-<12-hex-character-UUID-prefix>` branch.
 
 Creation produces `PREPARED`. A separate `task.py queue` command performs the
@@ -81,7 +82,7 @@ SQLite blocker side effect is the routing barrier.
 Step 7 publication is a separate trusted operator operation:
 
 ```text
-SQLite ARCHIVIST
+SQLite FINAL_MECHANICAL_ACCEPTANCE
       |
       v
 Pilot exact-head publication broker
@@ -116,7 +117,7 @@ protection and the exact PR head before merging.
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
 | Codex App Server activation | BLOCKED | existing execution-capability gate and launch boundary remain fail-closed |
 | Live Codex task containment | NOT YET PROVEN | no Codex task was started |
-| Multi-role canary and live cutover | NOT RUN | explicitly prohibited for this PR |
+| Tier-C target twin / live cutover | RETIRED | target-twin workflow, probe, and contract residue are retired; storage and containment primitives remain |
 
 ## Containment
 

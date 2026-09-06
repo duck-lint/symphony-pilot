@@ -406,7 +406,7 @@ class Step6LifecycleTests(unittest.TestCase):
 
         with control_db.open_database(self.database_path) as database:
             task = database.read_task(self.TASK_ID)
-            self.assertEqual(task["state"], "ARCHIVIST")
+            self.assertEqual(task["state"], "FINAL_MECHANICAL_ACCEPTANCE")
             self.assertEqual(task["current_head"], head)
             self.assertEqual(database.read_workpad(self.TASK_ID)["version"], 7)
             self.assertCountEqual(
@@ -416,7 +416,7 @@ class Step6LifecycleTests(unittest.TestCase):
             )
             with self.assertRaises(control_db.StateConflict):
                 database.transition_task(
-                    self.TASK_ID, expected_state="ARCHIVIST", new_state="READY_FOR_HUMAN_MERGE",
+                    self.TASK_ID, expected_state="FINAL_MECHANICAL_ACCEPTANCE", new_state="READY_FOR_HUMAN_MERGE",
                     event_type="ready_for_human_merge",
                 )
 

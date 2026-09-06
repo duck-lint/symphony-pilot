@@ -27,10 +27,10 @@ alias SymphonyElixir.Tracker.SQLite.Adapter
 :ok = Workflow.set_workflow_file_path(workflow)
 settings = Config.settings!().tracker
 {:ok, rows} = Adapter.fetch_issues_by_states_for_test(
-  ["PREPARED", "ARCHIVIST" | settings.active_states], settings)
+  ["PREPARED" | settings.active_states], settings)
 state = %Orchestrator.State{max_concurrent_agents: 1}
-expected = Map.new(1..9, fn n -> {"T-" <> String.pad_leading(to_string(n), 6, "0"), n in 2..7} end)
-true = length(rows) == 9
+expected = Map.new([1, 2, 3, 4, 5, 6, 7, 9], fn n -> {"T-" <> String.pad_leading(to_string(n), 6, "0"), n in 2..7} end)
+true = length(rows) == 8
 Enum.each(rows, fn row ->
   dispatch = Orchestrator.should_dispatch_issue_for_test(row, state)
   true = dispatch == Map.fetch!(expected, row.identifier)

@@ -201,7 +201,7 @@ class UnpublishedContinuationTests(unittest.TestCase):
             }[outcome])
             self.assertEqual(projection["blockers"], [])
 
-        self.assertEqual(self._task()["state"], "ARCHIVIST")
+        self.assertEqual(self._task()["state"], "FINAL_MECHANICAL_ACCEPTANCE")
         self.assertEqual(self._observe_remote_refs("final"), ["refs/heads/master"])
         self.assertTrue(self.remote_ref_observations)
         self.assertTrue(all(refs == ["refs/heads/master"] for _, refs in self.remote_ref_observations))

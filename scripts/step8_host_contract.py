@@ -29,7 +29,7 @@ def load_contract(path: pathlib.Path = CONTRACT_PATH) -> dict[str, Any]:
         raise HostContractError("host contract schema is not accepted")
     if document.get("version") != 1:
         raise HostContractError("host contract version is not accepted")
-    for key in ("exact_identity", "compatible_buildability", "informational", "disposable_runner"):
+    for key in ("exact_identity", "compatible_buildability", "informational"):
         if not isinstance(document.get(key), dict):
             raise HostContractError(f"host contract field is malformed: {key}")
     return document

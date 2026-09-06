@@ -42,9 +42,9 @@
       "quotactl_fd": 443
     },
     "paths": {
-      "pilot_source_root": "F:\\PROJECT-REPOS\\symphony-pilot",
-      "runtime_source_root": "F:\\PROJECT-REPOS\\symphony-runtime",
-      "canary_source_root": "F:\\PROJECT-REPOS\\symphony-canary",
+      "pilot_source_root": "F:\\PROJECT-REPOS\\SYMPHONY\\symphony-pilot",
+      "runtime_source_root": "F:\\PROJECT-REPOS\\SYMPHONY\\symphony-runtime",
+      "canary_source_root": "F:\\PROJECT-REPOS\\SYMPHONY\\symphony-canary",
       "wsl_distribution": "Ubuntu-24.04",
       "wsl_user": "duck-lint",
       "deployed_pilot_root": "/home/duck-lint/.local/share/symphony-pilot/deployments/symphony-canary",
@@ -73,18 +73,5 @@
     "target_windows_version": "2009",
     "target_d3d": "1.611.1-81528511",
     "target_dxcore": "10.0.26100.1-240331-1435.ge-release"
-  },
-  "disposable_runner": {
-    "repository": "duck-lint/symphony-pilot",
-    "branch": "codex/step-8-deployment-immutability",
-    "labels": [
-      "self-hosted",
-      "windows",
-      "x64",
-      "symphony-target",
-      "symphony-disposable"
-    ],
-    "marker_path": "C:\\SymphonyTargetRunner\\runner-marker.json",
-    "marker_schema": "symphony-pilot-disposable-target-runner/v1"
   }
 }

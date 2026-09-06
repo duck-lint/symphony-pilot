@@ -42,15 +42,15 @@ ADVERSARIAL_REVIEW
 FINAL_MECHANICAL_ACCEPTANCE
 ```
 
-It excludes PREPARED, ARCHIVIST, READY_FOR_HUMAN_MERGE, HUMAN_BLOCKED, and
+It excludes PREPARED, READY_FOR_HUMAN_MERGE, HUMAN_BLOCKED, and
 INFRASTRUCTURE_BLOCKED, and renders `agent.max_turns: 1`. ARCHIVIST is the
-Step-6 endpoint. READY remains guarded by successful exact-current-HEAD
+closeout role at the final mechanical acceptance state. READY remains guarded by successful exact-current-HEAD
 publication, which is Step 7 and has not started.
 
 ## Evidence boundary
 
 The disposable fixture producer is `scripts/generate_step6_fixture.py`; it
-contains PREPARED through ARCHIVIST, a blocked active task, and a second
+contains PREPARED through FINAL_MECHANICAL_ACCEPTANCE, a blocked active task, and a second
 project. The lifecycle E2E uses a disposable target Git repository and
 disposable SQLite database without launching Codex.
 

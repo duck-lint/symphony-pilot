@@ -32,7 +32,7 @@ onboarding is operationally recommended but is not a Runtime-start prerequisite.
 
 The separate `task publish` operation requires the host GitHub API credential,
 the bound write-enabled deploy key, and fresh ruleset proof before it can
-publish an exact ARCHIVIST head.
+publish an exact final-mechanical-acceptance head.
 
 ## Step-6 lifecycle operations
 
@@ -48,8 +48,9 @@ finishes the Architect attempt and records an infrastructure blocker. Resolve
 one inspected blocker with the exact project-scoped `task resolve-blocker`
 command, then the retained active lifecycle state becomes routable naturally.
 Do not delete lifecycle evidence or repair a task by manually setting its
-state. A task at ARCHIVIST is intentionally parked until the explicit Step-7
-publication command. Publication derives repository, branch, base, HEAD,
+state. Archivist closeout is recorded as role evidence while the task remains
+at final mechanical acceptance until the explicit Step-7 publication command.
+Publication derives repository, branch, base, HEAD,
 credentials, ruleset evidence, and PR identity from host state; it never
 consumes model publication prose. A failed publication preserves external
 recovery evidence and records an infrastructure blocker.

@@ -82,17 +82,35 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.git(root, "clone", str(remote), str(workspace))
         return profile, workspace, record
 
-    def test_remote_head_uses_structured_argv_and_fails_closed_on_ambiguity(self):
-        response = subprocess.CompletedProcess(
-            ["git"], 0, "ref: refs/heads/main\tHEAD\n" + "a" * 40 + "\tHEAD\n", ""
-        )
-        with mock.patch.object(task.subprocess, "run", return_value=response) as run:
-            self.assertEqual(task.resolve_remote_head("git@example:repo.git"), ("main", "a" * 40))
-        self.assertEqual(run.call_args.args[0], ["git", "ls-remote", "--symref", "git@example:repo.git", "HEAD"])
-        ambiguous = subprocess.CompletedProcess(["git"], 0, "ref: refs/heads/main\tHEAD\n", "")
-        with mock.patch.object(task.subprocess, "run", return_value=ambiguous):
+    def test_github_api_supplies_default_ref_and_exact_sha(self):
+        profile = self.profile(pathlib.Path("/tmp"), git_remote="ssh://untrusted.example/repo.git")
+        with mock.patch.object(task, "read_secret", return_value="host-token"), \
+             mock.patch.object(task, "github", side_effect=[
+                 {"default_branch": "main"},
+                 {"ref": "refs/heads/main", "object": {"sha": "A" * 40}},
+             ]) as github_call:
+            self.assertEqual(task.resolve_github_head(profile), ("main", "a" * 40))
+        self.assertEqual(github_call.call_args_list[0].args[2:], ("GET", ""))
+        self.assertEqual(github_call.call_args_list[1].args[2:], ("GET", "/git/ref/heads/main"))
+
+    def test_repository_transport_cannot_supply_task_authority(self):
+        source = pathlib.Path(task.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("git ls-remote", source)
+        self.assertNotIn("resolve_remote_head", source)
+        profile = self.profile(pathlib.Path("/tmp"), git_remote="file:///transport-only")
+        with mock.patch.object(task, "read_secret", return_value="host-token"), \
+             mock.patch.object(task, "github", side_effect=[
+                 {"default_branch": "trunk"},
+                 {"ref": "refs/heads/trunk", "object": {"sha": "b" * 40}},
+             ]):
+            self.assertEqual(task.resolve_github_head(profile), ("trunk", "b" * 40))
+
+    def test_github_authority_fails_closed_when_facts_are_unavailable(self):
+        profile = self.profile(pathlib.Path("/tmp"))
+        with mock.patch.object(task, "read_secret", return_value="host-token"), \
+             mock.patch.object(task, "github", side_effect=task.TaskCommandError("API unavailable")):
             with self.assertRaises(task.TaskCommandError):
-                task.resolve_remote_head("git@example:repo.git")
+                task.resolve_github_head(profile)
 
     def test_create_queues_through_local_db_and_branch_is_not_caller_authority(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,7 +118,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
             database_path = root / "control.sqlite3"
             profile = self.profile(root)
             with mock.patch.object(task, "_profile", return_value=profile), \
-                 mock.patch.object(task, "resolve_remote_head", return_value=("main", "a" * 40)), \
+                 mock.patch.object(task, "resolve_github_head", return_value=("main", "a" * 40)), \
                  mock.patch.object(task, "default_database_path", return_value=database_path):
                 self.assertEqual(task.create(Namespace(project="alpha", title="Local task", objective="Do it")), 0)
                 with control_db.open_database(database_path) as database:
@@ -159,7 +177,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
             database_path = root / "control.sqlite3"
             profile = self.profile(root)
             with mock.patch.object(task, "_profile", return_value=profile), \
-                 mock.patch.object(task, "resolve_remote_head", return_value=("main", "a" * 40)), \
+                 mock.patch.object(task, "resolve_github_head", return_value=("main", "a" * 40)), \
                  mock.patch.object(task, "default_database_path", return_value=database_path), \
                  mock.patch.object(task, "verify_profile_storage",
                                    side_effect=task.TaskCommandError("quota backend unavailable")):

@@ -755,7 +755,10 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     next_state = {
         "planning_complete": "PLANNED", "implementation_complete": "IMPLEMENTED",
         "review_approved": "REVIEW", "adversary_pass": "ADVERSARIAL_REVIEW",
-        "validation_pass": "FINAL_MECHANICAL_ACCEPTANCE", "archive_complete": "ARCHIVIST",
+        # Archivist is a role run/evidence record, not a durable lifecycle
+        # state. Closeout leaves the task in final mechanical acceptance for
+        # the trusted publication broker to gate.
+        "validation_pass": "FINAL_MECHANICAL_ACCEPTANCE", "archive_complete": "FINAL_MECHANICAL_ACCEPTANCE",
         "correction_complete": "IMPLEMENTED", "correction_required": state,
         "blocked": state,
     }[outcome]

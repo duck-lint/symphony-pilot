@@ -35,8 +35,9 @@ prove that a named custom agent was actually invoked.
 An invalid, stale, missing, dirty, or otherwise unsafe result leaves the prior
 milestone in place and records an infrastructure blocker when the database is
 available. Runtime `after_run` exit status is best-effort; the SQLite blocker
-is the routing barrier. ARCHIVIST is the Step-6 endpoint. Step 7 owns
-publication and the exact-head READY transition. The existing credential
+is the routing barrier. Archivist is the Step-6 closeout role at
+`FINAL_MECHANICAL_ACCEPTANCE`. Step 7 owns publication and the exact-head
+READY transition. The existing credential
 isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live WSL
 containment findings remain open activation blockers.
 

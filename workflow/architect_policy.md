@@ -18,7 +18,7 @@ sequential lifecycle is:
       -> REVIEW
       -> ADVERSARIAL REVIEW
       -> FINAL MECHANICAL ACCEPTANCE
-      -> ARCHIVIST
+      -> FINAL MECHANICAL ACCEPTANCE + ARCHIVIST CLOSEOUT
       -> READY FOR HUMAN MERGE (Step 7 only)
 
 The ARCHITECT / ORCHESTRATOR owns task interpretation, authority
@@ -191,4 +191,4 @@ stop conditions.
 
 On successful closeout, return one bounded lifecycle result with round
 evidence, exact current HEAD, capability limitations, and the archivist
-packet. ARCHIVIST is the Step-6 endpoint; publication and READY are Step 7.
+packet. ARCHIVIST is a Step-6 closeout role; publication and READY are Step 7.
