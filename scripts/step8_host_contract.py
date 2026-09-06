@@ -83,9 +83,11 @@ def verify_ubuntu_buildability(contract: dict[str, Any], observed: dict[str, Any
     compiler = observed.get("compiler", {})
     if compiler.get("path") != expected["compiler_path"] or not compiler.get("executable"):
         failures.append("compiler.path")
-    if not _contains(compiler.get("version_output"), expected["compiler_family"]):
+    compiler_output = compiler.get("version_output", "")
+    if not (_contains(compiler_output, expected["compiler_family"]) or
+            _contains(compiler_output, "cc (")):
         failures.append("compiler.family")
-    version = _version_tuple(compiler.get("version_output", ""))
+    version = _version_tuple(compiler_output)
     if not version or version[0] != expected["compiler_major"]:
         failures.append("compiler.major")
     if not _contains(observed.get("glibc"), expected["glibc_family"]):

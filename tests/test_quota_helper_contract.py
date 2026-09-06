@@ -864,7 +864,8 @@ int main(void) {{
         self.assertIsNotNone(match)
         return match.group(0)
 
-    @unittest.skipUnless(shutil.which("sh"), "POSIX shell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("sh"),
+                         "native POSIX shell unavailable")
     def test_exact_copy_is_proven_before_identity_and_execution(self):
         install_function = self._verified_helper_install_shell_function()
         with tempfile.TemporaryDirectory(prefix="symphony-helper-copy-") as directory:
@@ -926,7 +927,8 @@ echo "exact-copy install: PASS"
         self.assertTrue(executed_exists)
         self.assertFalse(temp_exists)
 
-    @unittest.skipUnless(shutil.which("sh"), "POSIX shell unavailable")
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("sh"),
+                         "native POSIX shell unavailable")
     def test_corrupt_install_fails_before_identity_or_helper_execution(self):
         install_function = self._verified_helper_install_shell_function()
         with tempfile.TemporaryDirectory(prefix="symphony-helper-corrupt-") as directory:
@@ -985,8 +987,9 @@ touch "{executed}"
         self.assertFalse(temp_exists)
 
     @unittest.skipUnless(
-        shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,
-        "root POSIX shell unavailable",
+        sys.platform.startswith("linux") and shutil.which("sh") and
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root native POSIX shell unavailable",
     )
     def test_missing_compiler_preflight_stops_before_mutation(self):
         preflight = self._preflight_shell_function()
@@ -1019,8 +1022,9 @@ touch "{marker}"
         self.assertFalse(marker.exists())
 
     @unittest.skipUnless(
-        shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,
-        "root POSIX shell unavailable",
+        sys.platform.startswith("linux") and shutil.which("sh") and
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root native POSIX shell unavailable",
     )
     def test_failing_compiler_preflight_stops_before_mutation(self):
         preflight = self._preflight_shell_function()
@@ -1056,8 +1060,9 @@ touch "{marker}"
         self.assertFalse(marker.exists())
 
     @unittest.skipUnless(
-        shutil.which("sh") and hasattr(os, "geteuid") and os.geteuid() == 0,
-        "root POSIX shell unavailable",
+        sys.platform.startswith("linux") and shutil.which("sh") and
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root native POSIX shell unavailable",
     )
     def test_successful_preflight_installs_same_binary_without_recompile(self):
         preflight = self._preflight_shell_function()

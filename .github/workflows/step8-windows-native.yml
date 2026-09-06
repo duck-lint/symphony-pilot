@@ -20,6 +20,13 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
 
+      - name: Preserve source bytes for digest contracts
+        shell: pwsh
+        run: |
+          git config core.autocrlf false
+          git config core.eol lf
+          git reset --hard HEAD
+
       - name: Create evidence directory
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path artifacts/step8 | Out-Null
