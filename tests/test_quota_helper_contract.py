@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import stat
@@ -100,18 +101,22 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("Remove-NewlyCreatedVhdx", recipe)
         self.assertIn("maximum=65536 type=fixed", recipe)
         self.assertIn("VirtualDiskAccessGetInfo = 0x00080000", recipe)
-        self.assertIn("OpenVirtualDiskVersion2 = 2", recipe)
         self.assertIn("GetVirtualDiskInfoSize = 1", recipe)
         self.assertIn("GetVirtualDiskInfoVirtualStorageType = 6", recipe)
         self.assertIn("GetVirtualDiskInfoProviderSubtype = 7", recipe)
-        self.assertIn("GetInfoOnly = 1", recipe)
-        self.assertIn("ReadOnly = 1", recipe)
-        self.assertIn("ResiliencyGuid = Guid.Empty", recipe)
-        self.assertIn("VirtualStorageTypeDeviceVhdx = 3", recipe)
-        self.assertIn("MicrosoftVendorId", recipe)
+        self.assertIn("VirtualStorageTypeDeviceUnknown = 0", recipe)
+        self.assertIn("VendorId = Guid.Empty", recipe)
+        self.assertIn("OpenVirtualDiskFlagNone,\n                    IntPtr.Zero", recipe)
         self.assertIn("IntPtr sizeUsed", recipe)
         self.assertIn("IntPtr.Zero", recipe)
         self.assertIn("SafeVirtualDiskHandle", recipe)
+        self.assertIn("public SafeVirtualDiskHandle()", recipe)
+        self.assertIn('"OpenVirtualDisk"', recipe)
+        self.assertIn('"VIRTUAL_STORAGE_TYPE"', recipe)
+        self.assertIn('"PROVIDER_SUBTYPE"', recipe)
+        self.assertIn('"SIZE"', recipe)
+        self.assertIn("VirtDiskStageException", recipe)
+        self.assertIn("status=$([uint32]$failure.Status)", recipe)
         self.assertIn("Size = 32", recipe)
         self.assertIn("FieldOffset(16)] public ulong PhysicalSize", recipe)
         self.assertIn("FieldOffset(24)] public uint BlockSize", recipe)
@@ -128,6 +133,9 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertNotIn("ExpandVirtualDisk", recipe)
         self.assertNotIn("VirtualDiskAccessMetaOps", recipe)
         self.assertNotIn("VirtualDiskAccessAttach", recipe)
+        self.assertNotIn("OpenVirtualDiskParameters", recipe)
+        self.assertNotIn("GetInfoOnly", recipe)
+        self.assertNotIn("ReadOnly", recipe)
         self.assertNotIn("New-VHD", recipe)
         self.assertNotIn("Get-VHD", recipe)
         self.assertNotIn("Mount-VHD", recipe)
@@ -267,15 +275,9 @@ try {{
     if ($layout.SizeInfoVersion -ne 1 -or
         $layout.VirtualStorageTypeInfoVersion -ne 6 -or
         $layout.ProviderSubtypeInfoVersion -ne 7 -or
-        $layout.RequestedDeviceId -ne 3 -or
-        $layout.RequestedVendorId.ToString() -ne
-            "ec984aec-a0f9-47e9-901f-71415a66345b" -or
+        $layout.RequestedDeviceId -ne 0 -or
+        $layout.RequestedVendorId -ne [guid]::Empty -or
         $layout.InformationAccessMask -ne 0x00080000) {{ exit 1 }}
-    if ($layout.OpenParametersSize -ne 28 -or
-        $layout.OpenParametersVersionOffset -ne 0 -or
-        $layout.OpenParametersGetInfoOnlyOffset -ne 4 -or
-        $layout.OpenParametersReadOnlyOffset -ne 8 -or
-        $layout.OpenParametersResiliencyGuidOffset -ne 12) {{ exit 1 }}
     if ($layout.GetInfoBufferSize -ne 32 -or
         $layout.GetInfoVersionOffset -ne 0 -or
         $layout.GetInfoVirtualSizeOffset -ne 8 -or
@@ -286,7 +288,11 @@ try {{
         $layout.GetInfoProviderSubtypeOffset -ne 8) {{ exit 1 }}
     try {{ [SymphonyVirtDiskEvidence]::Read($temporary) | Out-Null; exit 1 }}
     catch {{
-        if ($_.Exception.Message -match "Unable to load DLL|EntryPointNotFound|TypeInitialization") {{ exit 1 }}
+        if ($_.Exception.Message -notmatch "VirtDisk native operation failed") {{ exit 1 }}
+    }}
+    try {{ Get-NativeVhdxInformation $temporary | Out-Null; exit 1 }}
+    catch {{
+        if ($_.Exception.Message -notmatch "stage 'OpenVirtualDisk' \\(status=\\d+\\)") {{ exit 1 }}
     }}
     "VirtDisk read-only API smoke: PASS"
 }}
@@ -300,6 +306,53 @@ finally {{
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("VirtDisk read-only API smoke: PASS", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("pwsh"),
+                         "Windows PowerShell unavailable")
+    def test_positive_temporary_fixed_vhdx_virtdisk_smoke(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        verifier_start = recipe.index("function Get-NativeVhdxInformation")
+        verifier_end = recipe.index("function Get-NativeAllocatedFileBytes")
+        verifier = recipe[verifier_start:verifier_end]
+        diskpart = pathlib.Path(
+            shutil.which("diskpart.exe") or
+            pathlib.Path(os.environ["SystemRoot"]) / "System32" / "diskpart.exe"
+        )
+        with tempfile.TemporaryDirectory(prefix="symphony-virtdisk-smoke-") as directory:
+            root = pathlib.Path(directory)
+            fixture = root / "fixture.vhdx"
+            script = root / "create.txt"
+            script.write_text(
+                f'create vdisk file="{fixture}" maximum=16 type=fixed\r\n'
+                "exit\r\n",
+                encoding="ascii",
+            )
+            created = subprocess.run(
+                [str(diskpart), "/s", str(script)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            self.assertTrue(fixture.is_file())
+            command = f'''$ErrorActionPreference = "Stop"
+{verifier}
+$info = Get-NativeVhdxInformation "{fixture}"
+if ($info.DeviceId -ne 3 -or
+    $info.VendorId.ToString() -ne
+        "ec984aec-a0f9-47e9-901f-71415a66345b" -or
+    $info.ProviderSubtype -ne 2 -or
+    $info.VirtualSize -ne 16MB) {{ exit 1 }}
+"Temporary fixed VHDX VirtDisk smoke: PASS size=16MiB device=$($info.DeviceId) vendor=$($info.VendorId) subtype=$($info.ProviderSubtype) virtualSize=$($info.VirtualSize)"
+'''
+            inspected = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(inspected.returncode, 0, inspected.stderr)
+            self.assertIn("Temporary fixed VHDX VirtDisk smoke: PASS", inspected.stdout)
 
     def test_wsl_vhd_capability_uses_help_grammar_not_exit_status(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
