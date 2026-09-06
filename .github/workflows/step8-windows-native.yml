@@ -35,6 +35,27 @@ jobs:
         shell: pwsh
         run: ./scripts/collect_step8_windows_observation.ps1 -OutputPath artifacts/step8/windows-host.json
 
+      - name: Record hosted WSL grammar availability
+        shell: pwsh
+        run: |
+          $wsl = Join-Path $env:SystemRoot "System32\wsl.exe"
+          $available = $false
+          $help = ""
+          if (Test-Path -LiteralPath $wsl -PathType Leaf) {
+            $help = (& $wsl --help 2>&1 | Out-String)
+            $available = $help -match '(?m)--mount' -and $help -match '(?m)--vhd' -and
+              $help -match '(?m)--bare' -and $help -match '(?m)--unmount'
+          }
+          $document = Get-Content -LiteralPath artifacts/step8/windows-host.json -Raw | ConvertFrom-Json
+          $document | Add-Member -NotePropertyName wsl_grammar -NotePropertyValue ([ordered]@{
+            available = $available
+            required_tokens = @("--mount", "--vhd", "--bare", "--unmount")
+          }) -Force
+          $document | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath artifacts/step8/windows-host.json -Encoding utf8NoBOM
+          if (-not $available) {
+            Write-Warning "hosted Windows WSL direct-VHD grammar unavailable; this is not Tier C evidence"
+          }
+
       - name: Verify compatible Windows native contract
         shell: pwsh
         run: python scripts/verify_step8_host.py --tier windows-native --observed-file artifacts/step8/windows-host.json --output artifacts/step8/windows-verification.json
@@ -60,20 +81,6 @@ jobs:
             if (-not $summary) { $summary = 'focused Windows storage contract suite failed; see windows-tests.log' }
             Write-Output "::error file=tests/test_quota_helper_contract.py::$summary"
             exit $LASTEXITCODE
-          }
-
-      - name: Run non-mutating WSL grammar probe when WSL is present
-        shell: pwsh
-        run: |
-          $wsl = Join-Path $env:SystemRoot "System32\wsl.exe"
-          if (-not (Test-Path -LiteralPath $wsl -PathType Leaf)) {
-            Write-Host "WSL grammar probe unavailable on hosted Windows runner; this is not Tier C evidence."
-            exit 0
-          }
-          $help = (& $wsl --help 2>&1 | Out-String)
-          if ($help -notmatch '(?m)--mount' -or $help -notmatch '(?m)--vhd' -or
-              $help -notmatch '(?m)--bare' -or $help -notmatch '(?m)--unmount') {
-            throw "required WSL direct-VHD grammar is not advertised"
           }
 
       - name: Write final exact-SHA evidence

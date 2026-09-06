@@ -115,8 +115,10 @@ fail:
 
 static int quota_control(int operation, int pool_fd, uint32_t id,
                          struct dqblk *quota) {
+    /* glibc does not expose qid_t under the reviewed C11 feature surface;
+     * quotactl_fd's Linux ABI qid field is the fixed 32-bit project ID. */
     return (int)syscall(SYS_quotactl_fd, pool_fd,
-                         QCMD(operation, PRJQUOTA), (qid_t)id,
+                         QCMD(operation, PRJQUOTA), (uint32_t)id,
                          (char *)quota);
 }
 

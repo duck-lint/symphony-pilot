@@ -63,6 +63,8 @@ class QuotaHelperContractTests(unittest.TestCase):
         self.assertIn("Q_SETQUOTA", helper)
         self.assertIn("struct dqblk", helper)
         self.assertIn("SYS_quotactl_fd", helper)
+        self.assertIn("(uint32_t)id", helper)
+        self.assertNotIn("(qid_t)id", helper)
         self.assertNotIn("Q_XGETQUOTA", helper)
         self.assertNotIn("Q_XSETQLIM", helper)
 
