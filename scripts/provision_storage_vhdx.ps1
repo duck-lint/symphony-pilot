@@ -269,10 +269,75 @@ function Invoke-DiskPartFixedVhdxCreate {
     }
 }
 
+function Get-InteropContractIdentity {
+    param([Parameter(Mandatory)][string]$Source)
+    $normalized = $Source.Replace("`r`n", "`n").Trim()
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($normalized)
+        $hash = $sha256.ComputeHash($bytes)
+        "sha256:" + ([BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant())
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Read-InteropTypeIdentity {
+    param([Parameter(Mandatory)][type]$Type)
+    $field = $Type.GetField(
+        "InteropContractIdentity",
+        [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static
+    )
+    if ($null -eq $field -or $field.FieldType -ne [string]) {
+        throw "interop type does not expose a safe contract identity"
+    }
+    $identity = [string]$field.GetRawConstantValue()
+    if ([string]::IsNullOrWhiteSpace($identity)) {
+        throw "interop type returned an empty contract identity"
+    }
+    $identity
+}
+
+function Ensure-InteropType {
+    param(
+        [Parameter(Mandatory)][string]$TypeName,
+        [Parameter(Mandatory)][string]$Source
+    )
+    $expectedIdentity = Get-InteropContractIdentity $Source
+    $loaded = $TypeName -as [type]
+    if ($null -ne $loaded) {
+        try {
+            $actualIdentity = Read-InteropTypeIdentity $loaded
+        }
+        catch {
+            throw "stale PowerShell interop type conflicts with deployed storage contract; start a fresh elevated PowerShell session"
+        }
+        if ($actualIdentity -ne $expectedIdentity) {
+            throw "stale PowerShell interop type conflicts with deployed storage contract; start a fresh elevated PowerShell session"
+        }
+        return
+    }
+    $compiledSource = $Source.Replace(
+        "sha256:{INTEROP_CONTRACT_IDENTITY}",
+        $expectedIdentity
+    )
+    try {
+        Add-Type -TypeDefinition $compiledSource
+        $loaded = $TypeName -as [type]
+        if ($null -eq $loaded -or
+            (Read-InteropTypeIdentity $loaded) -ne $expectedIdentity) {
+            throw "compiled interop type identity did not match deployed storage contract"
+        }
+    }
+    catch {
+        throw "fresh PowerShell interop type failed deployed storage contract verification"
+    }
+}
+
 function Get-NativeVhdxInformation {
     param([Parameter(Mandatory)][string]$Path)
-    if ($null -eq ("SymphonyVirtDiskEvidence" -as [type])) {
-        Add-Type -TypeDefinition @"
+    $source = @'
 using System;
 using System.ComponentModel;
 using Microsoft.Win32.SafeHandles;
@@ -280,6 +345,8 @@ using System.Runtime.InteropServices;
 
 public static class SymphonyVirtDiskEvidence
 {
+    public const string InteropContractIdentity = "sha256:{INTEROP_CONTRACT_IDENTITY}";
+
     private const uint VirtualDiskAccessGetInfo = 0x00080000;
     private const uint OpenVirtualDiskFlagNone = 0;
     private const uint GetVirtualDiskInfoSize = 1;
@@ -489,8 +556,8 @@ public static class SymphonyVirtDiskEvidence
         }
     }
 }
-"@
-    }
+'@
+    Ensure-InteropType "SymphonyVirtDiskEvidence" $source
     try {
         [SymphonyVirtDiskEvidence]::Read($Path)
     }
@@ -512,20 +579,21 @@ public static class SymphonyVirtDiskEvidence
 
 function Get-NativeAllocatedFileBytes {
     param([Parameter(Mandatory)][string]$Path)
-    if ($null -eq ("SymphonyNativeFileEvidence" -as [type])) {
-        Add-Type -TypeDefinition @"
+    $source = @'
 using System;
 using System.Runtime.InteropServices;
 
 public static class SymphonyNativeFileEvidence
 {
+    public const string InteropContractIdentity = "sha256:{INTEROP_CONTRACT_IDENTITY}";
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint GetCompressedFileSizeW(
         string lpFileName,
         out uint lpFileSizeHigh);
 }
-"@
-    }
+'@
+    Ensure-InteropType "SymphonyNativeFileEvidence" $source
     [uint32]$high = 0
     [uint32]$low = [SymphonyNativeFileEvidence]::GetCompressedFileSizeW(
         $Path,

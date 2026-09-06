@@ -220,9 +220,10 @@ if (-not (Must-Fail $valid ([pscustomobject]@{{ PSIsContainer=$false; FullName=$
                          "Windows PowerShell unavailable")
     def test_native_allocated_size_smoke_uses_fixed_windows_api(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
         start = recipe.index("function Get-NativeAllocatedFileBytes")
         end = recipe.index("function Remove-NewlyCreatedVhdx")
-        helper = recipe[start:end]
+        helper = recipe[helper_start:end]
         command = f'''$ErrorActionPreference = "Stop"
 {helper}
 $temporary = [IO.Path]::GetTempFileName()
@@ -262,9 +263,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\\VirtDisk.
                          "Windows PowerShell unavailable")
     def test_virtdisk_readonly_api_smoke_resolves_and_rejects_ordinary_file(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
         start = recipe.index("function Get-NativeVhdxInformation")
         end = recipe.index("function Get-NativeAllocatedFileBytes")
-        verifier = recipe[start:end]
+        verifier = recipe[helper_start:end]
         command = f'''$ErrorActionPreference = "Stop"
 {verifier}
 $temporary = [IO.Path]::GetTempFileName()
@@ -311,9 +313,10 @@ finally {{
                          "Windows PowerShell unavailable")
     def test_positive_temporary_fixed_vhdx_virtdisk_smoke(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
         verifier_start = recipe.index("function Get-NativeVhdxInformation")
         verifier_end = recipe.index("function Get-NativeAllocatedFileBytes")
-        verifier = recipe[verifier_start:verifier_end]
+        verifier = recipe[helper_start:verifier_end]
         diskpart = pathlib.Path(
             shutil.which("diskpart.exe") or
             pathlib.Path(os.environ["SystemRoot"]) / "System32" / "diskpart.exe"
@@ -353,6 +356,167 @@ if ($info.DeviceId -ne 3 -or
             )
             self.assertEqual(inspected.returncode, 0, inspected.stderr)
             self.assertIn("Temporary fixed VHDX VirtDisk smoke: PASS", inspected.stdout)
+
+    def test_interop_contract_identity_is_source_derived_and_guarded(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        self.assertIn("function Get-InteropContractIdentity", recipe)
+        self.assertIn("function Read-InteropTypeIdentity", recipe)
+        self.assertIn("function Ensure-InteropType", recipe)
+        self.assertIn('"SymphonyVirtDiskEvidence"', recipe)
+        self.assertIn('"SymphonyNativeFileEvidence"', recipe)
+        self.assertIn('InteropContractIdentity', recipe)
+        self.assertIn('sha256:{INTEROP_CONTRACT_IDENTITY}', recipe)
+        self.assertIn(
+            "stale PowerShell interop type conflicts with deployed storage contract; "
+            "start a fresh elevated PowerShell session",
+            recipe,
+        )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_interop_contract_digest_changes_when_embedded_source_changes(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
+        helper_end = recipe.index("function Get-NativeVhdxInformation")
+        helpers = recipe[helper_start:helper_end]
+        command = f'''$ErrorActionPreference = "Stop"
+{helpers}
+$sourceA = "embedded implementation marker"
+$sourceB = $sourceA.Replace("marker", "changed")
+if ((Get-InteropContractIdentity $sourceA) -eq (Get-InteropContractIdentity $sourceB)) {{ exit 1 }}
+"Interop contract digest mutation: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Interop contract digest mutation: PASS", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_stale_virtdisk_type_fails_before_native_method_invocation(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
+        verifier_start = recipe.index("function Get-NativeVhdxInformation")
+        verifier_end = recipe.index("function Get-NativeAllocatedFileBytes")
+        verifier = recipe[helper_start:verifier_end]
+        command = f'''$ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition @'
+using System;
+public static class SymphonyVirtDiskEvidence
+{{
+    public const string InteropContractIdentity = "sha256:stale";
+    public static object Read(string path) {{ throw new Exception("SENTINEL_INVOKED"); }}
+}}
+'@
+{verifier}
+try {{ Get-NativeVhdxInformation "unused" | Out-Null; exit 1 }}
+catch {{
+    if ($_.Exception.Message -notmatch "stale PowerShell interop type conflicts") {{ exit 1 }}
+    if ($_.Exception.Message -match "SENTINEL_INVOKED") {{ exit 1 }}
+}}
+"Stale VirtDisk interop guard: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Stale VirtDisk interop guard: PASS", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_identity_absent_virtdisk_type_fails_closed_before_invocation(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
+        verifier_start = recipe.index("function Get-NativeVhdxInformation")
+        verifier_end = recipe.index("function Get-NativeAllocatedFileBytes")
+        verifier = recipe[helper_start:verifier_end]
+        command = f'''$ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition @'
+using System;
+public static class SymphonyVirtDiskEvidence
+{{
+    public static object Read(string path) {{ throw new Exception("SENTINEL_INVOKED"); }}
+}}
+'@
+{verifier}
+try {{ Get-NativeVhdxInformation "unused" | Out-Null; exit 1 }}
+catch {{
+    if ($_.Exception.Message -notmatch "stale PowerShell interop type conflicts") {{ exit 1 }}
+    if ($_.Exception.Message -match "SENTINEL_INVOKED") {{ exit 1 }}
+}}
+"Identity-absent VirtDisk interop guard: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Identity-absent VirtDisk interop guard: PASS", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_matching_virtdisk_type_is_reused_within_one_process(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
+        verifier_start = recipe.index("function Get-NativeVhdxInformation")
+        verifier_end = recipe.index("function Get-NativeAllocatedFileBytes")
+        verifier = recipe[helper_start:verifier_end]
+        command = f'''$ErrorActionPreference = "Stop"
+{verifier}
+$temporary = [IO.Path]::GetTempFileName()
+try {{
+    $messages = @()
+    foreach ($unused in 1..2) {{
+        try {{ Get-NativeVhdxInformation $temporary | Out-Null; exit 1 }}
+        catch {{ $messages += $_.Exception.Message }}
+    }}
+    if ($messages.Count -ne 2) {{ exit 1 }}
+    foreach ($message in $messages) {{
+        if ($message -notmatch "stage 'OpenVirtualDisk' \\(status=\\d+\\)") {{ exit 1 }}
+        if ($message -match "stale PowerShell interop type conflicts") {{ exit 1 }}
+    }}
+    "Matching VirtDisk interop reuse: PASS"
+}}
+finally {{
+    if (Test-Path -LiteralPath $temporary) {{ [IO.File]::Delete($temporary) }}
+}}
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Matching VirtDisk interop reuse: PASS", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell unavailable")
+    def test_stale_native_file_type_fails_before_native_method_invocation(self):
+        recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
+        helper_start = recipe.index("function Get-InteropContractIdentity")
+        loader_start = recipe.index("function Get-NativeAllocatedFileBytes")
+        loader_end = recipe.index("function Remove-NewlyCreatedVhdx")
+        loader = recipe[helper_start:loader_end]
+        command = f'''$ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition @'
+using System;
+public static class SymphonyNativeFileEvidence
+{{
+    public const string InteropContractIdentity = "sha256:stale";
+    public static uint GetCompressedFileSizeW(string path, out uint high) {{ throw new Exception("SENTINEL_INVOKED"); }}
+}}
+'@
+{loader}
+try {{ Get-NativeAllocatedFileBytes "unused" | Out-Null; exit 1 }}
+catch {{
+    if ($_.Exception.Message -notmatch "stale PowerShell interop type conflicts") {{ exit 1 }}
+    if ($_.Exception.Message -match "SENTINEL_INVOKED") {{ exit 1 }}
+}}
+"Stale native-file interop guard: PASS"
+'''
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Stale native-file interop guard: PASS", result.stdout)
 
     def test_wsl_vhd_capability_uses_help_grammar_not_exit_status(self):
         recipe = (ROOT / "scripts" / "provision_storage_vhdx.ps1").read_text()
