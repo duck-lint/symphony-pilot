@@ -69,7 +69,7 @@ class Step8CiContractTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/step8-buildability.yml").read_text()
         self.assertIn("runs-on: ubuntu-24.04", workflow)
         self.assertIn("/usr/bin/cc -std=c11 -O2 -Wall -Wextra -Werror", workflow)
-        self.assertIn("python3 -m unittest discover -s tests -v", workflow)
+        self.assertIn("run_step8_full_suite.py", workflow)
         self.assertIn("test_helper_compiles_with_strict_linux_warnings", workflow)
         self.assertIn("sudo -E python3 -m unittest", workflow)
         self.assertNotIn("continue-on-error: true", workflow)
@@ -101,6 +101,13 @@ class Step8CiContractTests(unittest.TestCase):
         self.assertIn('evidence.get("git_sha") != git_sha()', writer)
         self.assertIn("contract_digest(CONTRACT_PATH)", writer)
         self.assertIn('"target_contract_sha256"', verifier)
+
+    def test_full_suite_runner_records_bounded_failure_identity(self):
+        runner = (ROOT / "scripts/run_step8_full_suite.py").read_text()
+        self.assertIn("RecordingResult", runner)
+        self.assertIn("result.failure_records", runner)
+        self.assertIn('"symphony-pilot-step8-test-result/v1"', runner)
+        self.assertIn("::error file=tests::", runner)
 
 
 if __name__ == "__main__":
