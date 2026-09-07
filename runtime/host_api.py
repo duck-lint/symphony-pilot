@@ -13,6 +13,7 @@ import json
 import pathlib
 import re
 import socket
+import subprocess
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,7 @@ from process_identity import matches
 from project_registry import resolve_project, validate_registry
 from runtime_lock import RuntimeLockError, validate_lock
 from storage import capacity_snapshot
+from workspace_boundary import WorkspaceBoundaryError, physical_directory, run_git, validate_repository
 
 
 TASK_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -32,6 +34,7 @@ SECRET_PATTERNS = (
     re.compile(r"\bBearer\s+[^\s]+", re.I),
 )
 STATIC_ROOT = pathlib.Path(__file__).resolve().parents[1] / "web"
+MAX_DIFF_CHARS = 256 * 1024
 
 
 def redact(value: object) -> object:
@@ -93,7 +96,10 @@ class HostControlApplication:
                 "repository": profile.repository,
                 "dashboard_port": profile.dashboard_port,
                 "task_count": len(tasks),
-                "execution": {"enabled": False, "reason": "activation architecture remains blocked"},
+                "execution": {
+                    "enabled": True, "mode": "supervised-local",
+                    "reason": "operator opt-in required",
+                },
                 "deployment": self._deployment_summary(profile),
                 "process": self._process_summary(profile),
                 "runtime": self._runtime_summary(profile),
@@ -114,6 +120,204 @@ class HostControlApplication:
         if projection["task"]["project_slug"] != slug:  # type: ignore[index]
             raise ApiError(404, "unknown_task", "task is not registered to this project")
         return redact(projection)  # type: ignore[return-value]
+
+    def execution_receipt(self, slug: str, task_id: str) -> dict[str, object]:
+        """Read Git evidence for one host-resolved task workspace.
+
+        The task row remains the authority for the branch and change range.
+        Git is used only to observe the already-authorized workspace; no Git
+        command here can alter refs, configuration, remotes, or the index.
+        """
+        profile = self._profile(slug)
+        self._validate_task_id(task_id)
+        with self._read_database() as database:
+            projection = database.read_projection(task_id)
+        task = projection["task"]
+        if task["project_slug"] != slug:  # type: ignore[index]
+            raise ApiError(404, "unknown_task", "task is not registered to this project")
+
+        workspace, exists = self._task_workspace(profile, task)  # type: ignore[arg-type]
+        current_head = task["current_head"]
+        base_sha = str(task["base_sha"])
+        published_head = task["published_head"]
+        receipt: dict[str, object] = {
+            "workspace": {
+                "wsl_path": str(workspace),
+                "exists": exists,
+                "clean": None,
+            },
+            "git": {
+                "branch": str(task["branch"]),
+                "expected_branch": str(task["branch"]),
+                "head": None,
+                "base_sha": base_sha,
+                "current_head": current_head,
+                "published_head": published_head,
+            },
+            "commit": None,
+            "commits": [],
+            "change_summary": {
+                "files_changed": None,
+                "insertions": None,
+                "deletions": None,
+                "files": [],
+            },
+            "diff": {
+                "unified_patch": "Workspace not currently present." if not exists else "",
+                "truncated": False,
+            },
+        }
+        if not exists:
+            return redact(receipt)  # type: ignore[return-value]
+
+        try:
+            validate_repository(workspace)
+            remote = self._git(workspace, "remote", "get-url", "origin")
+            if remote != profile.git_remote:
+                raise ApiError(409, "workspace_repository_mismatch",
+                               "task workspace remote differs from the registered repository")
+            branch = self._git(workspace, "branch", "--show-current")
+            if branch != task["branch"]:
+                raise ApiError(409, "workspace_branch_mismatch",
+                               "task workspace is not on the SQLite-recorded task branch")
+            head = self._git(workspace, "rev-parse", "HEAD")
+            clean = not self._git(
+                workspace, "status", "--porcelain=v1", "--untracked-files=all"
+            )
+            receipt["workspace"]["clean"] = clean  # type: ignore[index]
+            receipt["git"]["branch"] = branch  # type: ignore[index]
+            receipt["git"]["head"] = head  # type: ignore[index]
+
+            if current_head is None:
+                receipt["diff"] = {
+                    "unified_patch": "No committed task changes.",
+                    "truncated": False,
+                }
+                return redact(receipt)  # type: ignore[return-value]
+            if str(current_head) == base_sha:
+                receipt["diff"] = {
+                    "unified_patch": "No committed task changes.",
+                    "truncated": False,
+                }
+                receipt["change_summary"] = {
+                    "files_changed": 0,
+                    "insertions": 0,
+                    "deletions": 0,
+                    "files": [],
+                }
+                return redact(receipt)  # type: ignore[return-value]
+
+            commits = self._commits(workspace, base_sha, str(current_head))
+            receipt["commits"] = commits
+            receipt["commit"] = commits[-1] if commits else None
+            summary = self._change_summary(workspace, base_sha, str(current_head))
+            receipt["change_summary"] = summary
+            patch = self._git(workspace, "diff", "--unified=3", f"{base_sha}..{current_head}")
+            receipt["diff"] = {
+                "unified_patch": patch[:MAX_DIFF_CHARS],
+                "truncated": len(patch) > MAX_DIFF_CHARS,
+            }
+            return redact(receipt)  # type: ignore[return-value]
+        except ApiError:
+            raise
+        except (WorkspaceBoundaryError, OSError, subprocess.SubprocessError) as exc:
+            raise ApiError(409, "workspace_untrusted", str(exc)) from exc
+
+    @staticmethod
+    def _task_workspace(profile, task: dict[str, object]) -> tuple[pathlib.Path, bool]:
+        """Resolve only the registered project root plus SQLite task identifier."""
+        identifier = str(task["identifier"])
+        if not re.fullmatch(r"T-[0-9]{6}", identifier):
+            raise ApiError(409, "invalid_task_identity", "task identifier is not a valid workspace identity")
+        root = pathlib.Path(profile.workspace_root)
+        workspace = root / identifier
+        try:
+            physical_root = physical_directory(root)
+        except FileNotFoundError:
+            # A missing project root is still a valid absent-workspace result,
+            # but its nearest existing parent must not be a symlink.
+            try:
+                physical_directory(root.parent)
+            except FileNotFoundError:
+                return workspace, False
+            return workspace, False
+        except WorkspaceBoundaryError as exc:
+            raise ApiError(409, "workspace_boundary", str(exc)) from exc
+        try:
+            physical_workspace = physical_directory(workspace)
+        except FileNotFoundError:
+            return workspace, False
+        except WorkspaceBoundaryError as exc:
+            raise ApiError(409, "workspace_boundary", str(exc)) from exc
+        try:
+            physical_workspace.relative_to(physical_root)
+        except ValueError as exc:
+            raise ApiError(409, "workspace_boundary", "task workspace escapes the project workspace root") from exc
+        return physical_workspace, True
+
+    @staticmethod
+    def _git(workspace: pathlib.Path, *args: str) -> str:
+        try:
+            result = run_git(workspace, *args)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ApiError(409, "git_evidence_unavailable", str(exc)) from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+            safe_detail = str(redact(detail))
+            raise ApiError(409, "git_evidence_unavailable",
+                           f"git {' '.join(args[:3])}: {safe_detail[:300]}")
+        return result.stdout.strip()
+
+    @classmethod
+    def _commits(cls, workspace: pathlib.Path, base_sha: str, current_head: str) -> list[dict[str, object]]:
+        shas = cls._git(workspace, "rev-list", "--reverse", f"{base_sha}..{current_head}").splitlines()
+        commits: list[dict[str, object]] = []
+        for sha in shas:
+            fields = cls._git(
+                workspace, "show", "-s",
+                "--format=%H%x1f%s%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%aI%x1f%cI",
+                sha,
+            ).split("\x1f")
+            if len(fields) != 8:
+                raise ApiError(409, "git_evidence_unavailable", "Git commit metadata is malformed")
+            commits.append({
+                "sha": fields[0], "subject": fields[1],
+                "author_name": fields[2], "author_email": fields[3],
+                "committer_name": fields[4], "committer_email": fields[5],
+                "authored_at": fields[6], "committed_at": fields[7],
+            })
+        return commits
+
+    @classmethod
+    def _change_summary(cls, workspace: pathlib.Path, base_sha: str, current_head: str) -> dict[str, object]:
+        statuses = cls._git(
+            workspace, "diff", "--name-status", "--find-renames", "--find-copies",
+            f"{base_sha}..{current_head}",
+        ).splitlines()
+        counts: dict[str, tuple[int | None, int | None]] = {}
+        for line in cls._git(workspace, "diff", "--numstat", f"{base_sha}..{current_head}").splitlines():
+            fields = line.split("\t", 2)
+            if len(fields) == 3:
+                added = None if fields[0] == "-" else int(fields[0])
+                deleted = None if fields[1] == "-" else int(fields[1])
+                counts[fields[2]] = (added, deleted)
+        files: list[dict[str, object]] = []
+        insertions = deletions = 0
+        for line in statuses:
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            status, path = fields[0], fields[-1]
+            added, deleted = counts.get(path, (None, None))
+            if added is not None:
+                insertions += added
+            if deleted is not None:
+                deletions += deleted
+            files.append({"path": path, "status": status, "insertions": added, "deletions": deleted})
+        return {
+            "files_changed": len(files), "insertions": insertions,
+            "deletions": deletions, "files": files,
+        }
 
     def _read_database(self) -> ControlPlaneDatabase:
         return ControlPlaneDatabase.open_readonly(self.database_path)
@@ -247,6 +451,13 @@ class HostControlHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/v1/projects":
                 self._json(200, {"projects": self.server.application.projects()})
             else:
+                receipt_match = re.fullmatch(
+                    r"/api/v1/projects/([^/]+)/tasks/([^/]+)/execution-receipt", path
+                )
+                if receipt_match:
+                    slug, task_id = receipt_match.groups()
+                    self._json(200, self.server.application.execution_receipt(slug, task_id))
+                    return
                 match = re.fullmatch(r"/api/v1/projects/([^/]+)/tasks(?:/([^/]+))?", path)
                 if not match:
                     raise ApiError(404, "not_found", "route does not exist")

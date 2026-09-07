@@ -66,6 +66,13 @@ project-independent role policies. Runtime dashboard observability is at
 
 ## 5. Inspect status and evidence
 
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765), select the project, and
+click the task row first. The task detail view's **Execution receipts** surface
+shows the resolved workspace, local branch, SQLite-authorized result range,
+commits, changed files, unified diff, role history, and publication status.
+Use the WSL/CLI commands below as lower-level troubleshooting or independent
+verification tools when needed.
+
 ```sh
 python3 scripts/task.py list --project symphony-canary
 python3 scripts/task.py show --project symphony-canary --task T-000001
