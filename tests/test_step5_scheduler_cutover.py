@@ -311,7 +311,9 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         self.assertIn("- IMPLEMENTED", rendered)
         self.assertIn("- REVIEW", rendered)
         self.assertIn("- ADVERSARIAL_REVIEW", rendered)
-        self.assertIn("- FINAL_MECHANICAL_ACCEPTANCE", rendered)
+        active, terminal = rendered.split("  terminal_states:\n", 1)
+        self.assertNotIn("- FINAL_MECHANICAL_ACCEPTANCE", active)
+        self.assertIn("    - FINAL_MECHANICAL_ACCEPTANCE", terminal)
         self.assertIn("- READY_FOR_HUMAN_MERGE", rendered)
         self.assertIn("max_turns: 1", rendered)
         for forbidden in (

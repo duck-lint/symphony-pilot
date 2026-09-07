@@ -19,9 +19,9 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         f"  project_slug: {profile.slug}",
         "  active_states:",
         "    - QUEUED", "    - PLANNED", "    - IMPLEMENTED", "    - REVIEW",
-        "    - ADVERSARIAL_REVIEW", "    - FINAL_MECHANICAL_ACCEPTANCE",
+        "    - ADVERSARIAL_REVIEW",
         "  terminal_states:",
-        "    - READY_FOR_HUMAN_MERGE",
+        "    - FINAL_MECHANICAL_ACCEPTANCE", "    - READY_FOR_HUMAN_MERGE",
         "polling:", f"  interval_ms: {profile.poll_interval_ms}",
         f"  max_retry_backoff_ms: {profile.max_retry_backoff_ms}",
         # Symphony still needs the host workspace allocator. The Codex task

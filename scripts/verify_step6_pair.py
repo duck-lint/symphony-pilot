@@ -17,8 +17,7 @@ import tempfile
 from generate_step6_fixture import generate
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-ACTIVE = ["QUEUED", "PLANNED", "IMPLEMENTED", "REVIEW", "ADVERSARIAL_REVIEW",
-          "FINAL_MECHANICAL_ACCEPTANCE"]
+ACTIVE = ["QUEUED", "PLANNED", "IMPLEMENTED", "REVIEW", "ADVERSARIAL_REVIEW"]
 PROBE = '''
 alias SymphonyElixir.{Workflow, Config, Orchestrator}
 alias SymphonyElixir.Tracker.SQLite.Adapter
@@ -67,7 +66,7 @@ def main() -> int:
         workflow.write_text("---\ntracker:\n  kind: sqlite\n  project_slug: alpha\n"
                             f"  database_path: {json.dumps(str(database))}\n"
                             f"  active_states: {json.dumps(ACTIVE)}\n"
-                            "  terminal_states: [READY_FOR_HUMAN_MERGE]\n"
+                            "  terminal_states: [FINAL_MECHANICAL_ACCEPTANCE, READY_FOR_HUMAN_MERGE]\n"
                             "agent:\n  max_concurrent_agents: 1\n---\nPair verification.\n")
         probe = temporary / "verify.exs"
         probe.write_text(PROBE)
