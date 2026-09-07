@@ -22,8 +22,6 @@ from control_db import (ControlPlaneDatabase, ControlPlaneError,
 from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
 from prepare_workspace import PreparationError, github, read_secret  # noqa: E402
-from workspace_boundary import (WorkspaceBoundaryError,
-                                create_empty_task_workspace)  # noqa: E402
 from storage import (StorageAdmissionProof, StorageContractError,
                      task_quota_binding_from_evidence,
                      verify_storage_evidence)  # noqa: E402
@@ -171,17 +169,9 @@ def queue(args: argparse.Namespace) -> int:
         if task["state"] != "PREPARED":
             raise StateConflict("only PREPARED tasks may be queued")
         try:
-            create_empty_task_workspace(
-                pathlib.Path(profile.workspace_root), str(task["identifier"]),
-            )
+            # Runtime owns workspace creation so its after_create hook can
+            # materialize the registered repository before before_run.
             task = database.queue_task(task["id"], project_slug=profile.slug)
-        except WorkspaceBoundaryError as exc:
-            error = TaskCommandError(f"task workspace preparation failed: {exc}")
-            database.record_blocker(
-                task_id=task["id"], kind="infrastructure",
-                body=f"local queue failed: {type(error).__name__}: {error}",
-            )
-            raise error from exc
         except StateConflict as exc:
             database.record_blocker(
                 task_id=task["id"], kind="infrastructure",

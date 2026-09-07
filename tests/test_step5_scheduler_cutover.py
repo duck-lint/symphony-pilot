@@ -188,6 +188,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
                          return_value=admission_proof(domain, identifier="T-000001"),
                      ):
                     self.assertEqual(task.queue(Namespace(project="alpha", task="T-000001")), 0)
+                self.assertFalse((profile.workspace_root / "T-000001").exists())
                 with self.assertRaises(control_db.StateConflict):
                     task.queue(Namespace(project="alpha", task="T-000001"))
                 with control_db.open_database_readonly(database_path) as database:
