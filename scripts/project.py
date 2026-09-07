@@ -34,7 +34,8 @@ from prepare_workspace import (
 from deployment_contract import (DEPLOYED_OPERATOR_FILES, DEPLOYED_RUNTIME_FILES,
                                  contract_digest, deployment_identity)
 from containment import ContainmentError, backend_identity, require_execution_capability
-from runtime_lock import RuntimeLockError, identify, validate_lock, verify_entry
+from runtime_lock import (ExecutableIdentity, RuntimeLockError, identify,
+                           validate_lock, verify_entry)
 from rulesets import RulesetError, fetch_all_rulesets, fetch_ruleset_details, require_default_branch_ruleset
 from project_registry import resolve_project
 
@@ -350,11 +351,11 @@ def start(profile):
         lock = validate_lock(json.loads(lock_path.read_text(encoding="utf-8")))
         verify_entry(lock["symphony"], identify(binary), "Symphony")
         verify_entry(lock["codex"], identify(codex), "Codex")
-        verify_entry(lock["containment"], {
-            "executable": containment.executable,
-            "version": containment.version,
-            "sha256": containment.sha256,
-        }, "containment")
+        verify_entry(lock["containment"], ExecutableIdentity(
+            executable=containment.executable,
+            version=containment.version,
+            sha256=containment.sha256,
+        ), "containment")
     except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError, ContainmentError) as exc:
         print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
         return 78
