@@ -317,16 +317,20 @@ def git(workspace: pathlib.Path, *args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def github(profile: Profile, token: str, method: str, path: str, body: object | None = None) -> object:
+def github(profile: Profile, token: str | None, method: str, path: str,
+           body: object | None = None) -> object:
     url = "https://api.github.com/repos/" + profile.repository + path
     data = None if body is None else json.dumps(body).encode()
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+        "User-Agent": "symphony-pilot-host",
+    }
+    if token is not None:
+        headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Authorization": "Bearer " + token,
-                 "Accept": "application/vnd.github+json",
-                 "X-GitHub-Api-Version": "2022-11-28",
-                 "Content-Type": "application/json",
-                 "User-Agent": "symphony-pilot-host"})
+        url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             raw = response.read()

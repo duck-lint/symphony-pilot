@@ -86,12 +86,57 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         profile = self.profile(pathlib.Path("/tmp"), git_remote="ssh://untrusted.example/repo.git")
         with mock.patch.object(task, "read_secret", return_value="host-token"), \
              mock.patch.object(task, "github", side_effect=[
-                 {"default_branch": "main"},
+                 {"full_name": "owner/alpha", "private": True, "default_branch": "main"},
                  {"ref": "refs/heads/main", "object": {"sha": "A" * 40}},
              ]) as github_call:
             self.assertEqual(task.resolve_github_head(profile), ("main", "a" * 40))
         self.assertEqual(github_call.call_args_list[0].args[2:], ("GET", ""))
         self.assertEqual(github_call.call_args_list[1].args[2:], ("GET", "/git/ref/heads/main"))
+
+    def test_public_repository_without_secret_uses_unauthenticated_authority_reads(self):
+        profile = self.profile(pathlib.Path("/tmp"))
+        missing = pw.PreparationError("credential_missing", "missing")
+        with mock.patch.object(task, "read_secret", side_effect=missing), \
+             mock.patch.object(task, "github", side_effect=[
+                 {"full_name": "owner/alpha", "private": False, "default_branch": "main"},
+                 {"ref": "refs/heads/main", "object": {"sha": "C" * 40}},
+             ]) as github_call:
+            self.assertEqual(task.resolve_github_head(profile), ("main", "c" * 40))
+        self.assertEqual(github_call.call_args_list[0].args[1:], (None, "GET", ""))
+        self.assertEqual(github_call.call_args_list[1].args[1:], (None, "GET", "/git/ref/heads/main"))
+
+    def test_github_omits_authorization_only_without_a_token(self):
+        profile = self.profile(pathlib.Path("/tmp"))
+        response = mock.Mock()
+        response.read.return_value = b"{}"
+        with mock.patch.object(pw.urllib.request, "urlopen",
+                               return_value=contextlib.nullcontext(response)) as urlopen:
+            pw.github(profile, None, "GET", "")
+            pw.github(profile, "host-token", "GET", "")
+        unauthenticated_request = urlopen.call_args_list[0].args[0]
+        authenticated_request = urlopen.call_args_list[1].args[0]
+        self.assertFalse(unauthenticated_request.has_header("Authorization"))
+        self.assertEqual(authenticated_request.get_header("Authorization"), "Bearer host-token")
+
+    def test_private_repository_without_secret_fails_closed(self):
+        profile = self.profile(pathlib.Path("/tmp"))
+        missing = pw.PreparationError("credential_missing", "missing")
+        with mock.patch.object(task, "read_secret", side_effect=missing), \
+             mock.patch.object(task, "github", return_value={
+                 "full_name": "owner/alpha", "private": True, "default_branch": "main",
+             }) as github_call:
+            with self.assertRaises(task.TaskCommandError):
+                task.resolve_github_head(profile)
+        self.assertEqual(github_call.call_args.args[1:], (None, "GET", ""))
+
+    def test_malformed_existing_secret_does_not_fall_back(self):
+        profile = self.profile(pathlib.Path("/tmp"))
+        malformed = pw.PreparationError("credential_invalid", "invalid")
+        with mock.patch.object(task, "read_secret", side_effect=malformed), \
+             mock.patch.object(task, "github") as github_call:
+            with self.assertRaises(pw.PreparationError):
+                task.resolve_github_head(profile)
+        github_call.assert_not_called()
 
     def test_repository_transport_cannot_supply_task_authority(self):
         source = pathlib.Path(task.__file__).read_text(encoding="utf-8")
@@ -100,7 +145,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         profile = self.profile(pathlib.Path("/tmp"), git_remote="file:///transport-only")
         with mock.patch.object(task, "read_secret", return_value="host-token"), \
              mock.patch.object(task, "github", side_effect=[
-                 {"default_branch": "trunk"},
+                 {"full_name": "owner/alpha", "private": True, "default_branch": "trunk"},
                  {"ref": "refs/heads/trunk", "object": {"sha": "b" * 40}},
              ]):
             self.assertEqual(task.resolve_github_head(profile), ("trunk", "b" * 40))

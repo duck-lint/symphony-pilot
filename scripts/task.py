@@ -21,7 +21,7 @@ from control_db import (ControlPlaneDatabase, ControlPlaneError,
                         default_database_path)  # noqa: E402
 from control_db import StateConflict  # noqa: E402
 from project_registry import resolve_project  # noqa: E402
-from prepare_workspace import github, read_secret  # noqa: E402
+from prepare_workspace import PreparationError, github, read_secret  # noqa: E402
 from workspace_boundary import (WorkspaceBoundaryError,
                                 create_empty_task_workspace)  # noqa: E402
 from storage import (StorageAdmissionProof, StorageContractError,
@@ -47,10 +47,19 @@ def resolve_github_head(profile) -> tuple[str, str]:
     the credential. Git remotes remain a byte-materialization concern for the
     later workspace path; they cannot establish task authority here.
     """
-    token = read_secret(profile)
+    try:
+        token = read_secret(profile)
+    except PreparationError as exc:
+        if exc.kind != "credential_missing":
+            raise
+        token = None
     repository = github(profile, token, "GET", "")
     if not isinstance(repository, dict):
         raise TaskCommandError("trusted GitHub repository facts are malformed")
+    if repository.get("full_name") != profile.repository:
+        raise TaskCommandError("trusted GitHub repository identity does not match the registered repository")
+    if token is None and repository.get("private") is not False:
+        raise TaskCommandError("unauthenticated GitHub authority requires a public repository")
     base_ref = repository.get("default_branch")
     if (not isinstance(base_ref, str) or not REF_RE.fullmatch(base_ref) or
             ".." in base_ref or "//" in base_ref or base_ref.endswith(("/", ".")) or
