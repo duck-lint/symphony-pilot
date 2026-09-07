@@ -192,3 +192,33 @@ stop conditions.
 On successful closeout, return one bounded lifecycle result with round
 evidence, exact current HEAD, capability limitations, and the archivist
 packet. ARCHIVIST is a Step-6 closeout role; publication and READY are Step 7.
+
+## Host result protocol
+
+The host-owned preparation marker at `.git/symphony-preparation.json` contains
+the absolute `lifecycle_namespace` for this Architect attempt. Read the
+read-only input packet at `<lifecycle_namespace>/inbox/lifecycle.json`. Do not
+invent task identity, state, round, workpad version, or starting HEAD; copy
+those values from the packet.
+
+Before the turn ends, write exactly one JSON object to
+`<lifecycle_namespace>/outbox/result.json`. Pilot `after_run` reads only that
+file; a prose response is not a lifecycle result. The object must have exactly
+these fields:
+
+    schema: "symphony-pilot-lifecycle-result/v1"
+    task_uuid, identifier, architect_role_run_id
+    expected_state, expected_workpad_version, expected_starting_head
+    workpad_body, summary, outcome, role_results, findings
+    requested_resolved_finding_ids
+
+Use the packet values for the five expected/identity fields. Preserve the
+workpad marker in `workpad_body`. Each `role_results` entry must contain only
+`role`, `verdict`, `summary`, `head_sha`, and `findings`; each finding must
+follow the fields and classifications defined above. For the initial QUEUED
+authority/planning action, the successful result is `planning_complete` with
+PROJECT-MANAGER `APPROVE` followed by PLANNER `COMPLETE`; later actions must
+use the exact role and outcome licensed by the current state. Use an empty list
+for findings and requested resolutions when none are justified. `head_sha`
+must be null for a read-only role packet and must equal trusted Git HEAD when a
+mutating IMPLEMENTER packet is present.

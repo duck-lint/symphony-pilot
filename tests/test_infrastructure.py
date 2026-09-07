@@ -225,6 +225,17 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("turn_sandbox_policy: null", rendered)
         self.assertNotIn("externalSandbox", rendered)
 
+    def test_workflow_supplies_sqlite_task_context_and_result_protocol(self):
+        from render_workflow import render
+        profile = self.profile(pathlib.Path("/tmp"))
+        with tempfile.TemporaryDirectory() as directory:
+            policy = pathlib.Path(directory) / "policy.md"
+            policy.write_text("write `<lifecycle_namespace>/outbox/result.json`\n", encoding="utf-8")
+            rendered = render(profile, pathlib.Path(directory), policy)
+        self.assertIn("{{ issue.identifier }}", rendered)
+        self.assertIn("{{ issue.description }}", rendered)
+        self.assertIn("<lifecycle_namespace>/outbox/result.json", rendered)
+
     def test_launcher_is_minimal_and_fail_closed(self):
         text = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")
         self.assertNotIn("ORIGINAL_CODEX_HOME", text)

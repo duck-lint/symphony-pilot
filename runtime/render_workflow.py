@@ -46,7 +46,19 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         # the installed Codex App Server protocol.
         "  turn_sandbox_policy: null",
     ]
-    lines += ["---", "", pathlib.Path(policy).read_text(encoding="utf-8").rstrip(), ""]
+    lines += [
+        "---", "", pathlib.Path(policy).read_text(encoding="utf-8").rstrip(), "",
+        "## Current local task",
+        "",
+        "The Runtime supplies the current Pilot SQLite task below. Treat this as the task work order; do not substitute tracker or GitHub state.",
+        "",
+        "- Identifier: {{ issue.identifier }}",
+        "- Title: {{ issue.title }}",
+        "- Lifecycle state: {{ issue.state }}",
+        "- Objective:",
+        "{{ issue.description }}",
+        "",
+    ]
     return "\n".join(lines)
 
 def main() -> int:
