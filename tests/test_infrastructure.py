@@ -232,6 +232,7 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("CODEX_API_KEY", text)
         self.assertIn("SYMPHONY_SUPERVISED_LOCAL", text)
         self.assertIn("exec codex app-server", text)
+        self.assertIn("${HOME:-}/.codex", text)
         self.assertIn("exit 78", text)
 
     def test_containment_backend_has_explicit_auth_blocker(self):

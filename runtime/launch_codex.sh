@@ -59,7 +59,9 @@ fi
 # active Codex agent directory so the normal installed App Server can resolve
 # the six project-owned policies.
 if [ "${SYMPHONY_SUPERVISED_LOCAL:-0}" = "1" ]; then
-  OPERATOR_CODEX_HOME=${CODEX_HOME:-${HOME:-}}
+  # Codex's default operator home is ~/.codex, not the process HOME itself.
+  # Preserve an explicit CODEX_HOME when the operator has configured one.
+  OPERATOR_CODEX_HOME=${CODEX_HOME:-${HOME:-}/.codex}
   if [ -z "$OPERATOR_CODEX_HOME" ]; then
     echo "symphony-pilot: supervised local mode requires CODEX_HOME or HOME" >&2
     exit 78
