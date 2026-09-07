@@ -236,6 +236,12 @@ for findings and requested resolutions when none are justified. `head_sha`
 must be null for a read-only role packet and must equal trusted Git HEAD when a
 mutating IMPLEMENTER packet is present.
 
+Accepted findings from earlier attempts are historical evidence. Resolving a
+host blocker does not resolve its finding record. Set
+`requested_resolved_finding_ids` to an empty list for normal planning,
+implementation, review, adversarial, validation, and archive outcomes; only
+`correction_complete` may request the currently licensed correction findings.
+
 For this supervised local canary, do not delegate the PM/Planner work to a
 separate task or wait for another task. Use the six installed role policies as
 the role contracts, perform the current phase in this Architect turn, and
