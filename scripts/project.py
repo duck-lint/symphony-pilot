@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import AWAKE_STATE, establish_awake_guard, release_awake_guard, release_awake_guard_at
+from lifecycle import LifecycleError, reconcile_orphaned_architect_attempts
 from process_identity import capture, matches, read
 from prepare_workspace import (
     DASHBOARD_PORT_MAX,
@@ -179,11 +180,17 @@ def _complete_process_stop(state_path, release=None):
     return 0
 
 
-def _stop_process_at(state_path, identity, release=None):
+def _stop_process_at(state_path, identity, release=None, after_stopped=None):
     pid = int(identity["pid"])
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
+        if after_stopped:
+            try:
+                after_stopped()
+            except Exception as exc:
+                print(f"Symphony stopped, but orphaned Architect reconciliation failed: {exc}")
+                return 1
         return _complete_process_stop(state_path, release)
     except (PermissionError, OSError) as exc:
         print(f"Cannot stop Symphony safely: {exc}")
@@ -194,13 +201,31 @@ def _stop_process_at(state_path, identity, release=None):
     except KeyboardInterrupt:
         print("Stop cancelled; Symphony remains running.")
         return 130
+    if after_stopped:
+        try:
+            after_stopped()
+        except Exception as exc:
+            print(f"Symphony stopped, but orphaned Architect reconciliation failed: {exc}")
+            return 1
     return _complete_process_stop(state_path, release)
+
+
+def _reconcile_after_managed_stop(profile, identity):
+    if _identity_alive(identity):
+        raise PreparationError("managed Runtime identity is still alive")
+    repaired = reconcile_orphaned_architect_attempts(profile, managed_runtime_stopped=True)
+    for attempt in repaired:
+        print(
+            f"Reconciled orphaned Architect attempt {attempt['identifier']} "
+            f"round {attempt['round']} as failed."
+        )
 
 
 def _stop_process(profile, identity):
     return _stop_process_at(
         state_paths(profile)[0], identity,
         release=lambda: release_awake_guard(profile),
+        after_stopped=lambda: _reconcile_after_managed_stop(profile, identity),
     )
 
 
@@ -485,6 +510,11 @@ def stop(profile, force=False):
     if not _identity_alive(identity):
         if pid_alive(int(identity["pid"])):
             print("Cannot stop safely: managed Symphony PID identity is stale or reused; no process was terminated.")
+            return 1
+        try:
+            _reconcile_after_managed_stop(profile, identity)
+        except Exception as exc:
+            print(f"Cannot reconcile stopped Runtime attempts safely: {exc}")
             return 1
         pid_path.unlink(missing_ok=True)
         return _report_stopped(profile, "Symphony is stopped")

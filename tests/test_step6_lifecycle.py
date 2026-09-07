@@ -16,7 +16,7 @@ import control_db
 from tests.storage_support import queue_task
 import lifecycle as lifecycle_module
 from lifecycle import (RESULT_SCHEMA, LifecycleError, prepare_attempt, read_result,
-                       reconcile)
+                       reconcile, reconcile_orphaned_architect_attempts)
 from prepare_workspace import Profile
 
 
@@ -664,6 +664,39 @@ class Step6LifecycleTests(unittest.TestCase):
             self.assertEqual(runs[0]["status"], "failed")
             self.assertEqual(database.read_task(self.TASK_ID)["state"], "QUEUED")
             self.assertEqual(database.read_projection(self.TASK_ID)["blockers"][0]["kind"], "infrastructure")
+
+    def test_managed_shutdown_terminalizes_orphaned_architect_attempt(self):
+        attempt = self._attempt()
+        original = dict(attempt["run"])
+        repaired = reconcile_orphaned_architect_attempts(
+            self.profile, managed_runtime_stopped=True,
+        )
+        self.assertEqual(repaired[0]["round"], original["round"])
+        with control_db.open_database(self.database_path) as database:
+            run = database.read_role_run(original["id"])
+            self.assertEqual(run["status"], "failed")
+            self.assertEqual(run["round"], original["round"])
+            self.assertEqual(run["head_sha"], original["head_sha"])
+            self.assertEqual(run["started_at"], original["started_at"])
+            self.assertIsNotNone(run["finished_at"])
+            self.assertEqual(
+                run["result_summary"],
+                "Managed Runtime stopped before Architect attempt reconciled.",
+            )
+            events = [event for event in database.list_events(self.TASK_ID)
+                      if event["role_run_id"] == original["id"]]
+            self.assertEqual(json.loads(events[-1]["payload_json"])["status"], "failed")
+
+    def test_live_architect_attempt_is_not_terminalized(self):
+        attempt = self._attempt()
+        with self.assertRaises(LifecycleError):
+            reconcile_orphaned_architect_attempts(
+                self.profile, managed_runtime_stopped=False,
+            )
+        with control_db.open_database(self.database_path) as database:
+            run = database.read_role_run(attempt["run"]["id"])
+            self.assertEqual(run["status"], "started")
+            self.assertIsNone(run["finished_at"])
 
     def test_pre_row_allocation_failure_records_direct_infrastructure_blocker(self):
         with mock.patch.object(

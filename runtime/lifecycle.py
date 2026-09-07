@@ -819,6 +819,46 @@ def fail_attempt(profile: Profile, task_id: str, *, detail: str) -> bool:
         return True
 
 
+def reconcile_orphaned_architect_attempts(
+    profile: Profile, *, managed_runtime_stopped: bool
+) -> list[dict[str, object]]:
+    """Terminalize Architect attempts only after the managed Runtime is dead.
+
+    The stop caller proves process absence from the persisted boot/PID identity
+    before invoking this function.  Requiring that proof explicitly prevents a
+    read-only dashboard observation or a stale task row from being treated as
+    permission to rewrite a still-running execution.
+    """
+    if managed_runtime_stopped is not True:
+        raise LifecycleError("orphan reconciliation requires a stopped managed Runtime")
+    summary = "Managed Runtime stopped before Architect attempt reconciled."
+    repaired: list[dict[str, object]] = []
+    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+        rows = database.connection.execute(
+            "SELECT role_runs.*, tasks.project_slug, tasks.current_head, tasks.base_sha "
+            "FROM role_runs JOIN tasks ON tasks.id = role_runs.task_id "
+            "WHERE tasks.project_slug = ? AND role_runs.role = 'ARCHITECT' "
+            "AND role_runs.status = 'started' ORDER BY role_runs.started_at, role_runs.id",
+            (profile.slug,),
+        ).fetchall()
+        if not rows:
+            return repaired
+        with database._transaction():
+            for row in rows:
+                task = database.read_task(str(row["task_id"]))
+                # Preserve the identity and selected head recorded at
+                # allocation; only terminal status fields are changed.
+                head = str(row["head_sha"] or task["current_head"] or task["base_sha"])
+                _finish_architect(database, task, str(row["id"]), summary, head, "failed")
+                repaired.append({
+                    "task_id": str(task["id"]),
+                    "identifier": str(task["identifier"]),
+                    "role_run_id": str(row["id"]),
+                    "round": int(row["round"]),
+                })
+    return repaired
+
+
 def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
     workspace = physical_directory(workspace)
     physical_directory(workspace / ".git")

@@ -14,7 +14,11 @@ function renderReceipt(receipt,view){
   const workspaceMessage=workspace.exists?"":"<p class=\"receipt-empty\">Workspace not currently present. SQLite task evidence is preserved.</p>";
   const commits=receipt.commits||[];
   const files=summary.files||[];
-  const roles=view.role_runs||[];
+  const runs=(view.role_runs||[]).slice().sort((left,right)=>String(left.started_at||"").localeCompare(String(right.started_at||""))||Number(left.round||0)-Number(right.round||0)||String(left.id||"").localeCompare(String(right.id||"")));
+  const roleRuns=runs.filter(run=>run.role!=="ARCHITECT");
+  const architectRuns=runs.filter(run=>run.role==="ARCHITECT");
+  const roleRows=roleRuns.map(run=>`<tr><td>${escapeHtml(run.role)}</td><td><span class="tag ${statusClass(run.status)}">${escapeHtml(run.status)}</span></td><td>${escapeHtml(run.round)}</td><td><code>${escapeHtml(shortSha(run.head_sha))}</code></td><td>${escapeHtml(run.result_summary||"—")}</td></tr>`).join("")||"<tr><td colspan=5>No specialized role executions recorded.</td></tr>";
+  const architectRows=architectRuns.map(run=>`<tr><td>${escapeHtml(run.round)}</td><td><span class="tag ${statusClass(run.status)}">${escapeHtml(run.status)}</span></td><td><code>${escapeHtml(shortSha(run.head_sha))}</code></td><td>${escapeHtml(run.result_summary||"—")}</td></tr>`).join("")||"<tr><td colspan=4>No Architect turns recorded.</td></tr>";
   return `<section class="receipt" aria-labelledby="receipt-title">
     <div class="receipt-heading"><div><span class="eyebrow">EXECUTION RECEIPT</span><h3 id="receipt-title">Execution receipts</h3><small class="receipt-source">${escapeHtml(source)}</small></div><span class="publication ${published?"published":"local"}">${escapeHtml(publication)}</span></div>
     <div class="cards receipt-summary">
@@ -27,8 +31,12 @@ function renderReceipt(receipt,view){
     ${files.length?`<div class="receipt-table-wrap"><table><thead><tr><th>Status</th><th>Path</th><th>Changes</th></tr></thead><tbody>${files.map(file=>`<tr><td><span class="tag ${statusClass(file.status)}">${escapeHtml(file.status)}</span></td><td><code>${escapeHtml(file.path)}</code></td><td>+${file.insertions==null?"?":escapeHtml(file.insertions)} −${file.deletions==null?"?":escapeHtml(file.deletions)}</td></tr>`).join("")}</tbody></table></div>`:`<p class="receipt-empty">${workspace.exists?"No committed task changes.":"Workspace not currently present."}</p>`}
     <h4>Diff</h4>
     <pre class="diff ${diff.truncated?"truncated":""}">${escapeHtml(diff.unified_patch||"No committed task changes.")}</pre>${diff.truncated?"<p class=\"muted\">Diff output was capped for safe browser delivery.</p>":""}
-    <h4>Role history</h4>
-    <div class="receipt-table-wrap"><table><thead><tr><th>Role</th><th>Status</th><th>Round</th><th>Head</th></tr></thead><tbody>${roles.map(run=>`<tr><td>${escapeHtml(run.role)}</td><td><span class="tag ${statusClass(run.status)}">${escapeHtml(run.status)}</span></td><td>${escapeHtml(run.round)}</td><td><code>${escapeHtml(shortSha(run.head_sha))}</code></td></tr>`).join("")||"<tr><td colspan=4>No role runs recorded.</td></tr>"}</tbody></table></div>
+    <h4>Role execution</h4>
+    <p class="muted">Specialized roles are work performed against the task.</p>
+    <div class="receipt-table-wrap"><table><thead><tr><th>Role</th><th>Status</th><th>Attempt</th><th>Head</th><th>Summary / reason</th></tr></thead><tbody>${roleRows}</tbody></table></div>
+    <h4>Orchestrator activity</h4>
+    <p class="muted">Architect turns are lifecycle and orchestration passes, including retries.</p>
+    <div class="receipt-table-wrap"><table><thead><tr><th>Turn</th><th>Status</th><th>Head</th><th>Summary / reason</th></tr></thead><tbody>${architectRows}</tbody></table></div>
   </section>`;
 }
 async function loadProjects(){try{const {projects}=await api("/api/v1/projects");projectsNode.innerHTML=projects.map(project=>`<button data-slug="${escapeHtml(project.slug)}"><strong>${escapeHtml(project.display_name||project.slug)}</strong><br><small>${escapeHtml(project.repository)} · ${project.task_count} tasks</small></button>`).join("")||"<p>No projects registered.</p>";projectsNode.querySelectorAll("button").forEach(button=>button.onclick=()=>loadProject(projects.find(p=>p.slug===button.dataset.slug)))}catch(error){projectsNode.textContent=error.message}}
