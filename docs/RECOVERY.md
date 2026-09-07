@@ -1,5 +1,12 @@
 # Recovery
 
+## Current operating boundary
+
+The supervised-local MVP is complete at `FINAL_MECHANICAL_ACCEPTANCE` and can
+be stopped normally with `scripts/project.py ... stop`. Recovery preserves the
+same SQLite task, workpad, role, finding, blocker, and event evidence; it does
+not create a second scheduler or silently resume a terminal task.
+
 Execution domains are disposable. The canonical registry, host SQLite task
 rows, local UUID/`T-N` identity, runtime locks, process identity, and host
 audit events are the durable machine authority. GitHub issues, workpad
@@ -20,8 +27,9 @@ Missing, malformed, stale, or identity-mismatched lifecycle results fail
 closed and produce an SQLite blocker when the database is available. Do not
 repair by deleting the result, role run, workpad history, or events.
 Archivist is a Step-6 role closeout recorded while the task remains at
-`FINAL_MECHANICAL_ACCEPTANCE`, awaiting the explicit Step-7 `task.py publish`
-operation. A durable `started` publication row records the
+`FINAL_MECHANICAL_ACCEPTANCE`. The supervised-local MVP intentionally stops at
+that state; the separate Step-7 `task.py publish` operation is outside MVP
+acceptance. A durable `started` publication row records the
 exact task UUID, head, and branch before external mutation. Retries may adopt
 only the exact branch and one exact open draft PR; contradictions are blockers,
 not repair requests. Final SQLite publication and READY transition are one

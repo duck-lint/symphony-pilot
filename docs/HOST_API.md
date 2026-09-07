@@ -1,5 +1,13 @@
 # Trusted local host API and browser UI
 
+## Current status
+
+The control UI is live at `http://127.0.0.1:8765` when started by the
+operator. It is a loopback HTTP, read-only SQLite evidence surface. The
+supervised-local MVP keeps task creation and queueing on the trusted CLI; it
+does not add browser mutation, sessions, HTTPS, or authentication in this
+pass. HTTPS and authenticated mutation remain future targets.
+
 Step 4 provides a dependency-free Python HTTP server and a static, read-only
 operator UI. Start it under the Linux/WSL operator environment with:
 

@@ -1,5 +1,10 @@
 # Architecture
 
+> **Current proven mode:** supervised local MVP. Pilot `a88b075...` and
+> Runtime `bca0d702...` completed live canary execution through
+> `FINAL_MECHANICAL_ACCEPTANCE` with clean terminal behavior. The status rows
+> below distinguish this proof from unattended hardening and publication.
+
 symphony-pilot is a trusted host control plane around the project-owned
 `symphony-runtime` lifecycle implementation. Target repositories remain
 authoritative for project meaning, validation, private inputs, and human stop
@@ -109,14 +114,15 @@ protection and the exact PR head before merging.
 | Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
 | Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
 | Aggregate persistent-workspace disk quota | IMPLEMENTED / TARGETED-VERIFIED / REQUIRES STEP-8 REVIEW | shared-pool pre-helper reservation, source-controlled narrow privileged helper, task-usable capacity, and kernel-proof admission seams; dedicated domain provisioning remains required |
-| Local SQLite task intake / queue authority | TARGETED / FIXTURE-VERIFIED | trusted task CLI, transactionally allocated identity, and PREPARED-to-QUEUED CAS tests |
-| Runtime SQLite scheduler contract | ACCEPTED CONTRACT / LIVE PROOF BLOCKED | frozen Runtime adapter contract; Pilot fixture and workflow pair await the canonical artifact smoke because WSL is unavailable |
+| Local SQLite task intake / queue authority | LIVE / CANARY-PROVEN | trusted task CLI, transactionally allocated identity, PREPARED-to-QUEUED transition, and T-000001/T-000002 evidence |
+| Runtime SQLite scheduler contract | LIVE / CANARY-PROVEN | Runtime reads the current Pilot v2 database project-scoped and read-only |
 | Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
-| SQLite lifecycle reconciliation | TARGETED / FIXTURE-VERIFIED | strict result, trusted Git checks, and atomic Step-6 synthetic E2E |
+| SQLite lifecycle reconciliation | LIVE / CANARY-PROVEN | T-000001 recovery/Archivist evidence and T-000002 clean final-acceptance evidence |
 | Host publication transfer | TARGETED / FIXTURE-VERIFIED | Step-7 exact-head host publication; no model or Runtime publication path |
 | Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
-| Codex App Server activation | BLOCKED | existing execution-capability gate and launch boundary remain fail-closed |
-| Live Codex task containment | NOT YET PROVEN | no Codex task was started |
+| Codex App Server activation | LIVE / SUPERVISED-LOCAL-PROVEN | explicit `SYMPHONY_SUPERVISED_LOCAL=1` launches the installed App Server using operator authentication |
+| Unattended Codex credential isolation | OPEN / UNATTENDED-ONLY | supervised operation does not prove hostile-child credential isolation |
+| Live Codex task containment | SUPERVISED-LOCAL-PROVEN; UNATTENDED HARDENING OPEN | canary executed under the supervised local contract; stronger unattended containment remains separate |
 | Tier-C target twin / live cutover | RETIRED | target-twin workflow, probe, and contract residue are retired; storage and containment primitives remain |
 
 ## Containment
@@ -138,7 +144,9 @@ operation requires a root-owned, capability-specific quota helper to bind the
 host-derived task project and prove byte/inode `EDQUOT` behavior.
 Reservations cannot be released without trusted proof that the
 exact workspace and quota can no longer grow. The current root filesystem is
-rejected, so unattended activation remains blocked pending dedicated-domain
+rejected for the unattended quota contract, so unattended activation remains a separate hardening target pending dedicated-domain
 and helper provisioning. The constructor is
 exercised independently of Codex; the auth blocker still stops the real
-launcher before App Server start.
+launcher before App Server start. The supervised-local launcher is intentionally
+explicit and uses the operator's existing Codex authentication; it does not
+claim production credential isolation.

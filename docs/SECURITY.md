@@ -1,5 +1,14 @@
 # Security contract
 
+## Operating-mode boundary
+
+The supervised-local MVP is proven, but it is explicitly operator-supervised.
+`SYMPHONY_SUPERVISED_LOCAL=1` permits the normal installed Codex App Server to
+use the operator's existing authenticated Codex environment. This does not
+prove unattended credential isolation. Findings below that remain open are
+unattended-hardening or publication findings, not evidence that supervised
+SYMPHONY cannot run.
+
 The model, task processes, issue/workpad payload, task filesystem, task Git
 metadata, task result, and publication bundle are hostile inputs.
 
@@ -39,7 +48,8 @@ is the routing barrier. Archivist is the Step-6 closeout role at
 `FINAL_MECHANICAL_ACCEPTANCE`. Step 7 owns publication and the exact-head
 READY transition. The existing credential
 isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live WSL
-containment findings remain open activation blockers.
+containment findings remain open unattended-activation or publication
+findings.
 
 ## GitHub trust
 
@@ -91,7 +101,7 @@ owned by the fixed helper group, and exactly setuid-root mode 4750. Its task
 root enables project-ID inheritance so descendants remain inside the same
 kernel quota.
 
-This fixture proves the constructor, not live Codex behavior. The real launcher
-still fails closed because the accepted Codex App Server authentication path
-does not prove that hostile model tools cannot recover App Server credentials
-or inherit its network authority.
+This fixture proves the constructor, not unattended credential isolation. The
+supervised-local launcher is intentionally live and uses the operator's
+existing authenticated Codex environment; that choice is bounded to explicit
+human supervision and is not accepted as a hostile-child credential boundary.

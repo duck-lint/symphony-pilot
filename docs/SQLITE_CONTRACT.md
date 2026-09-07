@@ -1,5 +1,14 @@
 # SQLite control-plane contract
 
+## Current status
+
+This v2 contract is live and is the authority used by the supervised-local
+MVP. Ordinary local queueing performs `PREPARED -> QUEUED` and creates the
+initial workpad without invoking the dormant Step-8 storage-admission path.
+Storage reservation tables and their stronger admission contract remain
+available for later unattended hardening; they are not required to explain the
+proven local canary.
+
 Step 2 established the host-owned persistence contract. Step 5 established
 that SQLite determines what work exists. Step 6 makes SQLite determine what
 has happened to that work: lifecycle state, current HEAD, workpad version,
@@ -157,7 +166,8 @@ result outcome. The contained task never writes SQLite and never chooses the
 next state. The `ARCHITECT` role is represented in
 `role_runs` and event provenance; the specialized worker role set remains
 `PROJECT-MANAGER`, `PLANNER`, `IMPLEMENTER`, `REVIEWER`, `ADVERSARY`, and
-The Archivist is represented by its role-run and evidence records while the
+`ARCHIVIST`. The Archivist is represented by its role-run and evidence records
+while the
 task remains in `FINAL_MECHANICAL_ACCEPTANCE` until trusted publication moves
 it to `READY_FOR_HUMAN_MERGE`.
 
@@ -262,6 +272,8 @@ There was no durable non-test `~/.local/state/symphony-pilot/control.sqlite3`
 in the inspected WSL host state root when this correction was made. Therefore
 the physical-schema and authority corrections modify schema v1 in place; no
 compatibility migration was added for disposable pre-acceptance test state.
+The current accepted runtime contract is schema v2, not the historical
+pre-launch v1-only state.
 
 ## Step-6 and later boundaries
 
@@ -273,4 +285,5 @@ real custom-agent invocation. Archivist closeout is a role action at the
 `FINAL_MECHANICAL_ACCEPTANCE` state. Step 7 owns publication and the final
 READY transition. Existing Step-8
 credential-isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live
-WSL containment blockers remain open.
+WSL containment findings remain open for unattended activation or publication.
+They do not block the proven supervised-local MVP.

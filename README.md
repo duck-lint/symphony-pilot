@@ -1,5 +1,13 @@
 # symphony-pilot
 
+> **SUPERVISED LOCAL MVP: PROVEN**
+>
+> Pilot `a88b075fb0ab60af369b377992c98706affd3b5e` has been proven with
+> Runtime `bca0d7027c49ef9bc62ee07de0bf669b8d3cb3d6` under
+> `SYMPHONY_SUPERVISED_LOCAL=1`. The control UI is
+> `http://127.0.0.1:8765`; the Runtime dashboard is
+> `http://127.0.0.1:4041` while Runtime is running.
+
 A trusted host-side control plane for local-task runs of the project-owned
 `symphony-runtime`. The canonical project registry is under `projects/`.
 Target repositories remain authoritative for project meaning, architecture,
@@ -27,23 +35,26 @@ remote, credential, or process state.
 
 Codex policy is defense in depth. The one supported structural backend is the
 Linux/WSL unshare namespace contract with mount, PID, network, and resource
-limits, CPU time, and child-tree teardown. These are admission invariants, not a claim that an unblocked task is
-currently running: the exact runtime remains stopped at the auth-boundary
-gate. Once activated, the task must have no tracker/publication credentials,
-operator CODEX_HOME, SSH agent, sibling workspace, host state, or arbitrary
-tool network.
+limits, CPU time, and child-tree teardown. These are admission invariants for
+hardened/unattended operation. In the explicit supervised-local path, the
+normal installed Codex App Server runs with the operator's existing
+authenticated Codex environment. The task must still have no
+tracker/publication credentials, operator CODEX_HOME, SSH agent, sibling
+workspace, host state, or arbitrary tool network.
 
 ## Current status
 
 Host-side local-task intake, SQLite scheduler configuration, local workspace
-preparation, and Step-7 exact-head publication are implemented and
-fixture-tested. Publication remains a host-only operation; it does not
-authorize unattended execution or human merge.
-Persistent task-workspace aggregate disk growth is explicitly unbounded in this
-cutover, and the exact current Codex App Server authentication path has no
-proven way to keep its credential out of hostile tool children. Unattended
-execution is therefore not activatable. Do not replace these limits with a
-same-user or prompt-only fallback.
+preparation, supervised Codex execution, lifecycle reconciliation, and the
+read-only control UI are live and canary-proven. The ordinary local queue path
+performs `PREPARED -> QUEUED` without invoking Step-8 quota admission.
+
+The supervised path is explicitly operator-enabled with
+`SYMPHONY_SUPERVISED_LOCAL=1`. It is not an unattended credential-isolation
+boundary. Aggregate task quota/EDQUOT enforcement, hostile-child credential
+isolation, Runtime pin-to-exec TOCTOU closure, remote workers, authenticated
+mutating UI, and publication acceptance remain future hardening/target seams;
+none of them means supervised SYMPHONY cannot run.
 
 ## Requirements
 
@@ -80,18 +91,17 @@ invocation form.
     python3 -m unittest discover -s tests -v
     python3 -m compileall -q runtime scripts tests
     python3 scripts/validate_profile.py
-    python3 scripts/provision_publication_key.py --project cleanroom
-    python3 scripts/task.py bind-publication-key --project cleanroom
-    python3 scripts/deploy.py --project cleanroom --dry-run
-    python3 scripts/project.py --project cleanroom start
+    python3 scripts/validate_profile.py
+    python3 scripts/deploy.py --project symphony-canary
+    python3 scripts/project.py --project symphony-canary start
 
-The start command must fail closed until the capability blocker is resolved.
-Run the original multi-role canary only after this repository is reviewed,
-cut over, credentials are rotated, branch protection is configured, runtime
-identities are pinned, and hostile-boundary probes pass.
+For supervised local development, start with the explicit opt-in documented in
+`docs/OPERATOR_RUNBOOK.md`. The stronger containment and credential checks
+remain required before unattended activation.
 
 See docs/ARCHITECTURE.md, docs/SECURITY.md, docs/OPERATIONS.md,
 docs/HUMAN_ONBOARDING.md, docs/CODEX_ONBOARDING.md, and docs/RECOVERY.md.
+The exact operator sequence is in [docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md).
 The host-owned SQLite contract is documented in docs/SQLITE_CONTRACT.md.
 Runtime implements the production SQLite tracker adapter, and the managed
 scheduler is configured to use it. Create a PREPARED task and explicitly queue

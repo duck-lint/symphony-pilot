@@ -1,5 +1,13 @@
 # Operations
 
+## Current operating claim
+
+The supervised-local MVP is live. The operator explicitly enables it with
+`SYMPHONY_SUPERVISED_LOCAL=1`; task mutation remains trusted CLI plus SQLite,
+the Pilot UI is loopback HTTP and read-only, and Runtime reads SQLite
+project-scoped and read-only. Step-8 storage admission and unattended
+credential isolation are not required for this supervised path.
+
 All physical lifecycle operations run in the WSL/Linux operator environment. Native Windows validation must not fabricate a WSL home or touch Linux state.
 
 ## Before start
@@ -48,8 +56,9 @@ finishes the Architect attempt and records an infrastructure blocker. Resolve
 one inspected blocker with the exact project-scoped `task resolve-blocker`
 command, then the retained active lifecycle state becomes routable naturally.
 Do not delete lifecycle evidence or repair a task by manually setting its
-state. Archivist closeout is recorded as role evidence while the task remains
-at final mechanical acceptance until the explicit Step-7 publication command.
+state. Archivist closeout is recorded as role evidence. The supervised-local
+MVP stops cleanly at `FINAL_MECHANICAL_ACCEPTANCE`; the separate publication
+path may later move an accepted task to `READY_FOR_HUMAN_MERGE`.
 Publication derives repository, branch, base, HEAD,
 credentials, ruleset evidence, and PR identity from host state; it never
 consumes model publication prose. A failed publication preserves external
@@ -63,7 +72,13 @@ recovery evidence and records an infrastructure blocker.
     python3 scripts/project.py --project <slug> status
     python3 scripts/project.py --project <slug> finish
 
-stop-now is the bounded emergency process control. It does not infer task identity from issue prose and does not authorize publication.
+`python3 scripts/project.py --project <slug> stop` is the normal graceful stop
+after the task reaches a terminal state. `stop-now` is the bounded emergency
+process control for an active or wedged process; it does not infer task
+identity from issue prose and does not authorize publication.
+
+For the exact supervised-local sequence, use
+[OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
 
 ## Destructive one-time cutover
 
