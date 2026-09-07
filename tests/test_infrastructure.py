@@ -219,7 +219,7 @@ class InfrastructureTests(unittest.TestCase):
         profile = self.profile(pathlib.Path("/tmp"))
         with tempfile.TemporaryDirectory() as directory:
             policy = pathlib.Path(directory) / "policy.md"
-            policy.write_text("policy\n", encoding="utf-8")
+            policy.write_text("## Host result protocol\npolicy\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
         self.assertIn("thread_sandbox: read-only", rendered)
         self.assertIn("type: readOnly", rendered)
@@ -230,11 +230,19 @@ class InfrastructureTests(unittest.TestCase):
         profile = self.profile(pathlib.Path("/tmp"))
         with tempfile.TemporaryDirectory() as directory:
             policy = pathlib.Path(directory) / "policy.md"
-            policy.write_text("write `<lifecycle_namespace>/outbox/result.json`\n", encoding="utf-8")
+            policy.write_text("## Host result protocol\nwrite `<lifecycle_namespace>/outbox/result.json`\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
         self.assertIn("{{ issue.identifier }}", rendered)
         self.assertIn("{{ issue.description }}", rendered)
         self.assertIn("<lifecycle_namespace>/outbox/result.json", rendered)
+
+    def test_specialized_role_template_block_has_no_architect_identity(self):
+        from render_workflow import render
+
+        rendered = render(self.profile(pathlib.Path("/tmp")), ROOT, ROOT / "workflow/architect_policy.md")
+        pm_block = rendered.split('{% if execution.role == "PROJECT-MANAGER" %}', 1)[1].split("{% endif %}", 1)[0]
+        self.assertIn("PROJECT-MANAGER", pm_block)
+        self.assertNotIn("You are the ARCHITECT", pm_block)
 
     def test_launcher_is_minimal_and_fail_closed(self):
         text = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")

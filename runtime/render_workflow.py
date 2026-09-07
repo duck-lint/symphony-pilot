@@ -42,8 +42,15 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "  approval_policy: never", "  thread_sandbox: read-only",
         "  turn_sandbox_policy:", "    type: readOnly",
     ]
+    policy_text = pathlib.Path(policy).read_text(encoding="utf-8").rstrip()
+    policy_marker = "## Host result protocol"
+    if policy_marker not in policy_text:
+        raise ValueError(f"Architect policy is missing the shared result protocol marker: {policy}")
+    architect_policy, shared_result_protocol = policy_text.split(policy_marker, 1)
     lines += [
-        "---", "", pathlib.Path(policy).read_text(encoding="utf-8").rstrip(), "",
+        "---", "", '{% if execution.role == "ARCHITECT" %}',
+        architect_policy.rstrip(), "{% endif %}", "",
+        policy_marker, shared_result_protocol.lstrip(), "",
         "## Current local task",
         "",
         "The Runtime supplies the current Pilot SQLite task below. Treat this as the task work order; do not substitute tracker or GitHub state.",

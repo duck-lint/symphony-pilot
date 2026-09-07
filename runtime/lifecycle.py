@@ -278,15 +278,97 @@ def _resolve_authorized_write_roots(workspace: pathlib.Path, paths: object) -> l
         parts = pathlib.PurePosixPath(candidate_text).parts
         if not parts or any(part in {"", ".", ".."} for part in parts):
             raise LifecycleError("authorized implementation seam contains traversal")
-        candidate = (root / pathlib.Path(*parts)).resolve(strict=False)
+        candidate = root.joinpath(*parts).resolve(strict=False)
         try:
             candidate.relative_to(root)
         except ValueError as exc:
             raise LifecycleError("authorized implementation seam escapes the task checkout") from exc
-        if candidate == root or not candidate.exists() or not candidate.is_dir():
-            raise LifecycleError("authorized implementation seam must name an existing directory below the task checkout")
+        current = root
+        for part in parts:
+            current /= part
+            if current.is_symlink():
+                raise LifecycleError("authorized implementation seam contains a symlink")
+        if candidate == root or not candidate.exists() or not (candidate.is_file() or candidate.is_dir()):
+            raise LifecycleError("authorized implementation seam must name an existing file or directory below the task checkout")
         resolved.append(str(candidate))
     return list(dict.fromkeys(resolved))
+
+
+def _working_tree_paths(workspace: pathlib.Path) -> list[str]:
+    result = run_git(workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if result.returncode:
+        raise LifecycleError("unable to inspect the Implementer working-tree delta")
+    records = result.stdout.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            raise LifecycleError("Git returned a malformed working-tree status")
+        status = record[:2]
+        paths.append(record[3:])
+        if "R" in status or "C" in status:
+            if index >= len(records) or not records[index]:
+                raise LifecycleError("Git returned an incomplete rename status")
+            paths.append(records[index])
+            index += 1
+    return paths
+
+
+def _path_is_authorized(
+    workspace: pathlib.Path,
+    path: str,
+    authorized_roots: list[tuple[pathlib.Path, str]],
+) -> bool:
+    relative = pathlib.PurePosixPath(path.replace("\\", "/"))
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        return False
+    candidate = (workspace / pathlib.Path(*relative.parts)).resolve(strict=False)
+    for authorized, kind in authorized_roots:
+        if candidate == authorized or kind == "directory" and candidate.is_relative_to(authorized):
+            return True
+    return False
+
+
+def _commit_implementer_delta(workspace: pathlib.Path, marker: dict[str, object]) -> str:
+    if marker.get("dispatch_role") != "IMPLEMENTER":
+        return _git(workspace, "rev-parse", "HEAD")
+    raw_roots = marker.get("target_writable_roots")
+    if not isinstance(raw_roots, list) or not raw_roots or any(not isinstance(path, str) for path in raw_roots):
+        raise LifecycleError("Implementer dispatch has no host-resolved writable seam")
+    raw_kinds = marker.get("target_writable_root_kinds")
+    if not isinstance(raw_kinds, list) or len(raw_kinds) != len(raw_roots) or any(kind not in {"file", "directory"} for kind in raw_kinds):
+        raise LifecycleError("Implementer dispatch writable seam types are malformed")
+    authorized_roots = [
+        (pathlib.Path(path).resolve(strict=False), str(kind))
+        for path, kind in zip(raw_roots, raw_kinds)
+    ]
+    changed_paths = _working_tree_paths(workspace)
+    if not changed_paths:
+        raise LifecycleError("Implementer produced no project-content changes")
+    if any(not _path_is_authorized(workspace, path, authorized_roots) for path in changed_paths):
+        raise LifecycleError("Implementer changed a project path outside the authorized seam")
+    if run_git(workspace, "add", "--", *changed_paths).returncode:
+        raise LifecycleError("host could not stage the authorized Implementer delta")
+    commit = run_git(
+        workspace,
+        "-c", "user.name=Symphony Agent",
+        "-c", "user.email=symphony@localhost",
+        "commit", "-m", "Symphony: implement authorized seam",
+    )
+    if commit.returncode:
+        detail = (commit.stderr or commit.stdout).strip().replace("\n", " ")
+        raise LifecycleError(f"host could not commit the authorized Implementer delta: {detail[:240]}")
+    head = _git(workspace, "rev-parse", "HEAD")
+    identity = _git(workspace, "show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce", head)
+    if identity != "Symphony Agent\x1fsymphony@localhost\x1fSymphony Agent\x1fsymphony@localhost":
+        raise LifecycleError("host Implementer commit identity is not the Symphony identity")
+    if _git(workspace, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise LifecycleError("authorized Implementer commit left the workspace dirty")
+    return head
 
 
 def _record_infrastructure_blocker(profile: Profile, task_id: str, detail: str) -> None:
@@ -334,8 +416,13 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
         outbox = namespace / "outbox"
         result_writable_root = str(outbox)
         target_writable_roots: list[str] = []
+        target_writable_root_kinds: list[str] = []
         if role == "IMPLEMENTER":
             target_writable_roots = _resolve_authorized_write_roots(workspace, authorized_write_paths)
+            target_writable_root_kinds = [
+                "directory" if pathlib.Path(path).is_dir() else "file"
+                for path in target_writable_roots
+            ]
         packet["authorized_write_paths"] = authorized_write_paths
         packet["dispatch"] = {
             "role": role,
@@ -345,6 +432,7 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
             "result_path": str(outbox / "result.json"),
             "result_writable_root": result_writable_root,
             "target_writable_roots": target_writable_roots,
+            "target_writable_root_kinds": target_writable_root_kinds,
         }
         _write_host_json(namespace / "inbox" / "lifecycle.json", packet)
         marker = old_marker if isinstance(old_marker, dict) else {}
@@ -360,6 +448,7 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
             "selected_head": facts.selected_head,
             "result_writable_root": result_writable_root,
             "target_writable_roots": target_writable_roots,
+            "target_writable_root_kinds": target_writable_root_kinds,
             "authorized_write_paths": authorized_write_paths,
         })
         _write_host_json(marker_path, marker)
@@ -679,6 +768,8 @@ def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
             run = _materialize_started_run(database, task, marker, receipt)
         try:
             result = read_result(namespace / "outbox" / "result.json")
+            if marker.get("dispatch_role") == "IMPLEMENTER" and result["outcome"] != "blocked":
+                _commit_implementer_delta(workspace, marker)
             actual_head = verify_git_truth(profile, workspace, task)
             if result["role"] == "ARCHITECT" and result["outcome"] == "planning_complete":
                 _resolve_authorized_write_roots(workspace, result["authorized_write_paths"])

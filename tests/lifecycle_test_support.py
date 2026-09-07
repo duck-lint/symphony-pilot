@@ -64,10 +64,8 @@ class LifecycleFixture(NamedRoleAuthorityTests):
     def _reach_adversarial_review(self) -> str:
         self._reach_planned()
         (self.workspace / "src" / "implementation.txt").write_text("implemented\n", encoding="utf-8")
-        self._git("add", "src/implementation.txt")
-        self._git("commit", "-qm", "implementation")
+        self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE")
         head = self._git("rev-parse", "HEAD")
-        self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE", head_sha=head)
         self.finish(self.attempt(), outcome="implementation_complete", role="ARCHITECT")
         self.finish(self.attempt(), outcome="role_complete", role="REVIEWER", verdict="APPROVE")
         self.finish(self.attempt(), outcome="review_approved", role="ARCHITECT")

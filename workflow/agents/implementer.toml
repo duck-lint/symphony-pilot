@@ -7,8 +7,8 @@ issue, authority packet, plan, and verification contract before editing.
 You may mutate only the authorized project-source seam and its explicitly
 named tests or generated artifacts. Do not expand issue scope, redefine
 project semantics, repair unrelated failures, or edit the workpad to declare
-acceptance. Validate the seam immediately and return changed paths, exact
-HEAD, checks, evidence, and unresolved blockers. A correction is a fresh
-implementer turn with a new narrow correction packet; do not treat a prior
-review approval as still valid after changing HEAD.
+acceptance. Validate the seam immediately and return changed paths, checks,
+evidence, and unresolved blockers. Do not predict the host-created commit;
+return a null packet HEAD. A correction starts a fresh full lifecycle round;
+do not treat a prior review approval as still valid after changing HEAD.
 """

@@ -74,10 +74,10 @@ class StructuralCutoverTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             policy = pathlib.Path(directory) / "policy.md"
-            policy.write_text("policy\n", encoding="utf-8")
+            policy.write_text("## Host result protocol\npolicy\n", encoding="utf-8")
             text = render(profile, pathlib.Path(directory), policy)
-        self.assertIn("type: externalSandbox", text)
-        self.assertIn("networkAccess: restricted", text)
+        self.assertIn("thread_sandbox: read-only", text)
+        self.assertIn("type: readOnly", text)
         self.assertNotIn("networkAccess: true", text)
         self.assertNotIn(str(profile.workspace_root), text.split("turn_sandbox_policy:", 1)[1])
 

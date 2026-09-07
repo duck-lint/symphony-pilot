@@ -301,7 +301,7 @@ class Step5SchedulerCutoverTests(unittest.TestCase):
         profile = self.profile(pathlib.Path("/home/operator"))
         with tempfile.TemporaryDirectory() as directory:
             policy = pathlib.Path(directory) / "policy.md"
-            policy.write_text("policy\n", encoding="utf-8")
+            policy.write_text("## Host result protocol\npolicy\n", encoding="utf-8")
             rendered = render_workflow.render(profile, pathlib.Path(directory), policy)
         self.assertIn("kind: sqlite", rendered)
         self.assertIn("database_path: /home/operator/state/control.sqlite3", rendered)

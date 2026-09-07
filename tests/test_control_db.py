@@ -481,7 +481,7 @@ class ControlDatabaseTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             policy = pathlib.Path(directory) / "policy.md"
-            policy.write_text("policy\n", encoding="utf-8")
+            policy.write_text("## Host result protocol\npolicy\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
         self.assertIn("kind: sqlite", rendered)
         self.assertIn("database_path: /home/operator/.local/state/symphony-pilot/control.sqlite3", rendered)

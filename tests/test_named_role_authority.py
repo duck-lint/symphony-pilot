@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, str(ROOT / "runtime"))
 
 import control_db
-from lifecycle import RESULT_SCHEMA, prepare_attempt, reconcile
+from lifecycle import RESULT_SCHEMA, _resolve_authorized_write_roots, prepare_attempt, reconcile
 from prepare_workspace import Profile
 from tests.storage_support import queue_task
 
@@ -126,10 +126,8 @@ class NamedRoleAuthorityTests(unittest.TestCase):
 
         implementation = self.workspace / "src" / "implementation.txt"
         implementation.write_text("implemented\n", encoding="utf-8")
-        self.git("add", "src/implementation.txt")
-        self.git("commit", "-qm", "implement")
+        self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE")
         head = self.git("rev-parse", "HEAD")
-        self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE", head_sha=head)
         self.finish(self.attempt(), outcome="implementation_complete", role="ARCHITECT")
         self.finish(self.attempt(), outcome="role_complete", role="REVIEWER", verdict="APPROVE")
         self.finish(self.attempt(), outcome="review_approved", role="ARCHITECT")
@@ -210,6 +208,46 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             self.assertEqual(projection["role_runs"][-1]["status"], "failed")
             self.assertNotEqual(projection["task"]["state"], "PLANNED")
 
+    def test_authorized_root_level_and_nested_files_are_preserved_exactly(self):
+        root_file = self.workspace / "canary.py"
+        nested_file = self.workspace / "src" / "parser.py"
+        root_file.write_text("base\n", encoding="utf-8")
+        nested_file.write_text("base\n", encoding="utf-8")
+        resolved = _resolve_authorized_write_roots(
+            self.workspace,
+            ["canary.py", "src", "src/parser.py"],
+        )
+        self.assertEqual(resolved, [str(root_file), str(self.workspace / "src"), str(nested_file)])
+
+    def test_authorized_seam_rejects_absolute_traversal_root_and_symlink_paths(self):
+        for value in (".", "..", "../other", "/etc/passwd", r"F:\\other", str(self.workspace)):
+            with self.assertRaises(Exception):
+                _resolve_authorized_write_roots(self.workspace, [value])
+        link = self.workspace / "source-link"
+        try:
+            link.symlink_to(self.workspace / "src", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation is unavailable")
+        with self.assertRaises(Exception):
+            _resolve_authorized_write_roots(self.workspace, ["source-link"])
+
+    def test_unauthorized_implementer_delta_refuses_host_commit(self):
+        self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="role_complete", role="PROJECT-MANAGER", verdict="APPROVE")
+        self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="role_complete", role="PLANNER", verdict="COMPLETE")
+        self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT", authorized_write_paths=["src"])
+        base_head = self.git("rev-parse", "HEAD")
+        (self.workspace / "src" / "allowed.txt").write_text("allowed\n", encoding="utf-8")
+        (self.workspace / "README").write_text("unauthorized\n", encoding="utf-8")
+        with self.assertRaises(Exception):
+            self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE")
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+        with control_db.open_database(self.database_path) as database:
+            run = database.read_projection(self.TASK_ID)["role_runs"][-1]
+            self.assertEqual(run["role"], "IMPLEMENTER")
+            self.assertEqual(run["status"], "failed")
+
     def test_review_nonconvergence_starts_a_new_full_round_at_project_manager(self):
         finding = {
             "role": "REVIEWER", "kind": "review finding", "severity": "high",
@@ -222,10 +260,8 @@ class NamedRoleAuthorityTests(unittest.TestCase):
         self.finish(self.attempt(), outcome="role_complete", role="PLANNER", verdict="COMPLETE")
         self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT", authorized_write_paths=["src"])
         (self.workspace / "src" / "implementation.txt").write_text("implemented\n", encoding="utf-8")
-        self.git("add", "src/implementation.txt")
-        self.git("commit", "-qm", "implement")
+        self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE")
         head = self.git("rev-parse", "HEAD")
-        self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE", head_sha=head)
         self.finish(self.attempt(), outcome="implementation_complete", role="ARCHITECT")
         self.finish(self.attempt(), outcome="role_complete", role="REVIEWER", verdict="FINDINGS", findings=[finding])
         self.finish(self.attempt(), outcome="correction_required", role="ARCHITECT")
