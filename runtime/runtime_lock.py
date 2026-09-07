@@ -33,6 +33,19 @@ def identify(executable: str, version_args: tuple[str, ...] = ("--version",)) ->
         raise RuntimeLockError(f"runtime executable is not executable: {path}")
     try:
         result = subprocess.run([str(path), *version_args], capture_output=True, text=True, check=True, timeout=10)
+    except subprocess.CalledProcessError as exc:
+        # The current Symphony artifact exposes --help, not --version. Its
+        # rejected --version probe is still a deterministic usage response,
+        # so use that existing interface for the human-supervised identity
+        # record rather than inventing a second executable wrapper.
+        output = (exc.stdout or exc.stderr or "").strip()
+        if version_args != ("--version",) or not output.startswith("Usage:"):
+            raise RuntimeLockError(f"cannot identify runtime executable: {path}") from exc
+        try:
+            result = subprocess.run([str(path), "--help"], capture_output=True, text=True,
+                                    check=False, timeout=10)
+        except (OSError, subprocess.SubprocessError) as help_exc:
+            raise RuntimeLockError(f"cannot identify runtime executable: {path}") from help_exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeLockError(f"cannot identify runtime executable: {path}") from exc
     output = (result.stdout or result.stderr).strip().splitlines()
