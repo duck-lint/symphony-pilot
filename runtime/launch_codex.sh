@@ -75,6 +75,10 @@ if [ "${SYMPHONY_SUPERVISED_LOCAL:-0}" = "1" ]; then
     cp -- "$ROLE_SOURCE/$name.toml" "$OPERATOR_CODEX_HOME/agents/$name.toml"
   done
   export CODEX_HOME="$OPERATOR_CODEX_HOME"
+  export GIT_AUTHOR_NAME="Symphony Agent"
+  export GIT_AUTHOR_EMAIL="symphony@localhost"
+  export GIT_COMMITTER_NAME="Symphony Agent"
+  export GIT_COMMITTER_EMAIL="symphony@localhost"
   exec codex app-server
 fi
 

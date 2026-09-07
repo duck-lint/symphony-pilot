@@ -246,6 +246,21 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("${HOME:-}/.codex", text)
         self.assertIn("exit 78", text)
 
+    def test_supervised_launcher_supplies_deterministic_git_identity(self):
+        text = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")
+        supervised = text.split(
+            'if [ "${SYMPHONY_SUPERVISED_LOCAL:-0}" = "1" ]; then', 1
+        )[1].split("fi\n\n# The default path", 1)[0]
+        expected = (
+            'export GIT_AUTHOR_NAME="Symphony Agent"',
+            'export GIT_AUTHOR_EMAIL="symphony@localhost"',
+            'export GIT_COMMITTER_NAME="Symphony Agent"',
+            'export GIT_COMMITTER_EMAIL="symphony@localhost"',
+        )
+        for line in expected:
+            self.assertIn(line, supervised)
+        self.assertLess(supervised.index(expected[-1]), supervised.index("exec codex app-server"))
+
     def test_containment_backend_has_explicit_auth_blocker(self):
         with mock.patch.object(containment, "require_backend", return_value=mock.Mock()):
             with self.assertRaises(containment.ContainmentError) as raised:
