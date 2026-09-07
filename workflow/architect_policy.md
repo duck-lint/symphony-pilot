@@ -242,6 +242,15 @@ host blocker does not resolve its finding record. Set
 implementation, review, adversarial, validation, and archive outcomes; only
 `correction_complete` may request the currently licensed correction findings.
 
+Use these exact lifecycle outcome strings: `QUEUED` uses
+`planning_complete`; `PLANNED` uses `implementation_complete`; `IMPLEMENTED`
+uses `review_approved`; `REVIEW` uses `adversary_pass`;
+`ADVERSARIAL_REVIEW` uses `validation_pass` with no role packet; and
+`FINAL_MECHANICAL_ACCEPTANCE` uses `archive_complete` with the ARCHIVIST
+packet. The only alternative outcomes are the contract's exact
+`correction_required` and `blocked` forms when their required evidence is
+present.
+
 For this supervised local canary, do not delegate the PM/Planner work to a
 separate task or wait for another task. Use the six installed role policies as
 the role contracts, perform the current phase in this Architect turn, and
