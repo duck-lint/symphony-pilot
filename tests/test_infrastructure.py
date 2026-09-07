@@ -214,17 +214,16 @@ class InfrastructureTests(unittest.TestCase):
         with self.assertRaises(rulesets.RulesetError):
             rulesets.require_default_branch_ruleset([dict(good, bypass_actors=[{"actor_type": "Integration"}])], "master")
 
-    def test_workflow_removes_parent_write_root_and_open_network(self):
+    def test_workflow_uses_current_codex_sandbox_contract(self):
         from render_workflow import render
         profile = self.profile(pathlib.Path("/tmp"))
         with tempfile.TemporaryDirectory() as directory:
             policy = pathlib.Path(directory) / "policy.md"
             policy.write_text("policy\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
-        self.assertIn("type: externalSandbox", rendered)
-        self.assertIn("networkAccess: restricted", rendered)
-        self.assertNotIn("networkAccess: true", rendered)
-        self.assertNotIn(str(profile.workspace_root), rendered.split("turn_sandbox_policy:", 1)[1])
+        self.assertIn("thread_sandbox: workspace-write", rendered)
+        self.assertIn("turn_sandbox_policy: null", rendered)
+        self.assertNotIn("externalSandbox", rendered)
 
     def test_launcher_is_minimal_and_fail_closed(self):
         text = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")
