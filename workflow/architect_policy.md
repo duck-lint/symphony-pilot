@@ -194,6 +194,14 @@ publication preflight, and process lifecycle. A role must not repair or guess
 an inherited dirty checkout. The target project owns its own semantics and
 stop conditions.
 
+In the explicit supervised-local execution path, the launcher supplies the
+fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
+`GIT_COMMITTER_EMAIL` values for task commits. Do not read, require, or mutate
+operator-global Git identity configuration; an absent `git config user.name`
+or `git config user.email` is not a blocker in this mode. Commit the licensed
+change normally and verify the recorded author and committer on the resulting
+HEAD.
+
 On successful closeout, return one bounded lifecycle result with round
 evidence, exact current HEAD, capability limitations, and the archivist
 packet. ARCHIVIST is a Step-6 closeout role; publication and READY are Step 7.
