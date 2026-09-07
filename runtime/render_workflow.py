@@ -40,11 +40,11 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         # attempt; SQLite reconciliation is the continuation mechanism.
         "  max_turns: 1",
         "codex:", f"  command: {shell(runtime / 'launch_codex.sh')}",
-        "  approval_policy: never", "  thread_sandbox: workspace-write",
-        # Let the current Runtime derive a workspace-scoped turn policy from
-        # the actual task cwd. The old externalSandbox spelling is not part of
-        # the installed Codex App Server protocol.
-        "  turn_sandbox_policy: null",
+        "  approval_policy: never", "  thread_sandbox: danger-full-access",
+        # Supervised-local mode deliberately permits the Architect to reach
+        # Pilot's host-owned lifecycle inbox/outbox outside the checkout. The
+        # launcher remains fail-closed unless the operator opts in explicitly.
+        "  turn_sandbox_policy:", "    type: dangerFullAccess",
     ]
     lines += [
         "---", "", pathlib.Path(policy).read_text(encoding="utf-8").rstrip(), "",

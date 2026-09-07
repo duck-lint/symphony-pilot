@@ -221,8 +221,8 @@ class InfrastructureTests(unittest.TestCase):
             policy = pathlib.Path(directory) / "policy.md"
             policy.write_text("policy\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
-        self.assertIn("thread_sandbox: workspace-write", rendered)
-        self.assertIn("turn_sandbox_policy: null", rendered)
+        self.assertIn("thread_sandbox: danger-full-access", rendered)
+        self.assertIn("type: dangerFullAccess", rendered)
         self.assertNotIn("externalSandbox", rendered)
 
     def test_workflow_supplies_sqlite_task_context_and_result_protocol(self):
