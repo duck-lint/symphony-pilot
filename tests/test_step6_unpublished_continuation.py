@@ -17,7 +17,6 @@ import after_run
 import before_run
 import control_db
 from tests.storage_support import queue_task
-import lifecycle
 import prepare_workspace as pw
 from prepare_workspace import Profile
 
@@ -128,7 +127,7 @@ class UnpublishedContinuationTests(unittest.TestCase):
             "expected_workpad_version": attempt["expected_workpad_version"],
             "expected_starting_head": attempt["expected_starting_head"],
             "workpad_body": attempt["workpad_body"] + f"\n- Outcome: {outcome}\n",
-            "summary": outcome, "outcome": outcome, "role_results": roles,
+            "summary": outcome, "outcome": outcome, "packet": None,
             "findings": [], "requested_resolved_finding_ids": [],
         }
 
