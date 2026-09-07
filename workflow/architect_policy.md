@@ -229,7 +229,7 @@ these fields:
     task_uuid, identifier, role_run_id, role
     expected_state, expected_workpad_version, expected_starting_head
     workpad_body, summary, outcome, packet, findings
-    requested_resolved_finding_ids
+    requested_resolved_finding_ids, authorized_write_paths
 
 Use the input packet values for the identity and expected-state fields.
 `role` must be `ARCHITECT`, `packet` must be `null`, and `findings` must be
@@ -240,6 +240,12 @@ eligible PM or Planner. Use `planning_complete`, `implementation_complete`,
 or `blocked` only when the corresponding real specialized execution and
 trusted Git evidence exist. Never return `role_results` or a specialized
 packet.
+
+`authorized_write_paths` is an empty list except on `planning_complete`. For
+that outcome, provide only the explicit repository-relative directories that
+the fresh Implementer is authorized to mutate. Do not provide absolute paths,
+parent traversal, or the checkout root; Pilot resolves and validates these
+paths before Runtime grants target-project write access.
 
 Accepted findings from earlier attempts are historical evidence. Resolving a
 host blocker does not resolve its finding record. Set

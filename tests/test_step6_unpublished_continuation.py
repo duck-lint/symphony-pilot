@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import stat
@@ -94,65 +93,6 @@ class UnpublishedContinuationTests(unittest.TestCase):
     def _after(self) -> int:
         with mock.patch.object(after_run, "load_profile", return_value=self.profile):
             return after_run.main(["--profile", str(self.profile_path), "--workspace", str(self.workspace)])
-
-    def _attempt(self) -> dict[str, object]:
-        marker = json.loads((self.workspace / ".git" / "symphony-preparation.json").read_text(encoding="utf-8"))
-        task = self._task()
-        with control_db.open_database(self.root / "control.sqlite3") as database:
-            workpad = database.read_workpad(self.TASK_ID)
-        return {
-            "task_uuid": self.TASK_ID,
-            "identifier": task["identifier"],
-            "architect_role_run_id": marker["architect_role_run_id"],
-            "expected_state": task["state"],
-            "expected_workpad_version": workpad["version"],
-            "expected_starting_head": task["current_head"] or task["base_sha"],
-            "workpad_body": workpad["body"],
-        }
-
-    def _result(self, attempt: dict[str, object], outcome: str, *, role=None, head=None) -> dict[str, object]:
-        verdicts = {"PROJECT-MANAGER": "APPROVE", "PLANNER": "COMPLETE",
-                    "IMPLEMENTER": "COMPLETE", "REVIEWER": "APPROVE",
-                    "ADVERSARY": "PASS", "ARCHIVIST": "COMPLETE"}
-        role_names = ([("PROJECT-MANAGER", None), ("PLANNER", None)]
-                      if outcome == "planning_complete" else ([] if role is None else [(role, head)]))
-        roles = [{
-            "role": role_name, "verdict": verdicts[role_name], "summary": outcome,
-            "head_sha": role_head, "findings": [],
-        } for role_name, role_head in role_names]
-        return {
-            "schema": lifecycle.RESULT_SCHEMA, "task_uuid": attempt["task_uuid"],
-            "identifier": attempt["identifier"], "architect_role_run_id": attempt["architect_role_run_id"],
-            "expected_state": attempt["expected_state"],
-            "expected_workpad_version": attempt["expected_workpad_version"],
-            "expected_starting_head": attempt["expected_starting_head"],
-            "workpad_body": attempt["workpad_body"] + f"\n- Outcome: {outcome}\n",
-            "summary": outcome, "outcome": outcome, "packet": None,
-            "findings": [], "requested_resolved_finding_ids": [],
-        }
-
-    def _write_result(self, attempt: dict[str, object], result: dict[str, object]) -> None:
-        namespace = pathlib.Path(self.profile.state_root) / "lifecycle" / str(attempt["identifier"]) / str(attempt["architect_role_run_id"])
-        (namespace / "outbox" / "result.json").write_text(json.dumps(result), encoding="utf-8")
-
-    def _accept(self, outcome: str, *, role=None, head=None, expected_state=None, expected_refs=None) -> dict[str, object]:
-        self.assertEqual(self._before(), 0)
-        attempt = self._attempt()
-        expected_local_head = self._git(self.workspace, "rev-parse", "HEAD")
-        if expected_state is not None:
-            self.assertEqual(attempt["expected_state"], expected_state)
-        self.assertEqual(self._observe_remote_refs(f"before:{outcome}"), expected_refs or ["refs/heads/master"])
-        if head is not None:
-            self.assertEqual(self._git(self.workspace, "rev-parse", "HEAD"), head)
-            expected_local_head = head
-        self._write_result(attempt, self._result(attempt, outcome, role=role, head=head))
-        self.assertEqual(self._after(), 0)
-        projection = self._projection()
-        self.assertEqual(self._git(self.workspace, "rev-parse", "HEAD"), expected_local_head)
-        self.assertEqual(self._git(self.workspace, "branch", "--show-current"), self._task()["branch"])
-        self.assertEqual(self._observe_remote_refs(f"after:{outcome}"), ["refs/heads/master"])
-        self.assertEqual(projection["blockers"], [])
-        return projection
 
     def test_exact_local_unpublished_continuation_succeeds(self):
         with control_db.open_database(self.root / "control.sqlite3") as database:

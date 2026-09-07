@@ -170,8 +170,8 @@ class InfrastructureTests(unittest.TestCase):
                          {"project-manager", "planner", "implementer", "reviewer", "adversary", "archivist"})
         parsed = {path.stem: tomllib.loads(path.read_text(encoding="utf-8")) for path in policies}
         self.assertIn("mutating worker", parsed["implementer"]["description"].lower())
-        self.assertEqual(parsed["reviewer"]["sandbox_mode"], "read-only")
-        self.assertEqual(parsed["adversary"]["sandbox_mode"], "read-only")
+        self.assertNotIn("sandbox_mode", parsed["reviewer"])
+        self.assertNotIn("sandbox_mode", parsed["adversary"])
         policy = (ROOT / "workflow" / "architect_policy.md").read_text(encoding="utf-8")
         self.assertIn("fresh implementer", policy.lower())
         self.assertIn("adversary", policy.lower())
@@ -221,8 +221,8 @@ class InfrastructureTests(unittest.TestCase):
             policy = pathlib.Path(directory) / "policy.md"
             policy.write_text("policy\n", encoding="utf-8")
             rendered = render(profile, pathlib.Path(directory), policy)
-        self.assertIn("thread_sandbox: danger-full-access", rendered)
-        self.assertIn("type: dangerFullAccess", rendered)
+        self.assertIn("thread_sandbox: read-only", rendered)
+        self.assertIn("type: readOnly", rendered)
         self.assertNotIn("externalSandbox", rendered)
 
     def test_workflow_supplies_sqlite_task_context_and_result_protocol(self):

@@ -25,6 +25,8 @@ class NamedRoleAuthorityTests(unittest.TestCase):
         self.root = pathlib.Path(self.temporary.name)
         self.workspace = self.root / "work" / "T-000001"
         self.workspace.mkdir(parents=True)
+        self.profile_path = self.root / "profile.toml"
+        self.profile_path.write_text("placeholder", encoding="utf-8")
         self.profile = Profile(
             slug="demo", repository="example/demo", git_remote=str(self.workspace),
             workspace_root=self.root / "work", state_root=self.root / "state", log_root=self.root / "logs",
@@ -38,7 +40,9 @@ class NamedRoleAuthorityTests(unittest.TestCase):
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Named role test")
         (self.workspace / "README").write_text("base\n", encoding="utf-8")
-        self.git("add", "README")
+        (self.workspace / "src").mkdir()
+        (self.workspace / "src" / ".keep").write_text("\n", encoding="utf-8")
+        self.git("add", "README", "src")
         self.git("commit", "-qm", "base")
         base_sha = self.git("rev-parse", "HEAD")
         self.git("remote", "add", "origin", str(self.workspace))
@@ -66,14 +70,17 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             marker.write_text(json.dumps({"schema": "symphony-pilot-preparation/v3"}), encoding="utf-8")
         return prepare_attempt(self.profile, self.workspace)
 
-    def finish(self, attempt: dict[str, object], *, outcome: str, role: str, verdict: str | None = None, head_sha: str | None = None, findings: list[dict[str, object]] | None = None) -> None:
+    def finish(self, attempt: dict[str, object], *, outcome: str, role: str, verdict: str | None = None, head_sha: str | None = None, findings: list[dict[str, object]] | None = None, authorized_write_paths: list[str] | None = None) -> None:
         packet = attempt["packet"]
-        writable_roots = packet["dispatch"]["writable_roots"]
+        dispatch = packet["dispatch"]
+        result_root = pathlib.Path(dispatch["result_writable_root"])
+        target_writable_roots = dispatch["target_writable_roots"]
+        self.assertNotIn(str(pathlib.Path(attempt["namespace"]) / "host" / "execution.json"), [str(result_root), *target_writable_roots])
         if role == "IMPLEMENTER":
-            self.assertIn(str(self.workspace), writable_roots)
+            self.assertEqual(target_writable_roots, [str(self.workspace / "src")])
         else:
-            self.assertNotIn(str(self.workspace), writable_roots)
-        self.assertTrue(all(str(path).endswith("outbox") for path in writable_roots if role != "IMPLEMENTER"))
+            self.assertEqual(target_writable_roots, [])
+        self.assertEqual(str(result_root), str(pathlib.Path(attempt["namespace"]) / "outbox"))
         role_packet = None if role == "ARCHITECT" else {
             "role": role, "verdict": verdict or "COMPLETE", "summary": role.lower(),
             "head_sha": head_sha, "findings": findings or [],
@@ -85,10 +92,11 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             "expected_starting_head": packet["selected_head"], "workpad_body": packet["workpad"]["body"],
             "summary": outcome, "outcome": outcome, "packet": role_packet,
             "findings": [], "requested_resolved_finding_ids": [],
+            "authorized_write_paths": authorized_write_paths or [],
         }
         namespace = pathlib.Path(attempt["namespace"])
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        (namespace / "outbox" / "execution.json").write_text(json.dumps({
+        (namespace / "host" / "execution.json").write_text(json.dumps({
             "schema": "symphony-runtime-execution/v1", "role": packet["role"],
             "role_run_id": packet["role_run_id"], "status": "finished",
             "started_at": now, "finished_at": now, "session_id": f"session-{packet['role_run_id']}",
@@ -97,16 +105,28 @@ class NamedRoleAuthorityTests(unittest.TestCase):
         (namespace / "outbox" / "result.json").write_text(json.dumps(result), encoding="utf-8")
         reconcile(self.profile, self.workspace)
 
+    def write_execution_receipt(self, attempt: dict[str, object], status: str) -> None:
+        packet = attempt["packet"]
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        pathlib.Path(attempt["namespace"], "host", "execution.json").write_text(json.dumps({
+            "schema": "symphony-runtime-execution/v1", "role": packet["role"],
+            "role_run_id": packet["role_run_id"], "status": status,
+            "started_at": now, "finished_at": now,
+            "session_id": f"session-{packet['role_run_id']}",
+            "thread_id": f"thread-{packet['role_run_id']}",
+            "turn_id": f"turn-{packet['role_run_id']}",
+        }), encoding="utf-8")
+
     def test_full_fresh_role_round_and_archivist_closeout(self):
         self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
         self.finish(self.attempt(), outcome="role_complete", role="PROJECT-MANAGER", verdict="APPROVE")
         self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
         self.finish(self.attempt(), outcome="role_complete", role="PLANNER", verdict="COMPLETE")
-        self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT", authorized_write_paths=["src"])
 
-        implementation = self.workspace / "implementation.txt"
+        implementation = self.workspace / "src" / "implementation.txt"
         implementation.write_text("implemented\n", encoding="utf-8")
-        self.git("add", "implementation.txt")
+        self.git("add", "src/implementation.txt")
         self.git("commit", "-qm", "implement")
         head = self.git("rev-parse", "HEAD")
         self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE", head_sha=head)
@@ -140,15 +160,55 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             "expected_starting_head": packet["selected_head"], "workpad_body": packet["workpad"]["body"],
             "summary": "forged", "outcome": "role_complete",
             "packet": {"role": "PROJECT-MANAGER", "verdict": "APPROVE", "summary": "forged", "head_sha": None, "findings": []},
-            "findings": [], "requested_resolved_finding_ids": [],
+            "findings": [], "requested_resolved_finding_ids": [], "authorized_write_paths": [],
         }
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        (namespace / "outbox" / "execution.json").write_text(json.dumps({"role": "ARCHITECT", "role_run_id": packet["role_run_id"], "status": "finished", "started_at": now, "finished_at": now}), encoding="utf-8")
+        (namespace / "host" / "execution.json").write_text(json.dumps({"role": "ARCHITECT", "role_run_id": packet["role_run_id"], "status": "finished", "started_at": now, "finished_at": now}), encoding="utf-8")
         (namespace / "outbox" / "result.json").write_text(json.dumps(result), encoding="utf-8")
         with self.assertRaises(Exception):
             reconcile(self.profile, self.workspace)
         with control_db.open_database(self.database_path) as database:
             self.assertFalse(any(row["role"] == "PROJECT-MANAGER" for row in database.read_projection(self.TASK_ID)["role_runs"]))
+
+    def test_started_failed_execution_is_retained_as_failed_role_run(self):
+        attempt = self.attempt()
+        self.write_execution_receipt(attempt, "failed")
+        reconcile(self.profile, self.workspace)
+        with control_db.open_database(self.database_path) as database:
+            projection = database.read_projection(self.TASK_ID)
+            self.assertEqual(len(projection["role_runs"]), 1)
+            self.assertEqual(projection["role_runs"][0]["role"], "ARCHITECT")
+            self.assertEqual(projection["role_runs"][0]["status"], "failed")
+            self.assertTrue(any(event["event_type"] == "role_started" for event in projection["events"]))
+            self.assertTrue(any(event["event_type"] == "role_finished" for event in projection["events"]))
+
+    def test_never_started_execution_does_not_create_role_run(self):
+        attempt = self.attempt()
+        with self.assertRaises(Exception):
+            reconcile(self.profile, self.workspace)
+        with control_db.open_database(self.database_path) as database:
+            self.assertEqual(database.read_projection(self.TASK_ID)["role_runs"], [])
+
+    def test_invalid_architect_seam_fails_the_actual_execution(self):
+        self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="role_complete", role="PROJECT-MANAGER", verdict="APPROVE")
+        self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="role_complete", role="PLANNER", verdict="COMPLETE")
+
+        with self.assertRaises(Exception):
+            self.finish(
+                self.attempt(),
+                outcome="planning_complete",
+                role="ARCHITECT",
+                authorized_write_paths=["../outside"],
+            )
+
+        with control_db.open_database(self.database_path) as database:
+            projection = database.read_projection(self.TASK_ID)
+            self.assertEqual(len(projection["role_runs"]), 5)
+            self.assertEqual(projection["role_runs"][-1]["role"], "ARCHITECT")
+            self.assertEqual(projection["role_runs"][-1]["status"], "failed")
+            self.assertNotEqual(projection["task"]["state"], "PLANNED")
 
     def test_review_nonconvergence_starts_a_new_full_round_at_project_manager(self):
         finding = {
@@ -160,9 +220,9 @@ class NamedRoleAuthorityTests(unittest.TestCase):
         self.finish(self.attempt(), outcome="role_complete", role="PROJECT-MANAGER", verdict="APPROVE")
         self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
         self.finish(self.attempt(), outcome="role_complete", role="PLANNER", verdict="COMPLETE")
-        self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT")
-        (self.workspace / "implementation.txt").write_text("implemented\n", encoding="utf-8")
-        self.git("add", "implementation.txt")
+        self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT", authorized_write_paths=["src"])
+        (self.workspace / "src" / "implementation.txt").write_text("implemented\n", encoding="utf-8")
+        self.git("add", "src/implementation.txt")
         self.git("commit", "-qm", "implement")
         head = self.git("rev-parse", "HEAD")
         self.finish(self.attempt(), outcome="role_complete", role="IMPLEMENTER", verdict="COMPLETE", head_sha=head)

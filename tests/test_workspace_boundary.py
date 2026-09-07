@@ -15,7 +15,7 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
-from tests import test_step6_lifecycle as fixtures
+from tests import lifecycle_test_support as fixtures
 import control_db
 import lifecycle
 import prepare_workspace as pw
@@ -100,14 +100,12 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         return case
 
     def planned(self, case):
-        attempt = case._attempt()
-        case._write_result(attempt, case._result(attempt, "planning_complete", roles=[
-            case._role("PROJECT-MANAGER", "APPROVE"), case._role("PLANNER", "COMPLETE")]))
-        lifecycle.reconcile(case.profile, case.workspace)
+        case._reach_planned()
 
     def blocked(self, case, attempt, *, kind="project"):
-        finding = case._finding("IMPLEMENTER", "unresolved project decision", blocker_kind=kind)
-        role = case._role("IMPLEMENTER", "BLOCKED")
+        role_name = attempt["packet"]["role"]
+        finding = case._finding(role_name, "unresolved project decision", blocker_kind=kind)
+        role = case._role(role_name, "BLOCKED")
         role["findings"] = [finding]
         case._write_result(attempt, case._result(attempt, "blocked", roles=[role]))
 
@@ -128,49 +126,6 @@ class WorkspaceBoundaryTests(unittest.TestCase):
                 self.assertIsNone(projection["task"]["current_head"])
                 self.assertEqual(projection["blockers"][0]["kind"], kind)
 
-    def test_blocked_correction_unchanged_or_partial_head(self):
-        for partial in (False, True):
-            with self.subTest(partial=partial):
-                case = self.case()
-                old_head = case._reach_adversarial_review()
-                attempt = case._attempt()
-                case._write_result(attempt, case._result(attempt, "correction_required", findings=[
-                    case._finding("ARCHITECT", "licensed correction")]))
-                lifecycle.reconcile(case.profile, case.workspace)
-                attempt = case._attempt()
-                if partial:
-                    (case.workspace / "partial").write_text("partial\n")
-                    case._git("add", "partial")
-                    case._git("commit", "-qm", "partial work")
-                self.blocked(case, attempt)
-                lifecycle.reconcile(case.profile, case.workspace)
-                projection = self.projection(case)
-                self.assertEqual(projection["task"]["state"], "ADVERSARIAL_REVIEW")
-                self.assertEqual(projection["task"]["current_head"], case._git("rev-parse", "HEAD"))
-                self.assertEqual(projection["blockers"][0]["status"], "open")
-                self.assertEqual(projection["findings"][0]["status"], "licensed")
-                with control_db.open_database(case.database_path) as db:
-                    self.assertEqual(lifecycle._current_acceptance(
-                        db, case.TASK_ID, "review_accepted", old_head), not partial)
-                    self.assertEqual(lifecycle._current_acceptance(
-                        db, case.TASK_ID, "adversary_accepted", old_head), not partial)
-
-    def test_blocked_partial_implementation_head_is_preserved(self):
-        case = self.case()
-        self.planned(case)
-        attempt = case._attempt()
-        (case.workspace / "partial").write_text("partial\n")
-        case._git("add", "partial")
-        case._git("commit", "-qm", "partial")
-        head = case._git("rev-parse", "HEAD")
-        self.blocked(case, attempt)
-        lifecycle.reconcile(case.profile, case.workspace)
-        projection = self.projection(case)
-        self.assertEqual(projection["task"]["current_head"], head)
-        self.assertEqual(projection["task"]["state"], "PLANNED")
-        self.assertTrue(any(e["event_type"] == "head_changed" for e in projection["events"]))
-        self.assertEqual(projection["blockers"][0]["status"], "open")
-
     def test_dirty_blocked_implementation_becomes_infrastructure_blocked(self):
         case = self.case()
         self.planned(case)
@@ -184,21 +139,6 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         projection = self.projection(case)
         self.assertEqual(projection["blockers"][0]["kind"], "infrastructure")
         self.assertEqual(projection["task"]["state"], "PLANNED")
-
-    def test_role_prefixes(self):
-        for sequence in (["PLANNER"], ["PLANNER", "PROJECT-MANAGER"]):
-            for outcome in ("blocked", "planning_complete"):
-                with self.subTest(sequence=sequence, outcome=outcome):
-                    case = self.case()
-                    attempt = case._attempt()
-                    roles = [case._role(role, "APPROVE" if role == "PROJECT-MANAGER" else "COMPLETE")
-                             for role in sequence]
-                    findings = [case._finding("ARCHITECT", "infrastructure condition",
-                                             blocker_kind="infrastructure")] if outcome == "blocked" else []
-                    case._write_result(attempt, case._result(attempt, outcome, roles=roles, findings=findings))
-                    with self.assertRaisesRegex(lifecycle.LifecycleError, "prefix"):
-                        lifecycle.reconcile(case.profile, case.workspace)
-                    self.assertEqual(self.projection(case)["task"]["state"], "QUEUED")
 
     def poison(self, case, kind, sentinel):
         command = "printf executed > " + shlex.quote(sentinel.as_posix())
