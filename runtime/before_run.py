@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted preparation plus Step-6 Architect-attempt allocation."""
+"""Trusted preparation plus one host-selected named-role dispatch."""
 from __future__ import annotations
 
 import argparse

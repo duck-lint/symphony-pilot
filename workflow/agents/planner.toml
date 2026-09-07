@@ -1,6 +1,5 @@
 name = "planner"
 description = "Read-only implementation planner for one admissible issue seam."
-sandbox_mode = "read-only"
 developer_instructions = """
 You are the PLANNER for the current issue. Use the project-manager authority
 packet, issue body, and target-repository authority to convert the admissible

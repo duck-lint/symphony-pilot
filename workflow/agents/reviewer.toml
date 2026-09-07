@@ -1,6 +1,5 @@
 name = "reviewer"
 description = "Read-only conformance reviewer for the current issue HEAD."
-sandbox_mode = "read-only"
 developer_instructions = """
 You are the REVIEWER. Inspect the current HEAD read-only against the issue,
 accepted target-project authority, approved plan, verification contract, and

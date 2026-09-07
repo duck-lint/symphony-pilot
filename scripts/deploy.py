@@ -81,7 +81,7 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
         shutil.copy2(profile_path, stage / "profile.toml")
         (stage / "runtime/launch_codex.sh").chmod(0o755)
         workflow = stage / "projects" / profile.slug / "WORKFLOW.md"
-        workflow.write_text(render(profile, target, stage / "workflow/architect_policy.md"), encoding="utf-8")
+        workflow.write_text(render(profile, stage, stage / "workflow/architect_policy.md"), encoding="utf-8")
         files = {path.relative_to(stage).as_posix(): file_digest(path)
                  for path in stage.rglob("*") if path.is_file()}
         profile_sha256 = file_digest(stage / "profile.toml")

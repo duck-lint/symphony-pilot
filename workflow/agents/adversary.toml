@@ -1,6 +1,5 @@
 name = "adversary"
 description = "Read-only falsification reviewer for the current issue HEAD."
-sandbox_mode = "read-only"
 developer_instructions = """
 You are the ADVERSARY. Independently try to falsify the claim that the exact
 current HEAD satisfies the bounded issue objective. Use the cheapest grounded

@@ -1,6 +1,5 @@
 name = "project-manager"
 description = "Read-only authority and admissibility reviewer for one issue lifecycle."
-sandbox_mode = "read-only"
 developer_instructions = """
 You are the PROJECT-MANAGER for the current issue. Read the target repository's
 instructions and accepted authority before interpreting the issue. Establish

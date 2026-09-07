@@ -5,6 +5,7 @@ import argparse
 import pathlib
 import shlex
 import sys
+import tomllib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from prepare_workspace import Profile, control_database_path, load_profile
 
@@ -36,15 +37,10 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "  before_remove: |",
         f"    python3 {shell(runtime / 'before_remove.py')} --profile {shell(profile_path)} --workspace \"$PWD\" || true",
         "agent:", f"  max_concurrent_agents: {profile.max_concurrent_agents}",
-        # One Runtime dispatch must correspond to one bounded Architect
-        # attempt; SQLite reconciliation is the continuation mechanism.
         "  max_turns: 1",
         "codex:", f"  command: {shell(runtime / 'launch_codex.sh')}",
-        "  approval_policy: never", "  thread_sandbox: danger-full-access",
-        # Supervised-local mode deliberately permits the Architect to reach
-        # Pilot's host-owned lifecycle inbox/outbox outside the checkout. The
-        # launcher remains fail-closed unless the operator opts in explicitly.
-        "  turn_sandbox_policy:", "    type: dangerFullAccess",
+        "  approval_policy: never", "  thread_sandbox: read-only",
+        "  turn_sandbox_policy:", "    type: readOnly",
     ]
     lines += [
         "---", "", pathlib.Path(policy).read_text(encoding="utf-8").rstrip(), "",
@@ -58,7 +54,31 @@ def render(profile: Profile, install_root: pathlib.Path, policy: pathlib.Path) -
         "- Objective:",
         "{{ issue.description }}",
         "",
+        "## Selected role policy",
+        "",
+        "The Runtime selects one role for this fresh execution. The following",
+        "policy projection is generated from the six deployed role TOMLs; it is",
+        "reasoning policy only. Sandbox and writable-root authority comes from",
+        "Runtime's App Server dispatch configuration.",
+        "",
     ]
+    role_files = {
+        "PROJECT-MANAGER": "project-manager",
+        "PLANNER": "planner",
+        "IMPLEMENTER": "implementer",
+        "REVIEWER": "reviewer",
+        "ADVERSARY": "adversary",
+        "ARCHIVIST": "archivist",
+    }
+    for role, filename in role_files.items():
+        role_path = install_root / "workflow" / "agents" / f"{filename}.toml"
+        if not role_path.is_file():
+            continue
+        role_config = tomllib.loads(role_path.read_text(encoding="utf-8"))
+        instructions = role_config.get("developer_instructions")
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise ValueError(f"role policy has no developer_instructions: {role_path}")
+        lines += [f'{{% if execution.role == "{role}" %}}', instructions.strip(), "{% endif %}", ""]
     return "\n".join(lines)
 
 def main() -> int:

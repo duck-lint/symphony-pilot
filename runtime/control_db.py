@@ -1363,6 +1363,7 @@ class ControlPlaneDatabase:
         head_sha: str | None = None,
         run_id: str | uuid.UUID | None = None,
         started_at: str | None = None,
+        event_payload: dict[str, object] | None = None,
     ) -> dict[str, object]:
         task_id = _uuid(task_id, "task_id")
         run_id = _uuid(run_id, "role_run_id")
@@ -1381,8 +1382,11 @@ class ControlPlaneDatabase:
                 """,
                 (run_id, task_id, role, round, head_sha, timestamp),
             )
+            payload = {"role": role, "round": round}
+            if event_payload:
+                payload.update(event_payload)
             self._insert_event(
-                task_id, "role_started", {"role": role, "round": round},
+                task_id, "role_started", payload,
                 role_run_id=run_id, occurred_at=timestamp,
             )
         return self.read_role_run(run_id)
@@ -1402,6 +1406,7 @@ class ControlPlaneDatabase:
         result_summary: str | None = None,
         head_sha: str | None = None,
         finished_at: str | None = None,
+        event_payload: dict[str, object] | None = None,
     ) -> dict[str, object]:
         run_id = _uuid(run_id, "role_run_id")
         if status not in ROLE_RUN_STATUSES - {"started"}:
@@ -1423,9 +1428,11 @@ class ControlPlaneDatabase:
                 """,
                 (status, timestamp, result_summary, head_sha, run_id),
             )
+            payload = {"role": current["role"], "round": current["round"], "status": status}
+            if event_payload:
+                payload.update(event_payload)
             self._insert_event(
-                task_id, "role_finished",
-                {"role": current["role"], "round": current["round"], "status": status},
+                task_id, "role_finished", payload,
                 role_run_id=run_id, occurred_at=timestamp,
             )
         return self.read_role_run(run_id)
@@ -1944,7 +1951,7 @@ class ControlPlaneDatabase:
             "workpad": self.read_workpad(task_id),
             "role_runs": [
                 dict(row) for row in self.connection.execute(
-                    "SELECT * FROM role_runs WHERE task_id = ? ORDER BY round, role", (task_id,)
+                    "SELECT * FROM role_runs WHERE task_id = ? ORDER BY started_at, id", (task_id,)
                 ).fetchall()
             ],
             "findings": [

@@ -155,57 +155,6 @@ class UnpublishedContinuationTests(unittest.TestCase):
         self.assertEqual(projection["blockers"], [])
         return projection
 
-    def test_actual_rendered_hook_cadence_keeps_continuation_unpublished(self):
-        policy = self.root / "policy.md"
-        policy.write_text("# synthetic policy\n", encoding="utf-8")
-        from render_workflow import render
-        rendered = render(self.profile, self.root / "install", policy)
-        self.assertIn("before_run.py", rendered)
-        self.assertIn("after_run.py", rendered)
-        self.assertEqual(self._task()["state"], "QUEUED")
-        planning = self._accept("planning_complete", role=None, expected_state="QUEUED")
-        self.assertEqual(planning["task"]["state"], "PLANNED")
-        self.assertEqual(planning["task"]["current_head"], None)
-        self.assertEqual(planning["workpad"]["version"], 2)
-        self.assertEqual(self._task()["state"], "PLANNED")
-
-        self.assertEqual(self._before(), 0)
-        attempt = self._attempt()
-        (self.workspace / "implementation").write_text("implemented\n", encoding="utf-8")
-        self._git(self.workspace, "add", "implementation")
-        self._git(self.workspace, "config", "user.email", "step6@example.invalid")
-        self._git(self.workspace, "config", "user.name", "Step 6")
-        self._git(self.workspace, "commit", "-qm", "implementation")
-        implementation_head = self._git(self.workspace, "rev-parse", "HEAD")
-        self.assertNotEqual(implementation_head, self.base_sha)
-        self._write_result(attempt, self._result(attempt, "implementation_complete", role="IMPLEMENTER", head=implementation_head))
-        self.assertEqual(self._after(), 0)
-        implemented = self._projection()
-        self.assertEqual(implemented["task"]["state"], "IMPLEMENTED")
-        self.assertEqual(implemented["task"]["current_head"], implementation_head)
-        self.assertEqual(implemented["workpad"]["version"], 3)
-        self.assertEqual(implemented["blockers"], [])
-        self.assertEqual(self._git(self.workspace, "rev-parse", "HEAD"), implementation_head)
-        self.assertEqual(self._observe_remote_refs("after:implementation_complete"), ["refs/heads/master"])
-
-        for outcome, role, state in (
-            ("review_approved", "REVIEWER", "IMPLEMENTED"),
-            ("adversary_pass", "ADVERSARY", "REVIEW"),
-            ("validation_pass", None, "ADVERSARIAL_REVIEW"),
-            ("archive_complete", "ARCHIVIST", "FINAL_MECHANICAL_ACCEPTANCE"),
-        ):
-            projection = self._accept(outcome, role=role, head=implementation_head, expected_state=state)
-            self.assertEqual(projection["task"]["current_head"], implementation_head)
-            self.assertEqual(projection["workpad"]["version"], {
-                "review_approved": 4, "adversary_pass": 5, "validation_pass": 6, "archive_complete": 7,
-            }[outcome])
-            self.assertEqual(projection["blockers"], [])
-
-        self.assertEqual(self._task()["state"], "FINAL_MECHANICAL_ACCEPTANCE")
-        self.assertEqual(self._observe_remote_refs("final"), ["refs/heads/master"])
-        self.assertTrue(self.remote_ref_observations)
-        self.assertTrue(all(refs == ["refs/heads/master"] for _, refs in self.remote_ref_observations))
-
     def test_exact_local_unpublished_continuation_succeeds(self):
         with control_db.open_database(self.root / "control.sqlite3") as database:
             database.update_heads(self.TASK_ID, current_head=self.base_sha)

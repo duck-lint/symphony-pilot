@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile one hostile Architect lifecycle result into Pilot SQLite.
+"""Reconcile one hostile, execution-bound role result into Pilot SQLite.
 
 The after_run exit status is not an activation barrier; SQLite blocker side
 effects are the scheduler barrier.
