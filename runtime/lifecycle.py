@@ -16,6 +16,7 @@ import re
 import stat
 import uuid
 from control_db import ControlPlaneDatabase, ControlPlaneError, StateConflict
+from execution_receipts import ReceiptError, capture_live_receipt, verify_persisted_receipt
 from workspace_boundary import atomic_metadata_write, physical_directory, run_git
 from prepare_workspace import (Profile, control_database_path,
                                local_task_facts, require_physical_namespace)
@@ -169,8 +170,8 @@ def _rollover_blocked_correction(
 
 
 def _insert_event(database: ControlPlaneDatabase, task_id: str, event_type: str,
-                  payload: object, *, role_run_id: str | None = None) -> None:
-    database._insert_event(task_id, event_type, payload, role_run_id=role_run_id, occurred_at=_now())
+                  payload: object, *, role_run_id: str | None = None) -> str:
+    return database._insert_event(task_id, event_type, payload, role_run_id=role_run_id, occurred_at=_now())
 
 
 def _write_host_json(path: pathlib.Path, value: object) -> None:
@@ -562,7 +563,12 @@ def _current_acceptance(database: ControlPlaneDatabase, task_id: str, event_type
     return False
 
 
-def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual_head: str) -> dict[str, object]:
+def _reconcile(
+    database: ControlPlaneDatabase,
+    result: dict[str, object],
+    actual_head: str,
+    profile: Profile,
+) -> dict[str, object]:
     task = database.read_task(str(result["task_uuid"]))
     run_id = str(result["architect_role_run_id"])
     if task["identifier"] != result["identifier"]:
@@ -752,6 +758,16 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
                 (actual_head, _now(), task["id"]),
             )
             _insert_event(database, task["id"], "head_changed", {"current_head": actual_head, "published_head": task["published_head"]}, role_run_id=run_id)
+    # Capture only after every lifecycle acceptance check has passed.  The
+    # enclosing transaction then makes the immutable receipt event and the
+    # accepted terminal transition one commit; a capture or verification
+    # failure leaves the workspace available for the infrastructure blocker.
+    receipt = None
+    if outcome == "validation_pass":
+        try:
+            receipt = capture_live_receipt(profile, task)
+        except ReceiptError:
+            raise
     next_state = {
         "planning_complete": "PLANNED", "implementation_complete": "IMPLEMENTED",
         "review_approved": "REVIEW", "adversary_pass": "ADVERSARIAL_REVIEW",
@@ -769,7 +785,14 @@ def _reconcile(database: ControlPlaneDatabase, result: dict[str, object], actual
     elif outcome == "adversary_pass":
         _insert_event(database, task["id"], "adversary_accepted", {"head_sha": actual_head}, role_run_id=specialized_runs["ADVERSARY"])
     elif outcome == "validation_pass":
-        _insert_event(database, task["id"], "validation_passed", {"head_sha": actual_head}, role_run_id=run_id)
+        event_id = _insert_event(
+            database,
+            task["id"],
+            "validation_passed",
+            {"head_sha": actual_head, "execution_receipt": receipt},
+            role_run_id=run_id,
+        )
+        verify_persisted_receipt(database, str(task["id"]), event_id, receipt)
     _finish_architect(database, task, run_id, str(result["summary"]), actual_head)
     body = str(result["workpad_body"])
     if not body.startswith(WORKPAD_MARKER):
@@ -813,7 +836,7 @@ def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
         result = read_result(namespace / "outbox" / "result.json")
         actual_head = verify_git_truth(profile, workspace, task)
         with database._transaction():
-            return _reconcile(database, result, actual_head)
+            return _reconcile(database, result, actual_head, profile)
 
 
 def fail_attempt_for_workspace(profile: Profile, workspace: pathlib.Path, detail: str) -> None:

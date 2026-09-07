@@ -17,6 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 
 import control_db
+import execution_receipts
 import host_api
 from project_registry import resolve_project
 
@@ -238,12 +239,13 @@ class HostApiTests(unittest.TestCase):
                 task_id=task_id, state="FINAL_MECHANICAL_ACCEPTANCE",
             )
         self._git(workspace, "switch", "-q", "-c", task["branch"])
-        (workspace / "symphony-canary.txt").write_text("SYMPHONY CANARY OK\n", encoding="utf-8")
-        self._git(workspace, "add", "symphony-canary.txt")
-        self._git(workspace, "commit", "-qm", "add canary file")
-        (workspace / "symphony-canary.txt").write_text("SYMPHONY CANARY OK\nsecond line\n", encoding="utf-8")
-        self._git(workspace, "add", "symphony-canary.txt")
-        self._git(workspace, "commit", "-qm", "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ evidence")
+        if current_head:
+            (workspace / "symphony-canary.txt").write_text("SYMPHONY CANARY OK\n", encoding="utf-8")
+            self._git(workspace, "add", "symphony-canary.txt")
+            self._git(workspace, "commit", "-qm", "add canary file")
+            (workspace / "symphony-canary.txt").write_text("SYMPHONY CANARY OK\nsecond line\n", encoding="utf-8")
+            self._git(workspace, "add", "symphony-canary.txt")
+            self._git(workspace, "commit", "-qm", "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ evidence")
         head = self._git(workspace, "rev-parse", "HEAD")
         with control_db.open_database(self.database_path) as database:
             database.update_heads(task_id, current_head=head if current_head else base_sha)
@@ -284,6 +286,36 @@ class HostApiTests(unittest.TestCase):
         self.assertEqual(receipt["change_summary"]["files"][0]["path"], "symphony-canary.txt")
         self.assertIn("SYMPHONY CANARY OK", receipt["diff"]["unified_patch"])
         self.assertNotIn("github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ", body.decode())
+
+    def test_execution_receipt_persists_after_workspace_cleanup(self):
+        task_id, profile, workspace, base_sha, head = self._receipt_fixture()
+        with control_db.open_database(self.database_path) as database:
+            task = database.read_task(task_id)
+            receipt = execution_receipts.capture_live_receipt(profile, task)
+            database.record_event(task_id, "validation_passed", {
+                "head_sha": head, "execution_receipt": receipt,
+            })
+        response, body = self._receipt_request(task_id, profile)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body)["source"], "live")
+        shutil.rmtree(workspace)
+        response, body = self._receipt_request(task_id, profile)
+        self.assertEqual(response.status, 200)
+        saved = json.loads(body)
+        self.assertEqual(saved["source"], "persisted")
+        self.assertFalse(saved["workspace"]["exists"])
+        self.assertIsNone(saved["workspace"]["clean"])
+        self.assertEqual(saved["git"]["base_sha"], base_sha)
+        self.assertEqual(saved["git"]["current_head"], head)
+        self.assertEqual(saved["commits"][-1]["author_name"], "Symphony Agent")
+        self.assertEqual(saved["change_summary"]["files"][0]["path"], "symphony-canary.txt")
+        self.assertIn("SYMPHONY CANARY OK", saved["diff"]["unified_patch"])
+
+    def test_execution_receipt_does_not_fabricate_from_dirty_workspace(self):
+        task_id, profile, workspace, _, _ = self._receipt_fixture()
+        (workspace / "uncommitted.txt").write_text("not committed\n", encoding="utf-8")
+        response, _ = self._receipt_request(task_id, profile)
+        self.assertEqual(response.status, 409)
 
     def test_execution_receipt_missing_workspace_preserves_sqlite_evidence(self):
         task_id, profile, workspace, base_sha, head = self._receipt_fixture()
@@ -332,7 +364,7 @@ class HostApiTests(unittest.TestCase):
 
     def test_execution_receipt_diff_is_capped_and_receipt_route_is_get_only(self):
         task_id, profile, _, _, _ = self._receipt_fixture()
-        with mock.patch.object(host_api, "MAX_DIFF_CHARS", 20):
+        with mock.patch.object(execution_receipts, "MAX_DIFF_CHARS", 20):
             response, body = self._receipt_request(task_id, profile)
         self.assertEqual(response.status, 200)
         receipt = json.loads(body)

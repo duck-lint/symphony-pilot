@@ -959,6 +959,56 @@ class Step6LifecycleTests(unittest.TestCase):
                 78,
             )
 
+    def test_validation_persists_receipt_before_workspace_cleanup(self):
+        head = self._reach_adversarial_review()
+        attempt = self._attempt()
+        self._write_result(attempt, self._result(attempt, "validation_pass"))
+        reconcile(self.profile, self.workspace)
+
+        with control_db.open_database(self.database_path) as database:
+            task = database.read_task(self.TASK_ID)
+            validation = next(
+                event for event in database.list_events(self.TASK_ID)
+                if event["event_type"] == "validation_passed"
+            )
+            payload = json.loads(validation["payload_json"])
+            receipt = payload["execution_receipt"]
+            self.assertEqual(task["state"], "FINAL_MECHANICAL_ACCEPTANCE")
+            self.assertEqual(payload["head_sha"], head)
+            self.assertEqual(receipt["source"], "live")
+            self.assertEqual(receipt["git"]["current_head"], head)
+            self.assertEqual(receipt["commits"][-1]["author_name"], "Step 6 test")
+            self.assertIn("implementation", receipt["diff"]["unified_patch"])
+
+        self.assertTrue(self.workspace.exists())
+        import execution_receipts
+        saved = execution_receipts.persisted_receipt([validation])
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["source"], "persisted")
+
+    def test_receipt_capture_failure_blocks_cleanup_evidence_loss(self):
+        self._reach_adversarial_review()
+        attempt = self._attempt()
+        self._write_result(attempt, self._result(attempt, "validation_pass"))
+        import after_run
+        with mock.patch.object(
+            lifecycle_module, "capture_live_receipt",
+            side_effect=lifecycle_module.ReceiptError("receipt capture failed"),
+        ), mock.patch.object(after_run, "load_profile", return_value=self.profile):
+            self.assertEqual(
+                after_run.main(["--profile", str(self.profile_path), "--workspace", str(self.workspace)]),
+                78,
+            )
+        with control_db.open_database(self.database_path) as database:
+            task = database.read_task(self.TASK_ID)
+            self.assertEqual(task["state"], "ADVERSARIAL_REVIEW")
+            self.assertFalse(any(
+                event["event_type"] == "validation_passed"
+                for event in database.list_events(self.TASK_ID)
+            ))
+            self.assertEqual(database.read_projection(self.TASK_ID)["blockers"][0]["kind"], "infrastructure")
+        self.assertTrue(self.workspace.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

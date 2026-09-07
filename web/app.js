@@ -9,13 +9,14 @@ function renderReceipt(receipt,view){
   const task=view.task, workspace=receipt.workspace||{}, git=receipt.git||{}, summary=receipt.change_summary||{}, diff=receipt.diff||{};
   const published=git.published_head;
   const publication=published?`Published head ${shortSha(published)}`:"LOCAL ONLY — NOT PUBLISHED TO GITHUB";
+  const source=receipt.source==="persisted"?"Saved execution receipt":receipt.source==="live"?"Live execution receipt":"Receipt unavailable";
   const result=git.current_head?`${shortSha(git.base_sha)} → ${shortSha(git.current_head)}`:"No recorded task head";
   const workspaceMessage=workspace.exists?"":"<p class=\"receipt-empty\">Workspace not currently present. SQLite task evidence is preserved.</p>";
   const commits=receipt.commits||[];
   const files=summary.files||[];
   const roles=view.role_runs||[];
   return `<section class="receipt" aria-labelledby="receipt-title">
-    <div class="receipt-heading"><div><span class="eyebrow">EXECUTION RECEIPT</span><h3 id="receipt-title">Execution receipts</h3></div><span class="publication ${published?"published":"local"}">${escapeHtml(publication)}</span></div>
+    <div class="receipt-heading"><div><span class="eyebrow">EXECUTION RECEIPT</span><h3 id="receipt-title">Execution receipts</h3><small class="receipt-source">${escapeHtml(source)}</small></div><span class="publication ${published?"published":"local"}">${escapeHtml(publication)}</span></div>
     <div class="cards receipt-summary">
       ${card("State",task.state)}${card("Workspace",workspace.wsl_path)}${card("Local branch",git.branch)}${card("Result",result)}
     </div>
