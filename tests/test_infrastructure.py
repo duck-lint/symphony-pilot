@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,40 @@ import rulesets
 import publication
 import project_registry
 import runtime_lock
+
+
+def _materialize_role_prompt(rendered: str, role: str) -> str:
+    """Evaluate the role gates in the final rendered WORKFLOW template.
+
+    The production renderer emits Solid/Liquid control tags for Runtime. This
+    test helper evaluates that deliberately small, role-only subset so the
+    assertions inspect the prompt a role receives, not an isolated TOML block.
+    """
+    frames: list[list[bool]] = []
+    output: list[str] = []
+    condition = re.compile(r'^\{% if execution\.role == "([A-Z-]+)" %\}$')
+
+    def active() -> bool:
+        return all(parent and branch for parent, branch in frames)
+
+    for line in rendered.splitlines():
+        stripped = line.strip()
+        match = condition.fullmatch(stripped)
+        if match:
+            frames.append([active(), role == match.group(1)])
+        elif stripped == "{% else %}":
+            if not frames:
+                raise AssertionError("unmatched role-template else")
+            frames[-1][1] = not frames[-1][1]
+        elif stripped == "{% endif %}":
+            if not frames:
+                raise AssertionError("unmatched role-template endif")
+            frames.pop()
+        elif active():
+            output.append(line)
+    if frames:
+        raise AssertionError("unterminated role-template conditional")
+    return "\n".join(output)
 
 
 class InfrastructureTests(unittest.TestCase):
@@ -240,9 +275,23 @@ class InfrastructureTests(unittest.TestCase):
         from render_workflow import render
 
         rendered = render(self.profile(pathlib.Path("/tmp")), ROOT, ROOT / "workflow/architect_policy.md")
-        pm_block = rendered.split('{% if execution.role == "PROJECT-MANAGER" %}', 1)[1].split("{% endif %}", 1)[0]
-        self.assertIn("PROJECT-MANAGER", pm_block)
-        self.assertNotIn("You are the ARCHITECT", pm_block)
+        prompts = {
+            role: _materialize_role_prompt(rendered, role)
+            for role in ("ARCHITECT", "PROJECT-MANAGER", "REVIEWER", "ARCHIVIST")
+        }
+        self.assertIn("PROJECT-MANAGER", prompts["PROJECT-MANAGER"])
+        self.assertIn("role_complete", prompts["PROJECT-MANAGER"])
+        self.assertNotIn("planning_complete", prompts["PROJECT-MANAGER"])
+        self.assertNotIn("role_requested", prompts["PROJECT-MANAGER"])
+        self.assertNotIn("You are the ARCHITECT", prompts["PROJECT-MANAGER"])
+        self.assertIn("REVIEWER", prompts["REVIEWER"])
+        self.assertIn("role_complete", prompts["REVIEWER"])
+        self.assertNotIn("review_approved", prompts["REVIEWER"])
+        self.assertIn("archive_complete", prompts["ARCHIVIST"])
+        self.assertNotIn("planning_complete", prompts["ARCHIVIST"])
+        self.assertNotIn("role_requested", prompts["ARCHIVIST"])
+        for outcome in ("role_requested", "planning_complete", "implementation_complete", "review_approved", "adversary_pass", "validation_pass", "correction_required", "blocked"):
+            self.assertIn(outcome, prompts["ARCHITECT"])
 
     def test_launcher_is_minimal_and_fail_closed(self):
         text = (ROOT / "runtime/launch_codex.sh").read_text(encoding="utf-8")

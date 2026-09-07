@@ -235,12 +235,26 @@ these fields:
 
 Use the input packet values for the identity and expected-state fields. The
 `role` must equal `{{ execution.role }}`. Preserve the workpad marker in
-`workpad_body`. Use `role_requested` when Pilot should dispatch the next
-eligible PM or Planner. Use `planning_complete`, `implementation_complete`,
-`review_approved`, `adversary_pass`, `validation_pass`, `correction_required`,
-or `blocked` only when the corresponding real specialized execution and
-trusted Git evidence exist. Never return `role_results` or another role's
-specialized packet.
+`workpad_body`. Never return `role_results` or another role's specialized
+packet.
+
+{% if execution.role == "ARCHITECT" %}
+Use `role_requested` when Pilot should dispatch the next eligible PM or
+Planner.
+The Architect may return `role_requested`, `planning_complete`,
+`implementation_complete`, `review_approved`, `adversary_pass`,
+`validation_pass`, `correction_required`, or `blocked` only when the
+corresponding real specialized execution and trusted Git evidence exist.
+Use these outcomes only as licensed by the current lifecycle state.
+{% else %}
+{% if execution.role == "ARCHIVIST" %}
+The Archivist may return only `archive_complete` or `blocked`. It does not
+choose an Architect/Pilot routing outcome.
+{% else %}
+The specialized role may return only `role_complete` or `blocked`. It does
+not choose an Architect/Pilot routing outcome.
+{% endif %}
+{% endif %}
 
 {% if execution.role == "ARCHITECT" %}
 For Architect execution, `packet` must be `null` and `findings` must contain
@@ -254,6 +268,7 @@ observed input HEAD where applicable. The host supplies the authoritative
 post-Implementer HEAD.
 {% endif %}
 
+{% if execution.role == "ARCHITECT" %}
 `authorized_write_paths` is an empty list except in an Architect
 `planning_complete` result. For that outcome, provide explicit
 repository-relative files and/or directories that the fresh Implementer is
@@ -261,6 +276,10 @@ authorized to mutate. Do not provide absolute paths, parent traversal, or the
 checkout root; Pilot resolves and validates these paths before Runtime grants
 target-project write access. A new file may be created only beneath an
 explicitly authorized directory.
+{% else %}
+`authorized_write_paths` must be an empty list. A specialized role does not
+authorize target-project writes.
+{% endif %}
 
 Accepted findings from earlier attempts are historical evidence. Resolving a
 host blocker does not resolve its finding record. Set
@@ -269,6 +288,7 @@ implementation, review, adversarial, validation, and archive outcomes. Only an
 Implementer may request resolution of currently licensed correction findings,
 and only in its own packet after the fresh round's implementation.
 
+{% if execution.role == "ARCHITECT" %}
 Use these exact routing outcomes: `QUEUED` uses `role_requested` until a real
 PM and Planner packet have both been accepted, then `planning_complete`;
 `PLANNED` uses `implementation_complete`; `IMPLEMENTED` uses
@@ -277,6 +297,15 @@ PM and Planner packet have both been accepted, then `planning_complete`;
 `archive_complete` packet after final mechanical acceptance.
 `correction_required` starts a new full round at PROJECT-MANAGER.
 `blocked` never advances lifecycle.
+{% else %}
+{% if execution.role == "ARCHIVIST" %}
+`archive_complete` is the Archivist's successful closeout outcome.
+`blocked` never advances lifecycle.
+{% else %}
+`role_complete` is the specialized role's successful outcome.
+`blocked` never advances lifecycle.
+{% endif %}
+{% endif %}
 
 Write only this execution's result to `result.json` before returning prose.
 The host only advances after that file is present, valid, and bound to this

@@ -595,8 +595,18 @@ def _transition(database: ControlPlaneDatabase, task: dict[str, object], new_sta
         raise StateConflict("task state changed during lifecycle reconciliation")
 
 
-def _reconcile(database: ControlPlaneDatabase, task: dict[str, object], result: dict[str, object], run: dict[str, object], receipt: dict[str, object], actual_head: str, profile: Profile) -> dict[str, object]:
-    if task["identifier"] != result["identifier"] or task["state"] != result["expected_state"]:
+def _validate_reconciliation_binding(
+    database: ControlPlaneDatabase,
+    task: dict[str, object],
+    result: dict[str, object],
+    run: dict[str, object],
+) -> tuple[dict[str, object], str, str, dict[str, object] | None]:
+    """Validate result binding before a host commit can be attempted.
+
+    This seam performs no lifecycle mutation. It only establishes that the
+    packet belongs to the current dispatch and is legal for the eligible role.
+    """
+    if str(result["task_uuid"]) != str(task["id"]) or task["identifier"] != result["identifier"] or task["state"] != result["expected_state"]:
         raise StateConflict("lifecycle result identity or expected state is stale")
     workpad = database.read_workpad(str(task["id"]))
     if workpad is None or workpad["version"] != result["expected_workpad_version"]:
@@ -607,8 +617,33 @@ def _reconcile(database: ControlPlaneDatabase, task: dict[str, object], result: 
     role = str(result["role"])
     if role != run["role"] or str(result["role_run_id"]) != run["id"]:
         raise StateConflict("lifecycle result is not bound to the dispatched execution")
-    state = str(task["state"])
+
     packet = result["packet"]
+    if role == "ARCHITECT":
+        return workpad, selected_head, role, None
+
+    if _expected_specialized_role(database, task, run) != role:
+        raise LifecycleError("specialized role is not eligible in the current lifecycle state")
+    expected_verdict = {"PROJECT-MANAGER": "APPROVE", "PLANNER": "COMPLETE", "IMPLEMENTER": "COMPLETE", "REVIEWER": "APPROVE", "ADVERSARY": "PASS", "ARCHIVIST": "COMPLETE"}[role]
+    if result["outcome"] not in {"role_complete", "archive_complete", "blocked"} or (result["outcome"] == "archive_complete" and role != "ARCHIVIST"):
+        raise LifecycleError("specialized role returned an invalid lifecycle outcome")
+    if result["outcome"] == "blocked" and packet["verdict"] != "BLOCKED":
+        raise LifecycleError("blocked specialized execution must return a BLOCKED packet")
+    allowed_verdicts = {expected_verdict}
+    if role in {"REVIEWER", "ADVERSARY"}:
+        allowed_verdicts.add("FINDINGS")
+    if result["outcome"] != "blocked" and packet["verdict"] not in allowed_verdicts:
+        raise LifecycleError("specialized role verdict is not licensed")
+    if role == "IMPLEMENTER" and packet["head_sha"] is not None:
+        raise LifecycleError("Implementer packet must not predict the host-created commit HEAD")
+    if result["workpad_body"] != workpad["body"]:
+        raise LifecycleError("specialized role attempted to author the lifecycle workpad")
+    return workpad, selected_head, role, packet
+
+
+def _reconcile(database: ControlPlaneDatabase, task: dict[str, object], result: dict[str, object], run: dict[str, object], receipt: dict[str, object], actual_head: str, profile: Profile) -> dict[str, object]:
+    workpad, selected_head, role, packet = _validate_reconciliation_binding(database, task, result, run)
+    state = str(task["state"])
     if role == "ARCHITECT":
         if actual_head != selected_head:
             raise LifecycleError("read-only Architect execution changed Git HEAD")
@@ -653,26 +688,12 @@ def _reconcile(database: ControlPlaneDatabase, task: dict[str, object], result: 
         for finding in result["findings"]:
             _insert_finding(database, task, run, finding)
     else:
-        if _expected_specialized_role(database, task, run) != role:
-            raise LifecycleError("specialized role is not eligible in the current lifecycle state")
-        expected_verdict = {"PROJECT-MANAGER": "APPROVE", "PLANNER": "COMPLETE", "IMPLEMENTER": "COMPLETE", "REVIEWER": "APPROVE", "ADVERSARY": "PASS", "ARCHIVIST": "COMPLETE"}[role]
-        if result["outcome"] not in {"role_complete", "archive_complete", "blocked"} or (result["outcome"] == "archive_complete" and role != "ARCHIVIST"):
-            raise LifecycleError("specialized role returned an invalid lifecycle outcome")
-        if result["outcome"] == "blocked" and packet["verdict"] != "BLOCKED":
-            raise LifecycleError("blocked specialized execution must return a BLOCKED packet")
-        allowed_verdicts = {expected_verdict}
-        if role in {"REVIEWER", "ADVERSARY"}:
-            allowed_verdicts.add("FINDINGS")
-        if result["outcome"] != "blocked" and packet["verdict"] not in allowed_verdicts:
-            raise LifecycleError("specialized role verdict is not licensed")
         if role == "IMPLEMENTER" and result["outcome"] != "blocked" and actual_head == selected_head:
             raise LifecycleError("Implementer did not produce a new committed HEAD")
         if role != "IMPLEMENTER" and actual_head != selected_head:
             raise LifecycleError("read-only specialized role changed Git HEAD")
         if packet["head_sha"] not in (None, actual_head):
             raise LifecycleError("specialized packet HEAD does not match trusted Git HEAD")
-        if result["workpad_body"] != workpad["body"]:
-            raise LifecycleError("specialized role attempted to author the lifecycle workpad")
         for finding in packet["findings"]:
             _insert_finding(database, task, run, finding)
         if result["requested_resolved_finding_ids"] and role != "IMPLEMENTER":
@@ -768,6 +789,9 @@ def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
             run = _materialize_started_run(database, task, marker, receipt)
         try:
             result = read_result(namespace / "outbox" / "result.json")
+            # Bind and validate the packet before any Implementer delta can
+            # become a host-authored commit.
+            _validate_reconciliation_binding(database, task, result, run)
             if marker.get("dispatch_role") == "IMPLEMENTER" and result["outcome"] != "blocked":
                 _commit_implementer_delta(workspace, marker)
             actual_head = verify_git_truth(profile, workspace, task)

@@ -70,13 +70,13 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             marker.write_text(json.dumps({"schema": "symphony-pilot-preparation/v3"}), encoding="utf-8")
         return prepare_attempt(self.profile, self.workspace)
 
-    def finish(self, attempt: dict[str, object], *, outcome: str, role: str, verdict: str | None = None, head_sha: str | None = None, findings: list[dict[str, object]] | None = None, authorized_write_paths: list[str] | None = None) -> None:
+    def finish(self, attempt: dict[str, object], *, outcome: str, role: str, verdict: str | None = None, head_sha: str | None = None, findings: list[dict[str, object]] | None = None, authorized_write_paths: list[str] | None = None, result_overrides: dict[str, object] | None = None) -> None:
         packet = attempt["packet"]
         dispatch = packet["dispatch"]
         result_root = pathlib.Path(dispatch["result_writable_root"])
         target_writable_roots = dispatch["target_writable_roots"]
         self.assertNotIn(str(pathlib.Path(attempt["namespace"]) / "host" / "execution.json"), [str(result_root), *target_writable_roots])
-        if role == "IMPLEMENTER":
+        if dispatch["role"] == "IMPLEMENTER":
             self.assertEqual(target_writable_roots, [str(self.workspace / "src")])
         else:
             self.assertEqual(target_writable_roots, [])
@@ -94,6 +94,8 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             "findings": [], "requested_resolved_finding_ids": [],
             "authorized_write_paths": authorized_write_paths or [],
         }
+        if result_overrides:
+            result.update(result_overrides)
         namespace = pathlib.Path(attempt["namespace"])
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         (namespace / "host" / "execution.json").write_text(json.dumps({
@@ -104,6 +106,15 @@ class NamedRoleAuthorityTests(unittest.TestCase):
         }), encoding="utf-8")
         (namespace / "outbox" / "result.json").write_text(json.dumps(result), encoding="utf-8")
         reconcile(self.profile, self.workspace)
+
+    def prepare_implementer_with_delta(self) -> dict[str, object]:
+        self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="role_complete", role="PROJECT-MANAGER", verdict="APPROVE")
+        self.finish(self.attempt(), outcome="role_requested", role="ARCHITECT")
+        self.finish(self.attempt(), outcome="role_complete", role="PLANNER", verdict="COMPLETE")
+        self.finish(self.attempt(), outcome="planning_complete", role="ARCHITECT", authorized_write_paths=["src"])
+        (self.workspace / "src" / "implementation.txt").write_text("implemented\n", encoding="utf-8")
+        return self.attempt()
 
     def write_execution_receipt(self, attempt: dict[str, object], status: str) -> None:
         packet = attempt["packet"]
@@ -247,6 +258,90 @@ class NamedRoleAuthorityTests(unittest.TestCase):
             run = database.read_projection(self.TASK_ID)["role_runs"][-1]
             self.assertEqual(run["role"], "IMPLEMENTER")
             self.assertEqual(run["status"], "failed")
+
+    def test_wrong_role_run_id_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(
+                attempt,
+                outcome="role_complete",
+                role="IMPLEMENTER",
+                verdict="COMPLETE",
+                result_overrides={"role_run_id": "22222222-2222-2222-2222-222222222222"},
+            )
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+
+    def test_wrong_task_uuid_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(
+                attempt,
+                outcome="role_complete",
+                role="IMPLEMENTER",
+                verdict="COMPLETE",
+                result_overrides={"task_uuid": "33333333-3333-3333-3333-333333333333"},
+            )
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+
+    def test_wrong_role_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(attempt, outcome="role_complete", role="PROJECT-MANAGER", verdict="APPROVE")
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+
+    def test_stale_expected_state_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(
+                attempt,
+                outcome="role_complete",
+                role="IMPLEMENTER",
+                verdict="COMPLETE",
+                result_overrides={"expected_state": "QUEUED"},
+            )
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+
+    def test_stale_expected_head_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(
+                attempt,
+                outcome="role_complete",
+                role="IMPLEMENTER",
+                verdict="COMPLETE",
+                result_overrides={"expected_starting_head": "0" * 40},
+            )
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+
+    def test_stale_workpad_version_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(
+                attempt,
+                outcome="role_complete",
+                role="IMPLEMENTER",
+                verdict="COMPLETE",
+                result_overrides={"expected_workpad_version": 999},
+            )
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
+
+    def test_illegal_implementer_outcome_is_rejected_before_host_commit(self):
+        attempt = self.prepare_implementer_with_delta()
+        base_head = self.git("rev-parse", "HEAD")
+        with self.assertRaises(Exception):
+            self.finish(
+                attempt,
+                outcome="planning_complete",
+                role="IMPLEMENTER",
+                verdict="COMPLETE",
+            )
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
 
     def test_review_nonconvergence_starts_a_new_full_round_at_project_manager(self):
         finding = {
