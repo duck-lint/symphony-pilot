@@ -222,3 +222,9 @@ use the exact role and outcome licensed by the current state. Use an empty list
 for findings and requested resolutions when none are justified. `head_sha`
 must be null for a read-only role packet and must equal trusted Git HEAD when a
 mutating IMPLEMENTER packet is present.
+
+For this supervised local canary, do not delegate the PM/Planner work to a
+separate task or wait for another task. Use the six installed role policies as
+the role contracts, perform the current phase in this Architect turn, and
+write `result.json` before returning any prose. The host only advances after
+that file is present and valid.
