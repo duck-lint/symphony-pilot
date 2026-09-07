@@ -53,8 +53,32 @@ then
   exit 78
 fi
 
-# The home is fresh and task-local. The runtime must not be started with an
-# authentication file or secret environment variable in this domain.
+# Supervised local development deliberately uses the operator's existing Codex
+# home and authentication. This opt-in is not an unattended or hostile-task
+# boundary; H-004 remains outside this MVP. The role files are copied into the
+# active Codex agent directory so the normal installed App Server can resolve
+# the six project-owned policies.
+if [ "${SYMPHONY_SUPERVISED_LOCAL:-0}" = "1" ]; then
+  OPERATOR_CODEX_HOME=${CODEX_HOME:-${HOME:-}}
+  if [ -z "$OPERATOR_CODEX_HOME" ]; then
+    echo "symphony-pilot: supervised local mode requires CODEX_HOME or HOME" >&2
+    exit 78
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "symphony-pilot: supervised local mode requires codex on PATH" >&2
+    exit 78
+  fi
+  mkdir -p "$OPERATOR_CODEX_HOME/agents"
+  for name in $EXPECTED_ROLES; do
+    cp -- "$ROLE_SOURCE/$name.toml" "$OPERATOR_CODEX_HOME/agents/$name.toml"
+  done
+  export CODEX_HOME="$OPERATOR_CODEX_HOME"
+  exec codex app-server
+fi
+
+# The default path remains fail-closed. The home is fresh and task-local; the
+# runtime must not be started with an authentication file or secret environment
+# variable in this domain.
 TASK_CODEX_HOME=$(mktemp -d /tmp/symphony-pilot-task-codex-home.XXXXXX)
 cleanup() { rm -rf -- "$TASK_CODEX_HOME"; }
 trap cleanup 0 1 2 3 15

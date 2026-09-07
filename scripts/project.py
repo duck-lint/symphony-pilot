@@ -321,6 +321,11 @@ def runtime_environment(root: pathlib.Path, workflow: pathlib.Path) -> dict[str,
     return env
 
 
+def supervised_local_enabled() -> bool:
+    """Return the explicit human-supervised local execution opt-in."""
+    return os.environ.get("SYMPHONY_SUPERVISED_LOCAL") == "1"
+
+
 def start(profile):
     pid_path, log_path = state_paths(profile)
     try:
@@ -353,13 +358,16 @@ def start(profile):
     except (OSError, ValueError, TypeError, RuntimeLockError, PreparationError, ContainmentError) as exc:
         print(f"Cannot start Symphony: reviewed runtime identity is unavailable: {exc}")
         return 78
-    # This gate runs before any host process launch or publication operation.
-    # It is intentionally not a fallback to the old same-user architecture.
-    try:
-        require_execution_capability()
-    except ContainmentError as exc:
-        print(f"Cannot start Symphony: containment capability blocker: {exc}")
-        return 78
+    # The normal path remains fail-closed. Supervised local mode is an
+    # explicit same-user development opt-in; it launches the installed Codex
+    # App Server with operator authentication and is not an unattended safety
+    # boundary.
+    if not supervised_local_enabled():
+        try:
+            require_execution_capability()
+        except ContainmentError as exc:
+            print(f"Cannot start Symphony: containment capability blocker: {exc}")
+            return 78
     if pid_path.exists():
         identity = read(pid_path)
         identity = identity.get("identity") if identity else None

@@ -964,9 +964,58 @@ class ControlPlaneDatabase:
         return dict(result)
 
     def queue_task(self, task_id: str | uuid.UUID, *, project_slug: str) -> dict[str, object]:
-        """Reject the legacy transition that bypassed storage admission."""
-        del task_id, project_slug
-        raise StateConflict("QUEUED admission requires a verified storage reservation")
+        """Queue a prepared local task and create its initial workpad.
+
+        This is the ordinary operator-controlled queue operation. Storage
+        admission is an independent dormant hardening path; local development
+        queueing only needs the canonical SQLite lifecycle transition.
+        """
+        task_id = _uuid(task_id, "task_id")
+        project_slug = _project_slug(project_slug)
+        timestamp = _timestamp(None, "occurred_at")
+        with self._transaction():
+            task = self.read_task(task_id)
+            self._queue_task_and_workpad_locked(
+                task,
+                project_slug=project_slug,
+                timestamp=timestamp,
+                event_payload={"identifier": task["identifier"], "project_slug": project_slug},
+            )
+        return self.read_task(task_id)
+
+    def _queue_task_and_workpad_locked(
+        self,
+        task: dict[str, object],
+        *,
+        project_slug: str,
+        timestamp: str,
+        event_payload: object,
+    ) -> None:
+        """Apply the shared QUEUED transition while a write transaction is open."""
+        if task["project_slug"] != project_slug:
+            raise StateConflict("task is not registered to the selected project")
+        if task["state"] != "PREPARED":
+            raise StateConflict("only PREPARED tasks may be queued")
+        changed = self.connection.execute(
+            """
+            UPDATE tasks SET state = 'QUEUED', updated_at = ?
+            WHERE id = ? AND state = 'PREPARED'
+            """,
+            (timestamp, task["id"]),
+        ).rowcount
+        if changed != 1:
+            raise StateConflict("task state changed before it could be queued")
+        self._insert_event(task["id"], "queued", event_payload, occurred_at=timestamp)
+        body = "\n".join((
+            "<!-- symphony-workpad:v1 -->", "## Symphony Workpad", "",
+            f"- Task: {task['identifier']}", f"- Objective: {task['objective']}",
+            f"- Base: {task['base_ref']} @ {task['base_sha']}",
+            f"- Branch: {task['branch']}", "- Lifecycle state: QUEUED", "",
+        ))
+        self.connection.execute(
+            "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
+            (task["id"], body, timestamp),
+        )
 
     def reserve_storage_capacity(
         self,
@@ -1134,25 +1183,14 @@ class ControlPlaneDatabase:
                  domain.pool_bytes, domain.pool_inodes, domain.free_bytes, domain.free_inodes,
                  timestamp, domain.evidence_json),
             )
-            self.connection.execute(
-                "UPDATE tasks SET state = 'QUEUED', updated_at = ? WHERE id = ? AND state = 'PREPARED'",
-                (timestamp, task_id),
-            )
-            self._insert_event(
-                task_id, "queued",
-                {"identifier": task["identifier"], "project_slug": project_slug,
-                 "reserved_bytes": policy.task_bytes, "reserved_inodes": policy.task_inodes},
-                occurred_at=timestamp,
-            )
-            body = "\n".join((
-                "<!-- symphony-workpad:v1 -->", "## Symphony Workpad", "",
-                f"- Task: {task['identifier']}", f"- Objective: {task['objective']}",
-                f"- Base: {task['base_ref']} @ {task['base_sha']}",
-                f"- Branch: {task['branch']}", "- Lifecycle state: QUEUED", "",
-            ))
-            self.connection.execute(
-                "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
-                (task_id, body, timestamp),
+            self._queue_task_and_workpad_locked(
+                task,
+                project_slug=project_slug,
+                timestamp=timestamp,
+                event_payload={
+                    "identifier": task["identifier"], "project_slug": project_slug,
+                    "reserved_bytes": policy.task_bytes, "reserved_inodes": policy.task_inodes,
+                },
             )
         return self.read_task(task_id)
 

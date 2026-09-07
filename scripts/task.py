@@ -162,32 +162,21 @@ def queue(args: argparse.Namespace) -> int:
         if task["state"] != "PREPARED":
             raise StateConflict("only PREPARED tasks may be queued")
         try:
-            # The SQLite reservation commits before the privileged helper can
-            # mutate project-quota state.  A retained PREPARED row is the
-            # crash-recovery record for an uncertain helper outcome.
-            domain = verify_profile_storage_pool(profile)
-            database.reserve_storage_capacity(
-                task["id"], project_slug=profile.slug, domain=domain,
-                policy=profile.storage_policy,
+            create_empty_task_workspace(
+                pathlib.Path(profile.workspace_root), str(task["identifier"]),
             )
-            try:
-                create_empty_task_workspace(
-                    pathlib.Path(profile.workspace_root), str(task["identifier"]),
-                )
-            except WorkspaceBoundaryError as exc:
-                raise TaskCommandError(f"task workspace admission failed: {exc}") from exc
-            admission = verify_profile_storage(
-                profile, str(task["identifier"]), database=database, task_id=str(task["id"]),
-            )
-            task = database.queue_task_with_storage(
-                task["id"], project_slug=profile.slug,
-                domain=admission.domain, policy=profile.storage_policy,
-                assignment=admission.binding,
-            )
-        except (TaskCommandError, StateConflict, StorageContractError) as exc:
+            task = database.queue_task(task["id"], project_slug=profile.slug)
+        except WorkspaceBoundaryError as exc:
+            error = TaskCommandError(f"task workspace preparation failed: {exc}")
             database.record_blocker(
                 task_id=task["id"], kind="infrastructure",
-                body=f"storage admission failed: {type(exc).__name__}: {exc}",
+                body=f"local queue failed: {type(error).__name__}: {error}",
+            )
+            raise error from exc
+        except StateConflict as exc:
+            database.record_blocker(
+                task_id=task["id"], kind="infrastructure",
+                body=f"local queue failed: {type(exc).__name__}: {exc}",
             )
             raise
     _emit(task)

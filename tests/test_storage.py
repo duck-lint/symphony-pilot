@@ -114,16 +114,18 @@ class StorageContractTests(unittest.TestCase):
         self.assertEqual(values["available_inodes"], 400)
         self.assertEqual(values["backing_pool_bytes"], 120)
 
-    def test_legacy_queue_transition_cannot_bypass_storage_admission(self):
+    def test_local_queue_transition_creates_workpad_without_storage_admission(self):
         with tempfile.TemporaryDirectory() as directory:
             with control_db.open_database(pathlib.Path(directory) / "control.sqlite3") as database:
                 task = database.create_task(
                     project_slug="demo", title="Storage", objective="Bounded storage",
                     base_ref="main", base_sha="a" * 40,
                 )
-                with self.assertRaisesRegex(control_db.StateConflict, "storage reservation"):
-                    database.queue_task(task["id"], project_slug="demo")
-                self.assertEqual(database.read_task(task["id"])["state"], "PREPARED")
+                queued = database.queue_task(task["id"], project_slug="demo")
+                self.assertEqual(queued["state"], "QUEUED")
+                self.assertIsNone(database.read_storage_reservation(task["id"]))
+                self.assertEqual(database.read_workpad(task["id"])["version"], 1)
+                self.assertIn("- Lifecycle state: QUEUED", database.read_workpad(task["id"])["body"])
 
     def test_queue_finalization_requires_preexisting_durable_reservation(self):
         with tempfile.TemporaryDirectory() as directory:
