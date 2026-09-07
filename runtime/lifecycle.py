@@ -31,7 +31,7 @@ TASK_IDENTIFIER_RE = re.compile(r"^T-[0-9]{6}$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SECRET_MARKER_RE = re.compile(
-    r"(?:gh[pousr]_|github_pat_|sk-[A-Za-z0-9]|BEGIN [A-Z ]*PRIVATE KEY|Bearer\s+)", re.I
+    r"(?:gh[pousr]_|github_pat_|\bsk-[A-Za-z0-9]|BEGIN [A-Z ]*PRIVATE KEY|Bearer\s+)", re.I
 )
 ACTIVE_STATES = (
     "QUEUED", "PLANNED", "IMPLEMENTED", "REVIEW",

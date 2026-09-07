@@ -986,6 +986,14 @@ class Step6LifecycleTests(unittest.TestCase):
         self.assertIsNotNone(saved)
         self.assertEqual(saved["source"], "persisted")
 
+    def test_credential_marker_boundary_allows_normal_hyphenated_prose(self):
+        self.assertEqual(
+            lifecycle_module._bounded_text("task-local workspace", "workpad_body", 1024),
+            "task-local workspace",
+        )
+        with self.assertRaises(LifecycleError):
+            lifecycle_module._bounded_text("sk-live-token", "workpad_body", 1024)
+
     def test_receipt_capture_failure_blocks_cleanup_evidence_loss(self):
         self._reach_adversarial_review()
         attempt = self._attempt()
