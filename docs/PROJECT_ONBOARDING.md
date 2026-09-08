@@ -1,23 +1,19 @@
 # Project onboarding
 
-The canonical registry is the tracked `projects/` directory. A registered project is exactly one `projects/<slug>/profile.toml` whose `slug` matches its directory name and whose non-secret fields pass profile validation.
+A registered project supplies project-owned harness inputs, repository
+identity, validation rules, and bounded local settings. Adding a project must
+not require a Pilot or Runtime source-code branch.
 
-Create a profile with repository, Git remote, any currently retained host-side secret/publication reference, an allocated dashboard port, execution limits, Codex settings, toolchain hint, and optional notification/sleep preferences. Legacy trusted dispatcher, dispatch-label, and blocked-label fields may remain for deferred publication/lifecycle seams but are not scheduler authority. Do not add host paths, publication-key paths, or service names: deployment, workspace, state, logs, credentials, process state, locks, workflow location, publication-key location, and service identity are derived from the slug.
+Pilot validates registration and owns the local task/lifecycle control plane.
+The target repository and its harness remain authoritative for project meaning,
+acceptance criteria, private inputs, and human stop conditions. Repository
+service observations may support host materialization and publication, but do
+not become local scheduler authority.
 
-```bash
-mkdir -p projects/example-four
-python3 scripts/list_projects.py --suggest-dashboard-port
-$EDITOR projects/example-four/profile.toml
-python3 scripts/validate_profile.py
-python3 scripts/list_projects.py
-python3 scripts/provision_secret.py --project example-four
-python3 scripts/provision_publication_key.py --project example-four
-python3 scripts/task.py bind-publication-key --project example-four
-python3 scripts/deploy.py --project example-four --dry-run
-python3 scripts/deploy.py --project example-four
-python3 scripts/project.py --project example-four test
-```
+Do not add external service metadata or browser state as lifecycle inputs. Do
+not add project-specific production conditionals. The
+canary is an ordinary registered test project, not infrastructure.
 
-The profile's repository is globally unique in the registry. This is a deliberate tracker-isolation rule: identical label text is safe across different repositories, but not across two profiles targeting one repository. Registry validation also rejects duplicate dashboard allocations, derived resource equality, and path containment. Adding or removing a profile changes only registry membership; generic implementation remains unchanged.
-
-The project repository remains authoritative for architecture, acceptance criteria, private inputs, and human stop conditions. Local task meaning enters through the trusted host CLI; GitHub Issues are not scheduler input. The pilot owns only reusable host mechanics. A harmless live canary is required before real dispatch, and `symphony-canary` is just another profile when it is onboarded.
+The supervised-local substrate is proven; canonical fresh-specialist
+orchestration and unattended hardening are not claimed live from registration
+or policy availability.

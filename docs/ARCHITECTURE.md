@@ -1,152 +1,50 @@
-# Architecture
+# Pilot architecture
 
-> **Current proven mode:** supervised local MVP. Pilot `a88b075...` and
-> Runtime `bca0d702...` completed live canary execution through
-> `FINAL_MECHANICAL_ACCEPTANCE` with clean terminal behavior. The status rows
-> below distinguish this proof from unattended hardening and publication.
+The parent harness is authoritative for SYMPHONY semantics. This document
+records only the Pilot boundary.
 
-symphony-pilot is a trusted host control plane around the project-owned
-`symphony-runtime` lifecycle implementation. Target repositories remain
-authoritative for project meaning, validation, private inputs, and human stop
-conditions. OpenAI Symphony is historical/reference material, not continuing
-lifecycle or architectural authority.
+Pilot is the deterministic local control plane. It owns:
 
-## Authority topology
+- durable task identity and project registration;
+- lifecycle, working-round, and planning-attempt state;
+- eligibility, accepted transitions, blockers, and termination classification;
+- role capability grants and result/evidence reconciliation;
+- repository-authority observation and workspace facts;
+- host-side Git and publication brokerage; and
+- the canonical local API/UI projection.
 
-Step 5: SQLite determines what work exists. Step 6: SQLite determines what
-has happened to that work. Pilot is the lifecycle authority; Runtime only
-observes the database through its read-only adapter. The Architect result is
-an untrusted report, and host code derives identities, rounds, paths, Git
-truth, and the next state before one atomic reconciliation.
+Pilot does not perform specialist reasoning or execution. Runtime consumes the
+Pilot-authorized execution projection and returns host-observed evidence.
 
-The host owns the canonical registry, SQLite task rows, local task identity,
-publication deploy key, runtime locks, process state, and publication. Issue
-prose, workpad prose, task Git metadata, task output, and task filesystem state
-are untrusted payload. GitHub is publication-only and is not scheduler or
-lifecycle authority.
+The lifecycle benchmark is the persistent task-scoped
+PROJECT-MANAGER / DISPATCHER coordinating fresh Planner, Reviewer,
+Implementer, Adversary, and Archivist executions. There is no Architect actor.
+The parent harness defines the lifecycle and should be referenced rather than
+duplicated here.
 
-Review correction routing is phase-specific: reviewer and adversary corrections
-require their specialized `FINDINGS` packet; mechanical-validation correction is
-top-level Architect evidence and requires no specialized packet. A `BLOCKED`
-result may contain only the bounded role evidence available before the stop, but
-must produce an open SQLite blocker. Human/project/infrastructure escalation is
-carried by finite `blocker_kind`, never inferred from finding prose.
+## Authority boundary
 
-The profile supplies project onboarding data: repository, clone remote, any
-currently retained host-secret/publication settings, model settings, and
-resource preferences. Host paths and publication-key paths are derived from
-the project slug. Legacy dispatch fields are not Runtime scheduler input.
+Pilot authorizes exact role grants. Planner may write only bounded plan and
+decision-memory artifacts. Implementer may write only its authorized project
+seam. Archivist may write only bounded archive, documentation, and
+project-memory artifacts. Reviewer, Adversary, and PM/Dispatcher are
+non-writing.
 
-## Local task intake and scheduler authority
+For every authorized writer, the host broker observes the exact filesystem
+delta, validates every changed path against that role's Pilot grant, rejects
+unauthorized changes, stages the accepted delta, and creates the commit.
+Pilot records the execution evidence, grant, changed paths, commit, and HEAD
+facts. No role stages, commits, writes .git, or expands its own grant. Writer
+grants are separate; there is no shared broad writable root.
 
-The trusted operator CLI creates local tasks in the host-wide
-`control.sqlite3`. It accepts only a registered project slug, title, and
-objective. Pilot reads the registered repository's default ref and exact
-authoritative commit from the official GitHub API; malformed or unavailable
-facts fail closed. Git transport is used only to materialize bytes. The
-database transaction derives the UUID, next unique `T-000001`
-identifier, and `codex/t-000001-<12-hex-character-UUID-prefix>` branch.
+Publication is a separate Pilot-authorized host operation. Final merge remains
+human-only.
 
-Creation produces `PREPARED`. A separate `task.py queue` command performs the
-accepted compare-and-set transition `PREPARED -> QUEUED`, creates the first
-host-generated workpad, and appends the `queued` event in the same transaction.
-Runtime reads SQLite in read-only mode, scoped to the rendered project slug;
-its adapter routing gate is no open blocker, while the configured
-`active_states` set is the scheduler gate. No GitHub issue, issue number,
-dispatch label, or `GH-N` identity is required or accepted in this causal
-chain.
+## Current evidence
 
-The workspace sequence is:
+The supervised-local substrate is proven: local task intake, Pilot SQLite,
+Runtime integration, App Server startup, reconciliation, and read-only UI
+observation were exercised under explicit operator supervision. The canonical
+fresh-specialist lifecycle, unattended credential isolation, publication, and
+merge are not thereby live-proven. See the parent harness current-state record.
 
-```text
-PREPARED
-   ↓ explicit host queue
-QUEUED
-   ↓ Runtime SQLite scheduler
-T-000001 workspace
-```
-
-## Protection and publication
-
-The supported GitHub protection contract is one active repository ruleset
-targeting `~DEFAULT_BRANCH` (or the exact default ref), containing one
-`pull_request` rule and an empty `bypass_actors` list. Classic branch-protection
-normalization and invented human-actor fields are not supported.
-
-Publication uses the deterministic host secret
-`~/.config/symphony-pilot/secrets/<slug>/publication-ssh-key`, mode 0600. It is
-separate from the Issues/PR tracker token, human account, and task domain.
-
-Step 6 deploys the strict local lifecycle result broker. A bounded
-`before_run` allocates one host Architect attempt and run namespace; the
-rendered `after_run` independently verifies Git truth and atomically
-reconciles accepted results into SQLite. Since Frozen Runtime treats
-`after_run` failures as best-effort, exit 78 is not an activation barrier; the
-SQLite blocker side effect is the routing barrier.
-
-Step 7 publication is a separate trusted operator operation:
-
-```text
-SQLite FINAL_MECHANICAL_ACCEPTANCE
-      |
-      v
-Pilot exact-head publication broker
-      |-- retained trusted workspace evidence
-      |-- host-generated bundle and sterile Git
-      |-- exact deploy-key proof
-      |-- fresh ruleset Snapshot A/B
-      |-- exact task branch and draft PR
-      v
-SQLite atomic finalization -> READY_FOR_HUMAN_MERGE -> HUMAN ONLY
-```
-
-The model cannot request publication and GitHub cannot create lifecycle
-authority. Publication failures preserve branch/PR evidence and create an
-infrastructure blocker. Step 7 does not merge, approve, un-draft, or enable
-auto-merge. Ruleset state can change after READY, so a human must recheck
-protection and the exact PR head before merging.
-
-## Execution truth states
-
-| Boundary | State | Evidence |
-|---|---|---|
-| Linux user/mount/PID/network namespace primitive | PROVEN | real WSL `unshare` probe |
-| Synthetic task filesystem constructor | PROVEN | hostile fixture; no broad `/etc` mount |
-| Supervisor child teardown and CPU bound | PROVEN BY FIXTURE | shared `--kill-child=SIGKILL` runner |
-| Aggregate persistent-workspace disk quota | IMPLEMENTED / TARGETED-VERIFIED / REQUIRES STEP-8 REVIEW | shared-pool pre-helper reservation, source-controlled narrow privileged helper, task-usable capacity, and kernel-proof admission seams; dedicated domain provisioning remains required |
-| Local SQLite task intake / queue authority | LIVE / CANARY-PROVEN | trusted task CLI, transactionally allocated identity, PREPARED-to-QUEUED transition, and T-000001/T-000002 evidence |
-| Runtime SQLite scheduler contract | LIVE / CANARY-PROVEN | Runtime reads the current Pilot v2 database project-scoped and read-only |
-| Legacy GitHub admission / dispatch provenance | RETIRED / NOT MANAGED | historical parser/provenance source is outside the deployed Step-5 scheduler path |
-| SQLite lifecycle reconciliation | LIVE / CANARY-PROVEN | T-000001 recovery/Archivist evidence and T-000002 clean final-acceptance evidence |
-| Host publication transfer | TARGETED / FIXTURE-VERIFIED | Step-7 exact-head host publication; no model or Runtime publication path |
-| Ruleset protection parser | PROVEN BY FIXTURES | real API-shaped fixtures |
-| Codex App Server activation | LIVE / SUPERVISED-LOCAL-PROVEN | explicit `SYMPHONY_SUPERVISED_LOCAL=1` launches the installed App Server using operator authentication |
-| Unattended Codex credential isolation | OPEN / UNATTENDED-ONLY | supervised operation does not prove hostile-child credential isolation |
-| Live Codex task containment | SUPERVISED-LOCAL-PROVEN; UNATTENDED HARDENING OPEN | canary executed under the supervised local contract; stronger unattended containment remains separate |
-| Tier-C target twin / live cutover | RETIRED | target-twin workflow, probe, and contract residue are retired; storage and containment primitives remain |
-
-## Containment
-
-The selected backend is rootless Linux/WSL `unshare`. The constructor creates a
-fresh tmpfs root, mounts only the current workspace, task home, read-only
-admission inbox, writable fixed outbox, bounded tmpfs, minimal devices, and
-read-only runtime libraries, then mounts a task PID namespace and restricted
-network namespace. It does not mount host `/etc`; the current explicit
-allowlist is empty. The shared runner uses util-linux `--kill-child=SIGKILL`,
-reaps the supervisor after timeout, and the fixture verifies a child and
-grandchild stop modifying a task sentinel. CPU time, process count, address
-space, open files, individual file size, task tmpfs, and wall clock are
-bounded. The managed queue now reserves full task capacity against one shared
-pool and rejects admission unless task-specific kernel byte/inode proof is
-supplied. The canary policy distinguishes nominal 64-GiB backing from a
-63-GiB allocatable filesystem ceiling. The fixed adapter's task admission
-operation requires a root-owned, capability-specific quota helper to bind the
-host-derived task project and prove byte/inode `EDQUOT` behavior.
-Reservations cannot be released without trusted proof that the
-exact workspace and quota can no longer grow. The current root filesystem is
-rejected for the unattended quota contract, so unattended activation remains a separate hardening target pending dedicated-domain
-and helper provisioning. The constructor is
-exercised independently of Codex; the auth blocker still stops the real
-launcher before App Server start. The supervised-local launcher is intentionally
-explicit and uses the operator's existing Codex authentication; it does not
-claim production credential isolation.

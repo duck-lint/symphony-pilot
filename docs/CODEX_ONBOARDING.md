@@ -1,34 +1,25 @@
 # Codex onboarding
 
-## Current supervised-local path
+Runtime/App Server execution is an implementation boundary owned by Runtime.
+Pilot supplies the task-scoped execution projection and the exact role grant;
+it does not perform specialist reasoning or launch a role as a semantic actor.
 
-The supported local-development launch is explicit:
+The supervised-local path uses explicit operator opt-in:
 
-```sh
-SYMPHONY_SUPERVISED_LOCAL=1 \
-SYMPHONY_BIN=/absolute/path/to/symphony-runtime/elixir/bin/symphony \
-python3 scripts/project.py --project <slug> start
-```
+    SYMPHONY_SUPERVISED_LOCAL=1
 
-This launches the normal installed `codex app-server` using the operator's
-existing authenticated Codex environment. The six role TOMLs remain
-project-independent and are made available through the task-local policy
-pack. Supervised local use is not claimed safe for unattended hostile
-execution.
+The operator's authenticated Codex environment in this mode is evidence of
+supervised local operation only. It is not proof of unattended credential
+isolation.
 
-The launcher creates a fresh task-local `CODEX_HOME` containing only the six
-pilot role policies and generated task configuration. It never copies or
-symlinks the operator home and never passes tracker or publication credentials
-to tools. Role TOML files are an allowlist; their presence does not prove
-native role dispatch or read-only enforcement.
+Role policy files describe bounded behavior and are not execution evidence or
+capability authority. Fresh specialist execution must be established by
+retained host evidence. The PM/Dispatcher is task-scoped and persistent in the
+canonical model; the harness does not prescribe one immortal process, App
+Server session, or thread.
 
-The launcher still retains the reviewed namespace and resource checks where
-they apply, but supervised-local mode deliberately permits the operator's
-authenticated App Server environment. This proves live App Server startup and
-agent orchestration, not unattended credential isolation or aggregate quota
-enforcement.
+Pilot authorizes separate grants for Planner, Implementer, and Archivist.
+Reviewer, Adversary, and PM/Dispatcher remain non-writing. Host Git brokerage
+handles every authorized writer delta; no role stages, commits, writes .git,
+or changes its grant.
 
-Do not describe supervised-local authentication as a production credential
-boundary. Do not claim the operator's Codex credential is isolated from
-hostile children. The fixed Git identity supplied to supervised agents is
-`Symphony Agent <symphony@localhost>` and does not mutate global Git config.

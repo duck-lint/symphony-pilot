@@ -1,41 +1,21 @@
 # Human onboarding
 
-## Current supervised-local onboarding
+The parent harness defines the SYMPHONY lifecycle and role authority. Human
+onboarding supplies a registered project and trusted local task input; it does
+not add a project-specific Pilot or Runtime branch.
 
-The MVP is proven for an operator-supervised local project. The ordinary path
-uses the trusted CLI for task mutation, Pilot SQLite for lifecycle authority,
-the read-only loopback UI for inspection, and the installed Codex App Server
-after explicit `SYMPHONY_SUPERVISED_LOCAL=1` opt-in.
+Register a project through the trusted local control plane with its
+project-owned harness, repository authority, validation inputs, and required
+host-side settings. Keep credentials host-confined. The target repository
+remains authoritative for project meaning and validation.
 
-Create one non-secret `projects/<slug>/profile.toml` with repository, clone
-remote, and model/resource settings. Legacy dispatch labels,
-`trusted_dispatchers`, and blocked label fields may remain for deferred
-publication/lifecycle seams; they are not scheduler authority. Validate the
-complete registry before selecting a project.
+Pilot owns local task identity, lifecycle state, eligibility, grants,
+reconciliation, and publication brokerage. Runtime is the executor. The local
+UI is read-only. GitHub or another repository service is not local lifecycle
+authority.
 
-Provision two separate host secrets under WSL/Linux:
+The supervised-local substrate is proven under explicit operator supervision.
+The frozen fresh-specialist lifecycle and unattended hardening remain separate
+acceptance claims. Do not claim them from policy files, task rows, packets, or
+dashboard presentation.
 
-```text
-~/.config/symphony-pilot/secrets/<slug>/github.token (host-side only)
-~/.config/symphony-pilot/secrets/<slug>/publication-ssh-key
-```
-
-The GitHub token is a host-owned credential for authenticated official-API
-reads and publication. For a configured public repository, task creation may
-resolve repository identity/default branch/exact SHA without this token; the
-host first proves the repository is public. A malformed configured credential
-still fails closed. The publication key is a repository-scoped write deploy
-key used only for derived branch pushes. Do not reuse a personal key or SSH
-agent, and never print either secret.
-
-Configure one active GitHub repository ruleset targeting the default branch.
-It must contain a pull-request rule and no bypass actors. Do not configure
-this automatically from the pilot. Keep the human GitHub account as the merge
-authority; the pilot has no merge API.
-
-Build the owned `symphony-runtime` repository and run runtime pinning,
-deployment, profile validation, the hostile fixture, and the full test suite
-as appropriate for the operating mode. The supervised-local canary is
-already proven. Aggregate quota/EDQUOT enforcement and unattended credential
-isolation remain hardening requirements for unattended activation, not
-blockers to the supervised MVP.

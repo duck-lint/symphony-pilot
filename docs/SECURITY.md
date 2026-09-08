@@ -1,107 +1,35 @@
-# Security contract
+# Pilot security boundary
 
-## Operating-mode boundary
+The parent harness is authoritative for security and authority semantics.
+Pilot is the trusted local control plane; Runtime and roles are not
+independent authorities.
 
-The supervised-local MVP is proven, but it is explicitly operator-supervised.
-`SYMPHONY_SUPERVISED_LOCAL=1` permits the normal installed Codex App Server to
-use the operator's existing authenticated Codex environment. This does not
-prove unattended credential isolation. Findings below that remain open are
-unattended-hardening or publication findings, not evidence that supervised
-SYMPHONY cannot run.
+Host-trusted facts include registered project identity, authoritative
+repository observations, Pilot SQLite state, process identity, workspace Git
+facts, retained execution evidence, and host-owned publication credentials.
+Model output, role packets, task files, task-controlled Git metadata, Runtime
+observations, and UI input are untrusted until validated at the appropriate
+host boundary.
 
-The model, task processes, issue/workpad payload, task filesystem, task Git
-metadata, task result, and publication bundle are hostile inputs.
+Pilot authorizes role capability grants. Runtime may instantiate and enforce
+only the exact grant Pilot issued. Planner, Implementer, and Archivist have
+separate bounded writable domains; Reviewer, Adversary, and PM/Dispatcher have
+no project or harness-artifact write authority. No role may write .git,
+stage, commit, or broaden its own grant.
 
-Trusted host state consists of the canonical registry, host-derived Git facts,
-SQLite task rows, dedicated publication deploy key, runtime locks, process
-state, and host audit state. Any retained publication credential is read only
-by its host operation. Secrets are never stored in Git, profiles, workpads,
-task homes, logs, or result payloads.
+For every writer, the host observes the exact filesystem delta and validates
+every changed path against the corresponding Pilot grant before staging or
+committing. A documentation grant cannot reach adjacent project content.
+Publication is a separate host-brokered operation, and final merge remains
+human-only.
 
-## Local dispatch trust
+The local UI projects trusted Pilot state and does not infer execution from
+role names, expected sequence, prose, packets, or dashboard presence. Runtime
+process/session state is evidence for reconciliation, not lifecycle authority.
 
-The trusted operator is the authority for local task creation and the explicit
-`PREPARED -> QUEUED` transition. SQLite CAS plus its atomic `queued` event
-prevents repeated or conflicting queue requests from silently overwriting
-state. Runtime receives no tracker credential and reads only the project-scoped
-SQLite projection.
+The supervised-local mode uses explicit operator authentication. That proves
+supervised local operation only; it does not prove unattended credential
+isolation, hostile-child isolation, or publication hardening. Containment,
+storage, executable pinning, and publication findings remain separately
+classified in SECURITY_FINDINGS.md.
 
-GitHub issue labels and event history are not scheduler trust inputs after Step
-5. Legacy issue code may remain as historical source, but it cannot create a
-local task, authorize a workspace, or replace the trusted Step-7 publication
-operation.
-
-## SQLite lifecycle trust
-
-Step 6 makes the host lifecycle broker the only writer of lifecycle state. A
-trusted `before_run` allocates one Architect attempt and one derived staging
-namespace; a trusted `after_run` verifies the workspace and applies one strict
-result atomically. The result is hostile input: it cannot choose a project,
-database, branch, base, role round, next state, publication destination, or
-credential. Specialized role rows record accepted result packets; they do not
-prove that a named custom agent was actually invoked.
-
-An invalid, stale, missing, dirty, or otherwise unsafe result leaves the prior
-milestone in place and records an infrastructure blocker when the database is
-available. Runtime `after_run` exit status is best-effort; the SQLite blocker
-is the routing barrier. Archivist is the Step-6 closeout role at
-`FINAL_MECHANICAL_ACCEPTANCE`. Step 7 owns publication and the exact-head
-READY transition. The existing credential
-isolation, aggregate-storage, Runtime pin-to-exec TOCTOU, and live WSL
-containment findings remain open unattended-activation or publication
-findings.
-
-## GitHub trust
-
-The profile secret reference is a host-only GitHub API credential. The
-publication deploy key is project-scoped, host-owned, mode 0600, agent-free,
-and used only by a sterile host repository. Its public key, repository, and
-GitHub deploy-key ID are bound in a restrictive host manifest and re-proven
-before every push. The task receives neither credential. The default branch
-must have one active repository ruleset requiring pull requests and no bypass
-actors. Human merge authority is the actual GitHub account operating the
-merge; it is not a field invented by the client parser.
-
-The host never uses task `origin`, `remote.*`, `core.hooksPath`,
-`credential.helper`, `include.path`, alternates, or SSH settings as publication
-authority. The retained workspace is checked through the shared trusted
-boundary. The host then generates a temporary bundle outside the task
-workspace, imports it into a fresh bare repository, verifies strict object
-integrity and ancestry, and pushes with an exact host SSH identity. The legacy
-model-produced outbox bundle is not consumed by Step 7.
-
-## Task domain
-
-The task-domain contract exposes only the current workspace, fresh task home,
-read-only admission inbox, writable fixed outbox, minimal read-only runtime
-files, task `/proc`, minimal devices, and bounded temporary storage. It does
-not expose host `/etc`; the explicit current `/etc` allowlist is empty.
-Operator homes, `.codex`, `.ssh`, host state/logs, deployments, sibling tasks,
-other projects, broad `/mnt/c`, agent sockets, and unrelated host processes are
-outside the domain. The synthetic hostile fixture has passed these denial
-checks, including network, symlink, proc, inherited-FD, and resource-limit
-attempts.
-
-The shared namespace runner applies a CPU-time limit and uses util-linux
-`--kill-child=SIGKILL`; timeout handling kills and reaps the namespace
-supervisor before reporting completion, and the fixture verifies that a
-grandchild can no longer modify a task-visible sentinel. Individual file size
-is bounded. Aggregate admission now uses one shared pool reservation ledger,
-separates nominal backing from the filesystem-usable admission ceiling, and
-keeps reservations active until trusted cleanup proof shows that a task quota
-cannot grow. The reservation is committed before the fixed privileged helper
-can mutate the task quota; uncertain helper outcomes retain that commitment.
-The fixed helper is a source-controlled setuid-root capability with exact
-opened-object identity pinning, not a general command broker. Pool admission
-uses unprivileged `f_bavail`/`f_favail`. The current root filesystem is rejected
-and no task is admitted until a dedicated kernel-enforced byte/inode domain and
-task-binding proof are available. The source digest is checked against the
-reviewed supervisor before compilation; the installed helper must be root-owned,
-owned by the fixed helper group, and exactly setuid-root mode 4750. Its task
-root enables project-ID inheritance so descendants remain inside the same
-kernel quota.
-
-This fixture proves the constructor, not unattended credential isolation. The
-supervised-local launcher is intentionally live and uses the operator's
-existing authenticated Codex environment; that choice is bounded to explicit
-human supervision and is not accepted as a hostile-child credential boundary.

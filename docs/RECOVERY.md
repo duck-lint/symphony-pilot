@@ -1,43 +1,36 @@
-# Recovery
+# Pilot recovery boundary
 
-## Current operating boundary
+The parent harness defines lifecycle meaning and termination classification.
+Recovery mechanics must preserve those distinctions.
 
-The supervised-local MVP is complete at `FINAL_MECHANICAL_ACCEPTANCE` and can
-be stopped normally with `scripts/project.py ... stop`. Recovery preserves the
-same SQLite task, workpad, role, finding, blocker, and event evidence; it does
-not create a second scheduler or silently resume a terminal task.
+A task is durable. A lifecycle is one bounded orchestration attempt on that
+task. Working rounds and planning attempts are nested within a lifecycle.
+A non-converged lifecycle termination is not acceptance, completion, a blocker,
+or an automatic new lifecycle. Human disposition is required before another
+lifecycle for the same task.
 
-Execution domains are disposable. The canonical registry, host SQLite task
-rows, local UUID/`T-N` identity, runtime locks, process identity, and host
-audit events are the durable machine authority. GitHub issues, workpad
-comments, and draft PRs are external evidence only, not task identity,
-scheduler input, or lifecycle authority.
+Pilot is the authority for recovery of lifecycle state, grants, retained
+execution evidence, blockers, termination facts, repository observations, and
+workspace observations. Runtime process/session state is observation supplied
+back to Pilot; it cannot terminalize or advance a lifecycle by itself.
 
-On restart, validate the exact task record and runtime identities. If the task record is missing or malformed, require clean re-admission. Never import branch, base, SHA, credential, or process state from arbitrary workpad prose or local .git metadata.
+On recovery, reconcile only after the managed Runtime identity and stop state
+are proven. Preserve the exact task and execution identities and retain
+incomplete, failed, or contradictory evidence. Never infer state from model
+prose, packets, external service records, browser state, task-controlled Git metadata,
+or a stale dashboard row.
 
-Step 6 recovery preserves the task row, current/versioned SQLite workpad,
-role-run history, findings, blockers, events, and any unique unpublished HEAD.
-If a host crash leaves one `ARCHITECT` role run in `started`, use the bounded
-`task.py fail-attempt` control. It marks that exact run failed and preserves an
-infrastructure blocker; it never creates a replacement attempt or advances
-state. Resolve blockers only through `task.py resolve-blocker` after
-inspection.
+Writer recovery uses the same broker contract as ordinary execution:
+observe the exact delta, validate it against the original role grant, reject
+unauthorized changes, then host-stage and host-commit only the accepted delta.
+Pilot records the result. Planner, Implementer, and Archivist grants remain
+distinct.
 
-Missing, malformed, stale, or identity-mismatched lifecycle results fail
-closed and produce an SQLite blocker when the database is available. Do not
-repair by deleting the result, role run, workpad history, or events.
-Archivist is a Step-6 role closeout recorded while the task remains at
-`FINAL_MECHANICAL_ACCEPTANCE`. The supervised-local MVP intentionally stops at
-that state; the separate Step-7 `task.py publish` operation is outside MVP
-acceptance. A durable `started` publication row records the
-exact task UUID, head, and branch before external mutation. Retries may adopt
-only the exact branch and one exact open draft PR; contradictions are blockers,
-not repair requests. Final SQLite publication and READY transition are one
-transaction. A failure after push or PR creation leaves that evidence intact.
+The parent harness does not prescribe crash/restart/session mechanics for the
+task-scoped PM/Dispatcher. Any implementation must preserve task-scoped
+continuity without requiring an immortal process, App Server session, or
+thread.
 
-Do not migrate old role homes, temporary homes, task caches, stale workspaces, generated deployments, or recovery archives. Preserve a unique unpublished source artifact only through an explicitly host-approved narrow recovery format; it must exclude .git, credentials, sockets, devices, absolute escape paths, and task homes.
-
-If local SQLite identity, containment, authentication, runtime identity,
-ruleset protection, publication identity, or broker state cannot be proven,
-stop and report the concrete blocker. Never recreate a task by marker, GitHub
-Issue, or local Git state.
+If identity, authority, containment, execution evidence, grant, workspace,
+or repository facts cannot be proven, stop and report the concrete blocker.
+Do not create compatibility fallbacks or revive obsolete scheduler state.

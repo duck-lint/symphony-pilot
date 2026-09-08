@@ -1,110 +1,45 @@
-# Operations
+# Pilot operations
 
-## Current operating claim
+The parent harness defines the lifecycle. This document records only current
+operating boundaries and evidence status.
 
-The supervised-local MVP is live. The operator explicitly enables it with
-`SYMPHONY_SUPERVISED_LOCAL=1`; task mutation remains trusted CLI plus SQLite,
-the Pilot UI is loopback HTTP and read-only, and Runtime reads SQLite
-project-scoped and read-only. Step-8 storage admission and unattended
-credential isolation are not required for this supervised path.
+The supervised-local substrate is proven with explicit operator opt-in:
+SYMPHONY_SUPERVISED_LOCAL=1. Task mutation is trusted host CLI plus Pilot
+SQLite. The local UI is read-only. Runtime reads a project-scoped Pilot
+projection and returns execution observations.
 
-All physical lifecycle operations run in the WSL/Linux operator environment. Native Windows validation must not fabricate a WSL home or touch Linux state.
+This evidence does not prove the canonical fresh-specialist lifecycle,
+unattended credential isolation, aggregate quota enforcement, publication, or
+human merge. Do not present those target behaviors as current operation.
 
-## Before start
+## Safe operating boundary
 
-1. Validate the complete project registry, including `trusted_dispatchers`.
-2. As publication onboarding, provision or explicitly adopt the host-side
-   Ed25519 publication key, then bind its public key to exactly one writable
-   GitHub deploy key:
-   `python3 scripts/provision_publication_key.py --project <slug>` followed by
-   `python3 scripts/task.py bind-publication-key --project <slug>`. The Runtime
-   scheduler does not receive a GitHub API credential.
-3. Deploy from a clean reviewed source checkout.
-4. Build the reviewed `symphony-runtime` repository, then pin and review the owned Symphony runtime, Codex, and unshare executable identities with `scripts/pin_runtime.py --project <slug>`.
-5. Configure one active GitHub repository ruleset targeting `~DEFAULT_BRANCH`, with a `pull_request` rule and no `bypass_actors`.
-6. Run the real WSL namespace constructor, supervisor-teardown/CPU probes, and hostile-fixture probes. Treat aggregate persistent-workspace disk growth as an unresolved resource boundary.
+- Use the registered project profile and trusted host controls.
+- Keep host credentials outside task workspaces, Runtime scheduler state, role
+  context, logs, and UI responses.
+- Treat model output, role packets, workspace bytes, Git metadata, and Runtime
+  observations as inputs to Pilot validation, not as authority.
+- Do not manually edit lifecycle state or infer execution from a role label.
+- Do not use external service state, browser state, or repository prose as local
+  scheduler authority.
+- Do not treat Runtime retries or process events as lifecycle transitions.
+- Publication is a separate Pilot-authorized host operation; merge is human-only.
 
-Task mutation is explicit and host-only:
+The host Git broker applies to every authorized writer role. Planner,
+Implementer, and Archivist each receive a separate bounded grant. The host
+observes the exact delta, validates every path against that grant, rejects
+unauthorized changes, stages the accepted delta, creates the commit, and
+records the resulting facts in Pilot. No role may write .git or perform Git
+staging/commit.
 
-    python3 scripts/task.py create --project <slug> --title "..." --objective "..."
-    python3 scripts/task.py queue --project <slug> --task T-000001
-    python3 scripts/task.py list --project <slug>
-    python3 scripts/task.py show --project <slug> --task T-000001
-    python3 scripts/task.py publish --project <slug> --task T-000001
+## Evidence categories
 
-Runtime `project start` verifies deployment coherence, the runtime lock, and
-containment capability before launching a process. It does not acquire a
-GitHub credential, verify publication keys or rulesets, query GitHub Issues,
-count dispatch labels, or inject a tracker credential into Runtime. Publication
-onboarding is operationally recommended but is not a Runtime-start prerequisite.
+Report these separately:
 
-The separate `task publish` operation requires the host GitHub API credential,
-the bound write-enabled deploy key, and fresh ruleset proof before it can
-publish an exact final-mechanical-acceptance head.
+- frozen benchmark: the parent harness target;
+- current implementation: the checked-out Pilot/Runtime behavior;
+- tested behavior: behavior established by tests or fixtures;
+- live-proven behavior: behavior established by supervised execution.
 
-## Step-6 lifecycle operations
-
-The managed lifecycle workflow renders `agent.max_turns: 1`: one Runtime
-dispatch is one bounded Architect attempt, followed by host reconciliation.
-The profile's historical `max_turns` value is not the lifecycle continuation
-mechanism. Inspect lifecycle state, workpad, role runs, findings, blockers, and
-events with `task show`; inspect only open blockers with `task blockers`.
-
-Malformed or missing results, stale attempts, dirty workspaces, and failed
-Git-truth checks are fail-closed. When SQLite is available, reconciliation
-finishes the Architect attempt and records an infrastructure blocker. Resolve
-one inspected blocker with the exact project-scoped `task resolve-blocker`
-command, then the retained active lifecycle state becomes routable naturally.
-Do not delete lifecycle evidence or repair a task by manually setting its
-state. Archivist closeout is recorded as role evidence. The supervised-local
-MVP stops cleanly at `FINAL_MECHANICAL_ACCEPTANCE`; the separate publication
-path may later move an accepted task to `READY_FOR_HUMAN_MERGE`.
-Publication derives repository, branch, base, HEAD,
-credentials, ruleset evidence, and PR identity from host state; it never
-consumes model publication prose. A failed publication preserves external
-recovery evidence and records an infrastructure blocker.
-
-## Ordinary controls
-
-    python3 scripts/validate_profile.py
-    python3 scripts/deploy.py --project <slug>
-    python3 scripts/project.py --project <slug> start
-    python3 scripts/project.py --project <slug> status
-    python3 scripts/project.py --project <slug> finish
-
-`python3 scripts/project.py --project <slug> stop` is the normal graceful stop
-after the task reaches a terminal state. `stop-now` is the bounded emergency
-process control for an active or wedged process; it does not infer task
-identity from issue prose and does not authorize publication.
-
-For the exact supervised-local sequence, use
-[OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
-
-## Destructive one-time cutover
-
-Do not run this from repository tests and do not perform it automatically.
-
-PRESERVE: the reviewed symphony-pilot source checkout, canonical
-projects/*/profile.toml files, host SQLite task rows, GitHub issues/PRs/workpads
-as historical or deferred publication records, and only an explicitly accepted
-unique unpublished source artifact.
-
-DELETE: after every old Symphony project process is stopped and unique work is
-accounted for, delete old task workspaces, task .git directories, role homes,
-role-home leases, generated deployments, project logs, stale state, recovery
-archives, caches, temporary homes, and continuation markers. Do not migrate
-these merely because they exist.
-
-ROTATE: project tracker credentials, publication credentials, and any dedicated
-Codex runtime credential that was readable under the previous same-user design.
-Never print or copy credential contents.
-
-REGENERATE: deployments, runtime locks, host task records, process state, logs,
-and fresh execution domains from the reviewed source and accepted registry.
-
-CONFIGURE REMOTELY: protect the default branch of every registered repository
-with one active repository ruleset whose `conditions.ref_name.include` targets
-`~DEFAULT_BRANCH`, whose `rules` contains `{"type":"pull_request"}`, and whose
-`bypass_actors` is empty. The publication deploy key may push only derived task
-branches; it has no Issues/PR API or merge authority. Configure these settings
-before canary admission and leave human merge as an explicit GitHub action.
+A successful supervised run does not promote current implementation into
+conformance with the frozen lifecycle.

@@ -1,71 +1,34 @@
-# Trusted local host API and browser UI
+# Pilot local API and UI
 
-## Current status
+The parent harness is authoritative for lifecycle and authority semantics. The
+local API/UI is a read-only projection of trusted Pilot state, not a second
+scheduler, lifecycle model, agent chat, or execution authority.
 
-The control UI is live at `http://127.0.0.1:8765` when started by the
-operator. It is a loopback HTTP, read-only SQLite evidence surface. The
-supervised-local MVP keeps task creation and queueing on the trusted CLI; it
-does not add browser mutation, sessions, HTTPS, or authentication in this
-pass. HTTPS and authenticated mutation remain future targets.
+Pilot owns the projected task, lifecycle, working-round, planning-attempt,
+eligibility, blocker, termination, grant, execution-evidence, repository, and
+workspace facts. Runtime observation is reported as observation; it does not
+become lifecycle meaning.
 
-Step 4 provides a dependency-free Python HTTP server and a static, read-only
-operator UI. Start it under the Linux/WSL operator environment with:
+The interface may expose, where available:
 
-```console
-python3 scripts/serve_control_ui.py
-```
+- expected role and dispatch eligibility;
+- actual retained execution identity and evidence;
+- role-authored result status;
+- grant and authorization status;
+- exact changed paths and resulting commit;
+- accepted HEAD and workspace HEAD;
+- clean/dirty workspace status; and
+- publication status.
 
-## Network and browser boundary
+Expected role, role name, PM prose, packet content, and UI state do not prove
+that an execution occurred. A role run is reportable only when Pilot has
+retained host evidence for that actual execution and has reconciled the
+corresponding packet.
 
-The server accepts only literal loopback binds (`127.0.0.1` by default; `::1`
-is also valid). Hostnames, wildcard addresses, and LAN addresses fail closed.
-Every HTTP request must also carry the canonical `Host` for the actual bound
-literal address and listening port (`127.0.0.1:<port>` or `[::1]:<port>`).
-This second check prevents a DNS-rebinding origin from addressing the local API
-as `attacker.example:<port>`, even after its DNS answer changes to loopback.
-`localhost`, aliases, malformed authorities, and wrong ports are not accepted.
+The existing loopback surface is read-only and operator-supervised. Browser
+input does not select repositories, roots, database paths, refs, processes,
+credentials, commands, files, Git operations, or network destinations. Queue
+and lifecycle mutation remain trusted host operations. The current supervised
+substrate is evidence of operation, not proof that the frozen fresh-specialist
+lifecycle is live.
 
-There is no CORS response. A strict CSP prevents framing and limits resources
-to the same origin. Step 4 has no mutation route, session, or CSRF mechanism;
-those controls belong with a future licensed mutation rather than dead code.
-
-## Authority and routes
-
-Registry profiles and the single host-owned `ControlPlaneDatabase` remain the
-authority. URL slugs and task UUIDs are selectors only. The server resolves a
-slug through the complete validated registry, then proves the selected task
-belongs to that project. Browser input cannot select roots, database paths,
-repositories, refs, heads, executable paths, process identities, credentials,
-SQL, commands, files, Git, GitHub calls, or network destinations.
-
-The entire Step-4 HTTP surface is read-only:
-
-* `GET /api/v1/projects`
-* `GET /api/v1/projects/{slug}/tasks`
-* `GET /api/v1/projects/{slug}/tasks/{uuid}`
-
-The API opens SQLite with `mode=ro`. A read never creates a database, migrates
-schema, changes permissions or journal mode, or repairs incompatible state.
-The existing schema version, migration identity, physical schema, integrity,
-and foreign keys must validate. SQLite itself rejects writes through the read
-connection. Read handles participate in the database's open-handle accounting,
-so offline restore semantics remain coherent.
-
-The routes expose registered project summaries; tasks; workpads; role runs;
-findings; blockers; publications; events; and bounded deployment, runtime-lock,
-and managed-process identity summaries. A structurally valid Runtime lock is
-reported as an accepted identity **record** (`state: recorded`, `lock_valid:
-true`, `live_verification: not_performed`). GET neither hashes nor executes the
-recorded executable, so the response makes no claim about its current bytes.
-
-Credential-shaped text is redacted even if mistakenly stored in an
-operator-visible field. This and the strict outbox are defense in depth, not
-credential DLP. Structural credential isolation remains required before
-unattended activation. Secrets, environments, raw files, and credential
-references are never returned.
-
-This UI is not an agent chat or a second state model. It provides no queue or
-dispatch mutation, manual Codex launch, publication, merge, or arbitrary
-repository control. Queue mutation remains on the trusted host CLI; the
-browser stays read-only. Runtime scheduler authority is host SQLite and the
-local `T-N` identity.
