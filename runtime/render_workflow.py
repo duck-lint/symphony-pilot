@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import shlex
 import sys
@@ -31,17 +32,12 @@ def render(profile: Profile, install_root: pathlib.Path) -> str:
         f"  database_path: {shell(control_database_path(profile))}",
         f"  project_slug: {profile.slug}",
         "  execution_projection: read-only",
+        "  reconcile_command: " + json.dumps(["python3", str(runtime / "reconcile.py"), "--profile", str(profile_path)]),
         "polling:", f"  interval_ms: {profile.poll_interval_ms}",
         f"  max_retry_backoff_ms: {profile.max_retry_backoff_ms}",
         "workspace:", f"  root: {profile.workspace_root}",
-        "hooks:", "  after_create: |",
-        f"    git clone --no-single-branch {shell(profile.git_remote)} .",
-        "  before_run: |", "    set -eu",
-        f"    exec python3 {shell(runtime / 'before_run.py')} --profile {shell(profile_path)} --workspace \"$PWD\"",
-        "  after_run: |", "    set -eu",
-        f"    exec python3 {shell(runtime / 'after_run.py')} --profile {shell(profile_path)} --workspace \"$PWD\"",
-        "  before_remove: |",
-        f"    python3 {shell(runtime / 'before_remove.py')} --profile {shell(profile_path)} --workspace \"$PWD\" || true",
+        "  materialize_command: " + json.dumps(["git", "clone", "--no-single-branch", profile.git_remote, "."]),
+        "  repository_remote: " + json.dumps(profile.git_remote),
         "agent:", f"  max_concurrent_agents: {profile.max_concurrent_agents}",
         "codex:", f"  command: {shell(runtime / 'launch_codex.sh')}",
         "  approval_policy: never", "---", "",

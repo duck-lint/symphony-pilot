@@ -169,8 +169,6 @@ def queue(args: argparse.Namespace) -> int:
         if task["state"] != "PREPARED":
             raise StateConflict("only PREPARED tasks may be queued")
         try:
-            # Runtime owns workspace creation so its after_create hook can
-            # materialize the registered repository before before_run.
             task = database.queue_task(task["id"], project_slug=profile.slug)
         except StateConflict as exc:
             database.record_blocker(
@@ -178,6 +176,12 @@ def queue(args: argparse.Namespace) -> int:
                 body=f"local queue failed: {type(exc).__name__}: {exc}",
             )
             raise
+    # Queueing is the Pilot lifecycle trigger. Runtime only consumes the
+    # resulting authorized dispatch; it never selects the initial role.
+    from lifecycle import issue_next_dispatch
+    issue_next_dispatch(profile, str(task["id"]))
+    with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
+        task = database.read_task(task["id"])
     _emit(task)
     return 0
 
@@ -245,9 +249,13 @@ def dispose(args: argparse.Namespace) -> int:
         ).fetchone()
         if lifecycle is None or lifecycle["task_id"] != task["id"]:
             raise TaskCommandError("lifecycle is not owned by the selected task")
-        _emit(database.record_human_disposition(
+        disposition = database.record_human_disposition(
             args.lifecycle, decision=args.decision, detail=args.detail,
-        ))
+        )
+    if args.decision == "START_ANOTHER_LIFECYCLE":
+        from lifecycle import issue_next_dispatch
+        issue_next_dispatch(profile, str(task["id"]))
+    _emit(disposition)
     return 0
 
 

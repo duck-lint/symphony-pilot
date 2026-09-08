@@ -10,10 +10,11 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "runtime"))
 
 from control_db import ControlPlaneDatabase, StateConflict
-from lifecycle import (AllocationConflict, LifecycleError, _licensed_run,
+from lifecycle import (AllocationConflict, LifecycleError, _handoff_inputs, _licensed_run,
                        _next_role, _record_lifecycle_outcome, _writer_scopes,
                        _working_tree_paths, broker_writer_delta,
-                       perform_mechanical_validation, reconcile_orphaned_executions)
+                       issue_next_dispatch, perform_mechanical_validation,
+                       reconcile_orphaned_executions)
 from prepare_workspace import load_profile
 from unittest.mock import patch
 
@@ -60,6 +61,7 @@ class HarnessCutoverTests(unittest.TestCase):
             "dispatch_id": grant["dispatch"]["id"], "observed_role": role, "status": "finished",
             "started_at": TIME, "finished_at": "2026-09-08T00:01:00+00:00", "head_sha": SHA,
             "starting_head": SHA, "changed_paths": [], "dirty": False,
+            "runtime_process_id": "pilot-test-process", "app_server_thread_id": "pilot-test-thread",
             "result": {"outcome": "accepted", "summary": "observed"},
         }
         value.update(extra)
@@ -69,6 +71,50 @@ class HarnessCutoverTests(unittest.TestCase):
         names = {row["name"] for row in self.database.connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertTrue({"lifecycles", "working_rounds", "planning_attempts", "role_dispatches", "capability_grants", "execution_evidence", "writer_deltas", "human_dispositions"} <= names)
         self.assertNotIn("ARCHITECT", self.database.connection.execute("SELECT sql FROM sqlite_master WHERE sql LIKE '%ARCHITECT%'").fetchall())
+
+    def test_queued_task_can_issue_initial_pm_without_workspace(self):
+        profile = type("Profile", (), {
+            "slug": "demo", "state_root": pathlib.Path(self.temp.name) / "state",
+            "harness_artifacts": type("Artifacts", (), {
+                "planner": ("harness/project-spec",),
+                "archivist": ("harness/implementations",),
+                "implementation_roots": ("src",),
+            })(),
+        })()
+        fresh_task = self.database.create_task(
+            project_slug="demo", title="Fresh task", objective="Objective", base_ref="main", base_sha=SHA,
+            current_head=SHA, created_at=TIME,
+        )
+        self.database.queue_task(fresh_task["id"], project_slug="demo")
+        database_path = self.database.path
+        self.database.close()
+        with patch("lifecycle.control_database_path", return_value=database_path):
+            dispatch = issue_next_dispatch(profile, fresh_task["id"])
+        self.database = ControlPlaneDatabase.open(database_path)
+        self.assertEqual(dispatch["role"], "PROJECT-MANAGER")
+        self.assertEqual(dispatch["task_id"], fresh_task["id"])
+        self.assertIsNone(dispatch["working_round_id"])
+        self.assertEqual(dispatch["handoff_inputs"], [])
+
+    def test_failed_execution_without_result_packet_is_retained(self):
+        grant = self.dispatch("REVIEWER")
+        launch = self.evidence(grant, "REVIEWER", status="running", phase="started")
+        launch.pop("finished_at")
+        run = self.database.record_execution_started(grant["dispatch"]["id"], launch)
+        terminal = self.evidence(grant, "REVIEWER", status="failed", phase="terminated")
+        terminal.pop("result")
+        retained = self.database.record_execution_termination(grant["dispatch"]["id"], terminal)
+        self.assertEqual(retained["id"], run["id"])
+        self.assertEqual(retained["status"], "failed")
+        self.assertIsNone(self.database.read_projection(self.task["id"])["active_execution"])
+
+    def test_pilot_dispatch_carries_bounded_accepted_pm_handoff(self):
+        pm = self.dispatch("PROJECT-MANAGER")
+        self._finish_execution(pm, "PROJECT-MANAGER", outcome="accepted", runtime_id="pm-handoff")
+        handoffs = _handoff_inputs(self.database, self.task, self.lifecycle, None, "PLANNER")
+        self.assertEqual(handoffs[0]["kind"], "PM_HANDOFF")
+        self.assertEqual(handoffs[0]["source_role"], "PROJECT-MANAGER")
+        self.assertEqual(handoffs[0]["input"]["outcome"], "accepted")
 
     def test_role_run_requires_retained_bound_execution_evidence(self):
         grant = self.dispatch("REVIEWER")
@@ -366,13 +412,22 @@ class HarnessCutoverTests(unittest.TestCase):
             "PROJECT-MANAGER", {"outcome": "converged"}, SHA,
         )
         facts = type("Facts", (), {"task_uuid": self.task["id"]})()
+        profile = type("Profile", (), {
+            "slug": "demo", "state_root": pathlib.Path(self.temp.name) / "state",
+            "harness_artifacts": type("Artifacts", (), {
+                "planner": ("harness/project-spec",),
+                "archivist": ("harness/implementations",),
+                "implementation_roots": ("src",),
+            })(),
+        })()
         with patch("lifecycle.local_task_facts", return_value=(facts, {})), \
              patch("lifecycle.control_database_path", return_value=self.database.path), \
              patch("lifecycle._git", return_value=SHA), \
              patch("lifecycle._working_tree_paths", return_value=[]), \
              patch("lifecycle.verify_git_truth", return_value=SHA):
-            result = perform_mechanical_validation(object(), pathlib.Path("unused"), lifecycle_id=self.lifecycle["id"])
+            result = perform_mechanical_validation(profile, pathlib.Path("unused"), lifecycle_id=self.lifecycle["id"])
         self.assertTrue(result["passed"])
+        self.assertEqual(result["next_dispatch"]["role"], "ARCHIVIST")
         self.assertTrue(all(result["evidence"]["checks"].values()))
         lifecycle = self.database.connection.execute(
             "SELECT mechanical_validation_status, mechanical_acceptance FROM lifecycles WHERE id = ?",

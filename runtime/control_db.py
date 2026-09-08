@@ -1794,6 +1794,11 @@ class ControlPlaneDatabase:
         dispatch_id, grant_id = str(uuid.uuid4()), str(uuid.uuid4())
         with self._transaction():
             self.read_task(task_id)
+            if self.connection.execute(
+                "SELECT 1 FROM role_dispatches WHERE task_id = ? AND status IN ('AUTHORIZED', 'RUNNING') LIMIT 1",
+                (task_id,),
+            ).fetchone():
+                raise StateConflict("task already has an authorized or running dispatch")
             self.connection.execute("INSERT INTO role_dispatches(id, task_id, lifecycle_id, working_round_id, planning_attempt_id, role, status, expected_starting_head, created_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, 'AUTHORIZED', ?, ?, NULL)", (dispatch_id, task_id, lifecycle_id, working_round_id, planning_attempt_id, role, expected_starting_head, timestamp))
             self.connection.execute("INSERT INTO capability_grants(id, task_id, dispatch_id, role, read_scopes_json, write_scopes_json, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (grant_id, task_id, dispatch_id, role, _payload(list(read_scopes)), _payload(list(write_scopes)), timestamp))
             self._insert_event(task_id, "dispatch_authorized", {"dispatch_id": dispatch_id, "grant_id": grant_id, "role": role}, occurred_at=timestamp)
@@ -1809,7 +1814,9 @@ class ControlPlaneDatabase:
         """Materialize an active role run only from retained launch evidence."""
         dispatch_id = _uuid(dispatch_id, "dispatch_id")
         role_run_id = _uuid(role_run_id, "role_run_id")
-        if not isinstance(evidence, dict) or evidence.get("status") != "running" or not evidence.get("runtime_execution_id"):
+        if (not isinstance(evidence, dict) or evidence.get("status") != "running" or
+                not evidence.get("runtime_execution_id") or
+                not evidence.get("runtime_process_id") or not evidence.get("app_server_thread_id")):
             raise StateConflict("retained running launch evidence is required")
         started = _timestamp(str(evidence.get("started_at")), "started_at")
         evidence_id = str(uuid.uuid4())
@@ -1848,7 +1855,7 @@ class ControlPlaneDatabase:
     ) -> dict[str, object]:
         """Complete the same role run that Pilot previously observed starting."""
         dispatch_id = _uuid(dispatch_id, "dispatch_id")
-        if not isinstance(evidence, dict) or evidence.get("status") not in {"finished", "failed", "blocked"}:
+        if not isinstance(evidence, dict) or evidence.get("status") not in {"finished", "failed", "blocked", "cancelled"}:
             raise StateConflict("retained terminal execution evidence is required")
         finished = _timestamp(str(evidence.get("finished_at")), "finished_at")
         with self._transaction():
@@ -1863,6 +1870,8 @@ class ControlPlaneDatabase:
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise StateConflict("retained launch evidence is malformed") from exc
             if (evidence.get("runtime_execution_id") != retained["runtime_execution_id"] or
+                    evidence.get("runtime_process_id") != launch_evidence.get("runtime_process_id") or
+                    evidence.get("app_server_thread_id") != launch_evidence.get("app_server_thread_id") or
                     evidence.get("task_id") != dispatch["task_id"] or
                     evidence.get("dispatch_id") != dispatch_id or
                     evidence.get("observed_role") != dispatch["role"] or
