@@ -251,6 +251,25 @@ def dispose(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_mechanical(args: argparse.Namespace) -> int:
+    """Compute final mechanical acceptance from Pilot and host observations."""
+    from lifecycle import perform_mechanical_validation
+
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+        lifecycle = database.connection.execute(
+            "SELECT task_id FROM lifecycles WHERE id = ?", (args.lifecycle,)
+        ).fetchone()
+        if lifecycle is None or lifecycle["task_id"] != task["id"]:
+            raise TaskCommandError("lifecycle is not owned by the selected task")
+    _emit(perform_mechanical_validation(
+        profile, pathlib.Path(args.workspace).resolve(), lifecycle_id=args.lifecycle,
+    ))
+    return 0
+
+
 def bind_publication_key(args: argparse.Namespace) -> int:
     """Bind one already registered writable deploy key to the local key."""
     from publication_key import bind_server_key
@@ -326,6 +345,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     dispose_parser.add_argument("--detail", required=True)
     dispose_parser.set_defaults(handler=dispose)
+
+    mechanical_parser = subparsers.add_parser(
+        "validate-mechanical", help="compute Pilot mechanical acceptance from host facts"
+    )
+    mechanical_parser.add_argument("--project", required=True)
+    mechanical_parser.add_argument("--task", required=True)
+    mechanical_parser.add_argument("--lifecycle", required=True)
+    mechanical_parser.add_argument("--workspace", required=True)
+    mechanical_parser.set_defaults(handler=validate_mechanical)
 
     bind_parser = subparsers.add_parser("bind-publication-key", help="bind the registered GitHub deploy key")
     bind_parser.add_argument("--project", required=True)

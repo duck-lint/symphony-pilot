@@ -130,22 +130,27 @@ def _git(workspace: pathlib.Path, *args: str) -> str:
 
 def _working_tree_paths(workspace: pathlib.Path) -> list[str]:
     """Return the exact host-observed changed paths, including untracked files."""
-    result = run_git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+    result = run_git(workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if result.returncode:
         detail = (result.stderr or result.stdout).strip().replace("\n", " ")
         raise LifecycleError(f"Git status verification failed: {detail[:240]}")
-    # Preserve the porcelain status columns' leading spaces; ``str.strip``
-    # would shift the path one character to the right.
-    status = result.stdout.rstrip("\r\n")
+    records = result.stdout.split("\x00")
     paths: list[str] = []
-    for line in status.splitlines():
-        if len(line) < 4:
+    index = 0
+    while index < len(records) - 1:
+        record = records[index]
+        if len(record) < 4:
             raise LifecycleError("Git status output is malformed")
-        path = line[3:]
-        if " -> " in path:
-            paths.extend(path.split(" -> ", 1))
+        paths.append(record[3:])
+        # With -z, rename/copy records carry source and destination as two
+        # consecutive NUL-delimited pathnames. Both are authority-relevant.
+        if record[0] in {"R", "C"} or record[1] in {"R", "C"}:
+            if index + 1 >= len(records) - 1 or not records[index + 1]:
+                raise LifecycleError("Git rename/copy status is incomplete")
+            paths.append(records[index + 1])
+            index += 2
         else:
-            paths.append(path)
+            index += 1
     return sorted(set(paths))
 
 
@@ -214,6 +219,146 @@ def verify_git_truth(profile: Profile, workspace: pathlib.Path, task: dict[str, 
     return head
 
 
+def perform_mechanical_validation(
+    profile: Profile,
+    workspace: pathlib.Path,
+    *,
+    lifecycle_id: str | None = None,
+) -> dict[str, object]:
+    """Compute Pilot mechanical acceptance from retained state and host facts.
+
+    This operation does not run project tests or interpret role prose. The
+    lower-level database method is intentionally private so callers cannot
+    promote an arbitrary ``passed=True`` value into final acceptance.
+    """
+    facts, _ = local_task_facts(profile, workspace)
+    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
+        task = database.read_task(facts.task_uuid)
+        lifecycle = database.connection.execute(
+            "SELECT * FROM lifecycles WHERE id = ?" if lifecycle_id else
+            "SELECT * FROM lifecycles WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1",
+            (lifecycle_id,) if lifecycle_id else (task["id"],),
+        ).fetchone()
+        if lifecycle is None or lifecycle["task_id"] != task["id"]:
+            raise LifecycleError("mechanical validation lifecycle is not owned by the task")
+        lifecycle = dict(lifecycle)
+        if lifecycle["convergence_status"] != "RECORDED":
+            raise LifecycleError("mechanical validation requires recorded PM convergence")
+
+        workspace_head: str | None = None
+        try:
+            workspace_head = _git(workspace, "rev-parse", "HEAD")
+        except LifecycleError:
+            pass
+        try:
+            changed_paths = _working_tree_paths(workspace)
+            clean_worktree = not changed_paths
+        except LifecycleError:
+            changed_paths = []
+            clean_worktree = False
+        try:
+            repository_head = verify_git_truth(profile, workspace, task)
+            repository_authority = repository_head == workspace_head
+        except LifecycleError:
+            repository_head = None
+            repository_authority = False
+
+        active_dispatches = database.connection.execute(
+            "SELECT id, status, role FROM role_dispatches "
+            "WHERE lifecycle_id = ? AND status IN ('AUTHORIZED', 'RUNNING')",
+            (lifecycle["id"],),
+        ).fetchall()
+        active_runs = database.connection.execute(
+            "SELECT id, role, status FROM role_runs WHERE lifecycle_id = ? AND status = 'running'",
+            (lifecycle["id"],),
+        ).fetchall()
+        runs = [dict(row) for row in database.connection.execute(
+            "SELECT * FROM role_runs WHERE lifecycle_id = ? ORDER BY started_at, id",
+            (lifecycle["id"],),
+        ).fetchall()]
+        required_roles = {"PROJECT-MANAGER", "PLANNER", "REVIEWER", "IMPLEMENTER", "ADVERSARY"}
+        retained_roles: set[str] = set()
+        bound_execution = True
+        no_failed_execution = True
+        accepted_writer_deltas = True
+        run_facts: list[dict[str, object]] = []
+        for run in runs:
+            evidence = database.connection.execute(
+                "SELECT * FROM execution_evidence WHERE id = ? AND task_id = ?",
+                (run["execution_evidence_id"], task["id"]),
+            ).fetchone() if run.get("execution_evidence_id") else None
+            dispatch = database.connection.execute(
+                "SELECT * FROM role_dispatches WHERE id = ? AND task_id = ?",
+                (run["dispatch_id"], task["id"]),
+            ).fetchone() if run.get("dispatch_id") else None
+            bound = bool(
+                evidence and dispatch and evidence["role_run_id"] == run["id"] and
+                evidence["dispatch_id"] == run["dispatch_id"] and
+                evidence["observed_role"] == run["role"] and
+                dispatch["role"] == run["role"] and evidence["status"] == "finished"
+            )
+            bound_execution = bound_execution and bound
+            no_failed_execution = no_failed_execution and run["status"] == "finished" and bound
+            retained_roles.add(str(run["role"])) if bound else None
+            writer_delta = None
+            if run["role"] in WRITER_ROLES:
+                writer_delta = database.connection.execute(
+                    "SELECT * FROM writer_deltas WHERE role_run_id = ? "
+                    "AND authorization_status = 'ACCEPTED' ORDER BY observed_at DESC, id DESC LIMIT 1",
+                    (run["id"],),
+                ).fetchone()
+                accepted_writer_deltas = accepted_writer_deltas and writer_delta is not None
+            run_facts.append({
+                "role_run_id": run["id"], "role": run["role"],
+                "status": run["status"], "evidence_id": evidence["id"] if evidence else None,
+                "dispatch_id": dispatch["id"] if dispatch else None,
+                "writer_delta_id": writer_delta["id"] if writer_delta else None,
+                "bound": bound,
+            })
+        open_blockers = database.connection.execute(
+            "SELECT id FROM blockers WHERE task_id = ? AND status = 'open'", (task["id"],)
+        ).fetchall()
+        latest_round = database.connection.execute(
+            "SELECT * FROM working_rounds WHERE lifecycle_id = ? ORDER BY ordinal DESC LIMIT 1",
+            (lifecycle["id"],),
+        ).fetchone()
+        checks = {
+            "lifecycle_convergence_recorded": lifecycle["convergence_status"] == "RECORDED",
+            "exact_convergence_head": bool(
+                workspace_head and lifecycle["convergence_head"] == task["current_head"] == workspace_head
+            ),
+            "repository_authority": repository_authority,
+            "clean_worktree": clean_worktree,
+            "no_active_dispatch_or_execution": not active_dispatches and not active_runs,
+            "required_lifecycle_executions_retained": required_roles <= retained_roles,
+            "bound_execution_evidence": bound_execution,
+            "writer_deltas_accepted": accepted_writer_deltas,
+            "no_failed_execution": no_failed_execution,
+            "no_open_mechanical_blocker": not open_blockers,
+            "converged_working_round": bool(latest_round and latest_round["state"] == "CONVERGED"),
+        }
+        evidence = {
+            "operation": "pilot-mechanical-validation/v1",
+            "lifecycle_id": lifecycle["id"], "task_id": task["id"],
+            "checks": checks,
+            "observed": {
+                "workspace_head": workspace_head,
+                "repository_head": repository_head,
+                "changed_paths": changed_paths,
+                "active_dispatches": [dict(row) for row in active_dispatches],
+                "active_executions": [dict(row) for row in active_runs],
+                "runs": run_facts,
+                "open_blocker_ids": [row["id"] for row in open_blockers],
+            },
+        }
+        passed = all(checks.values())
+        stored = database._record_mechanical_validation(
+            lifecycle["id"], head_sha=str(lifecycle["convergence_head"]),
+            passed=passed, evidence=evidence,
+        )
+        return {"lifecycle": stored, "passed": passed, "evidence": evidence}
+
+
 def _latest_run(database: ControlPlaneDatabase, task_id: str, role: str | None = None) -> dict[str, object] | None:
     query = "SELECT * FROM role_runs WHERE task_id = ?"
     params: list[object] = [task_id]
@@ -265,10 +410,41 @@ def _current_context(database: ControlPlaneDatabase, task_id: str) -> tuple[dict
     return dict(lifecycle), dict(working) if working else None, dict(attempt) if attempt else None
 
 
+def _terminalize_non_converged_lifecycle(
+    database: ControlPlaneDatabase,
+    task: dict[str, object],
+    lifecycle: dict[str, object],
+    actual_head: str,
+) -> None:
+    ended_at = _now()
+    database.connection.execute(
+        "UPDATE lifecycles SET state = 'NON_CONVERGED', terminal_outcome = 'NON_CONVERGED', ended_at = ? "
+        "WHERE id = ? AND state = 'RUNNING'",
+        (ended_at, lifecycle["id"]),
+    )
+    database.connection.execute(
+        "UPDATE tasks SET state = 'TERMINATED', current_head = ?, updated_at = ? WHERE id = ?",
+        (actual_head, ended_at, task["id"]),
+    )
+    database._insert_event(
+        str(task["id"]), "lifecycle_terminated",
+        {"lifecycle_id": lifecycle["id"], "terminal_outcome": "NON_CONVERGED", "head_sha": actual_head},
+        occurred_at=ended_at,
+    )
+
+
 def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple[str | None, dict[str, object] | None, dict[str, object] | None, dict[str, object] | None]:
     lifecycle, working, attempt = _current_context(database, str(task["id"]))
     if lifecycle is None:
         return "PROJECT-MANAGER", None, None, None
+    if lifecycle["state"] == "NON_CONVERGED":
+        archivist = database.connection.execute(
+            "SELECT 1 FROM role_runs WHERE lifecycle_id = ? AND role = 'ARCHIVIST' LIMIT 1",
+            (lifecycle["id"],),
+        ).fetchone()
+        if archivist is None:
+            return "ARCHIVIST", lifecycle, working, attempt
+        return None, lifecycle, working, attempt
     if lifecycle["state"] != "RUNNING":
         return None, lifecycle, working, attempt
     if working is None:
@@ -289,9 +465,11 @@ def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple
         packet = _run_packet(database, dict(reviewer))
         if packet.get("verdict") == "correction_required":
             if int(attempt["ordinal"]) >= 3:
+                if working["state"] != "NON_CONVERGED":
+                    raise AllocationConflict("planning-attempt exhaustion must be reconciled before the next dispatch")
                 if int(working["ordinal"]) >= 8:
                     return "ARCHIVIST", lifecycle, working, attempt
-                return "PLANNER", lifecycle, None, None
+                return "PROJECT-MANAGER", lifecycle, working, attempt
             return "PLANNER", lifecycle, working, None
         if packet.get("verdict") not in {"accepted", "pass", "approved"}:
             raise AllocationConflict("Reviewer evidence does not license implementation")
@@ -310,9 +488,29 @@ def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple
         return "ARCHIVIST", lifecycle, working, attempt
     if working["state"] == "NON_CONVERGED":
         if int(working["ordinal"]) >= 8:
-            return "ARCHIVIST", lifecycle, working, attempt
-        return "PLANNER", lifecycle, None, None
+            raise AllocationConflict("round-8 non-convergence must be terminalized before Archivist dispatch")
+        pm = database.connection.execute(
+            "SELECT * FROM role_runs WHERE lifecycle_id = ? AND working_round_id = ? "
+            "AND role = 'PROJECT-MANAGER' ORDER BY started_at DESC, id DESC LIMIT 1",
+            (lifecycle["id"], working["id"]),
+        ).fetchone()
+        if pm is None:
+            return "PROJECT-MANAGER", lifecycle, working, attempt
+        _licensed_run(database, dict(pm))
+        if _run_packet(database, dict(pm)).get("outcome") == "next_working_round":
+            return "PLANNER", lifecycle, None, None
+        return "PROJECT-MANAGER", lifecycle, working, attempt
     return None, lifecycle, working, attempt
+
+
+def _scopes_within_roots(paths: object, roots: tuple[str, ...], label: str) -> list[str]:
+    proposed = _validate_relative_paths(paths)
+    if any(
+        not any(path == root or path.startswith(root + "/") for root in roots)
+        for path in proposed
+    ):
+        raise LifecycleError(f"{label} exceeds registered implementation roots")
+    return proposed
 
 
 def _writer_scopes(profile: Profile, role: str, packet: dict[str, object] | None) -> list[str]:
@@ -321,8 +519,11 @@ def _writer_scopes(profile: Profile, role: str, packet: dict[str, object] | None
     if role == "ARCHIVIST":
         return list(profile.harness_artifacts.archivist)
     if role == "IMPLEMENTER":
-        paths = packet.get("authorized_write_paths") if isinstance(packet, dict) else None
-        return _validate_relative_paths(paths)
+        paths = packet.get("proposed_implementation_paths") if isinstance(packet, dict) else None
+        return _scopes_within_roots(
+            paths, profile.harness_artifacts.implementation_roots,
+            "Planner implementation proposal",
+        )
     return []
 
 
@@ -376,17 +577,6 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
                 attempt = database.start_planning_attempt(str(working["id"]))
             elif role == "PLANNER" and attempt is None:
                 attempt = database.start_planning_attempt(str(working["id"]))
-            if role == "ARCHIVIST" and working and working["state"] == "PLANNING":
-                if int(working["ordinal"]) != 8:
-                    raise AllocationConflict("Archivist is only eligible after a terminal lifecycle outcome")
-                ended_at = _now()
-                database.terminate_working_round_non_converged(str(working["id"]), ended_at=ended_at)
-                database._insert_event(
-                    str(task["id"]), "lifecycle_non_converged",
-                    {"lifecycle_id": lifecycle["id"], "working_round_id": working["id"], "reason": "planning_attempt_budget_exhausted"},
-                    occurred_at=ended_at,
-                )
-                working = dict(database.connection.execute("SELECT * FROM working_rounds WHERE id = ?", (working["id"],)).fetchone())
             previous = _latest_run(database, str(task["id"]), "PLANNER")
             previous_packet = _run_packet(database, previous)
             writer_scopes = _writer_scopes(profile, role, previous_packet)
@@ -406,6 +596,7 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
                     list(profile.harness_artifacts.planner) +
                     list(profile.harness_artifacts.archivist)
                 ),
+                implementation_roots=list(profile.harness_artifacts.implementation_roots),
             )
             dispatch = grant["dispatch"]
             namespace = lifecycle_root(profile, str(task["identifier"]), str(dispatch["id"]))
@@ -429,7 +620,7 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
 
 def read_result(path: pathlib.Path) -> dict[str, object]:
     value = _read_json(path, "execution result")
-    if not isinstance(value, dict) or set(value) - {"schema", "task_id", "dispatch_id", "role", "summary", "verdict", "authorized_write_paths", "findings", "outcome", "blocker_kind"}:
+    if not isinstance(value, dict) or set(value) - {"schema", "task_id", "dispatch_id", "role", "summary", "verdict", "proposed_implementation_paths", "findings", "outcome", "blocker_kind"}:
         raise LifecycleError("execution result fields are invalid")
     if value.get("schema") != RESULT_SCHEMA:
         raise LifecycleError("execution result schema is invalid")
@@ -440,8 +631,8 @@ def read_result(path: pathlib.Path) -> dict[str, object]:
         raise LifecycleError("execution result role is invalid")
     if value.get("summary") is not None:
         _bounded_text(value["summary"], "summary", MAX_SUMMARY_BYTES)
-    if "authorized_write_paths" in value:
-        _validate_relative_paths(value["authorized_write_paths"])
+    if "proposed_implementation_paths" in value:
+        _validate_relative_paths(value["proposed_implementation_paths"])
     return value
 
 
@@ -504,7 +695,12 @@ def _record_lifecycle_outcome(
     if role == "REVIEWER" and outcome == "correction_required":
         attempt = database.connection.execute("SELECT id FROM planning_attempts WHERE working_round_id = ? ORDER BY ordinal DESC LIMIT 1", (working["id"],)).fetchone()
         if attempt:
+            attempt_row = database.connection.execute("SELECT ordinal FROM planning_attempts WHERE id = ?", (attempt[0],)).fetchone()
             database.connection.execute("UPDATE planning_attempts SET state = 'CORRECTION_REQUIRED', ended_at = ? WHERE id = ? AND state = 'OPEN'", (_now(), attempt[0]))
+            if attempt_row and int(attempt_row["ordinal"]) >= 3:
+                database.terminate_working_round_non_converged(str(working["id"]))
+                if int(working["ordinal"]) >= 8:
+                    _terminalize_non_converged_lifecycle(database, task, lifecycle, actual_head)
         database._insert_event(str(task["id"]), "planning_correction_required", {"working_round_id": working["id"]})
     elif role == "REVIEWER" and outcome in {"plan_accepted", "accepted"}:
         attempt = database.connection.execute("SELECT id FROM planning_attempts WHERE working_round_id = ? ORDER BY ordinal DESC LIMIT 1", (working["id"],)).fetchone()
@@ -521,14 +717,40 @@ def _record_lifecycle_outcome(
         database._insert_event(str(task["id"]), "lifecycle_converged", {"lifecycle_id": lifecycle["id"], "head_sha": actual_head})
     elif role == "ARCHIVIST" and outcome in {"archive_complete", "archived"}:
         non_converged = database.connection.execute("SELECT 1 FROM working_rounds WHERE lifecycle_id = ? AND state = 'NON_CONVERGED' AND ordinal = 8", (lifecycle["id"],)).fetchone()
-        terminal_state = "NON_CONVERGED" if non_converged else "ACCEPTED"
-        terminal_outcome = "NON_CONVERGED" if non_converged else "SUCCESSFUL"
-        database.connection.execute("UPDATE lifecycles SET state = ?, terminal_outcome = ?, ended_at = ? WHERE id = ? AND state = 'RUNNING'", (terminal_state, terminal_outcome, _now(), lifecycle["id"]))
-        database.connection.execute("UPDATE tasks SET state = 'TERMINATED', current_head = ?, updated_at = ? WHERE id = ?", (actual_head, _now(), task["id"]))
-        database._insert_event(str(task["id"]), "lifecycle_terminated", {"lifecycle_id": lifecycle["id"], "terminal_outcome": terminal_outcome, "head_sha": actual_head})
+        if non_converged and lifecycle["state"] == "NON_CONVERGED":
+            # Round-8 terminal classification was already established before
+            # this Archivist dispatch. Archivist documents it; it does not
+            # manufacture or rewrite lifecycle meaning.
+            database.connection.execute(
+                "UPDATE tasks SET current_head = ?, updated_at = ? WHERE id = ?",
+                (actual_head, _now(), task["id"]),
+            )
+        else:
+            terminal_state = "NON_CONVERGED" if non_converged else "ACCEPTED"
+            terminal_outcome = "NON_CONVERGED" if non_converged else "SUCCESSFUL"
+            database.connection.execute("UPDATE lifecycles SET state = ?, terminal_outcome = ?, ended_at = ? WHERE id = ? AND state = 'RUNNING'", (terminal_state, terminal_outcome, _now(), lifecycle["id"]))
+            database.connection.execute("UPDATE tasks SET state = 'TERMINATED', current_head = ?, updated_at = ? WHERE id = ?", (actual_head, _now(), task["id"]))
+            database._insert_event(str(task["id"]), "lifecycle_terminated", {"lifecycle_id": lifecycle["id"], "terminal_outcome": terminal_outcome, "head_sha": actual_head})
     elif role == "PROJECT-MANAGER" and outcome in {"no_convergence", "non_converged"}:
         database.connection.execute("UPDATE working_rounds SET state = 'NON_CONVERGED', ended_at = ? WHERE id = ?", (_now(), working["id"]))
         database._insert_event(str(task["id"]), "lifecycle_non_converged", {"lifecycle_id": lifecycle["id"], "working_round_id": working["id"]})
+        if int(working["ordinal"]) >= 8:
+            _terminalize_non_converged_lifecycle(database, task, lifecycle, actual_head)
+    elif role == "PROJECT-MANAGER" and outcome == "next_working_round":
+        current_lifecycle = database.connection.execute(
+            "SELECT state FROM lifecycles WHERE id = ?", (lifecycle["id"],)
+        ).fetchone()
+        current_working = database.connection.execute(
+            "SELECT state, ordinal FROM working_rounds WHERE id = ?", (working["id"],)
+        ).fetchone()
+        if (current_lifecycle is None or current_lifecycle["state"] != "RUNNING" or
+                current_working is None or current_working["state"] != "NON_CONVERGED" or
+                int(current_working["ordinal"]) >= 8):
+            raise StateConflict("next working round handoff is not eligible")
+        database._insert_event(
+            str(task["id"]), "working_round_handoff_requested",
+            {"lifecycle_id": lifecycle["id"], "working_round_id": working["id"], "next_ordinal": int(current_working["ordinal"]) + 1},
+        )
 
 
 def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
@@ -615,8 +837,12 @@ def reconcile_orphaned_executions(profile: Profile, *, managed_runtime_stopped: 
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
         rows = database.connection.execute("SELECT * FROM role_dispatches WHERE status IN ('AUTHORIZED', 'RUNNING') AND task_id IN (SELECT id FROM tasks WHERE project_slug = ?)", (profile.slug,)).fetchall()
         result = []
-        with database._transaction():
-            for row in rows:
+        for row in rows:
+            if row["status"] == "RUNNING":
+                run = database.record_orphaned_execution(str(row["id"]))
+                result.append({"dispatch_id": row["id"], "task_id": row["task_id"], "role": row["role"], "role_run_id": run["id"], "status": "failed"})
+                continue
+            with database._transaction():
                 database.connection.execute("UPDATE role_dispatches SET status = 'REJECTED', consumed_at = ? WHERE id = ?", (_now(), row["id"]))
                 result.append({"dispatch_id": row["id"], "task_id": row["task_id"], "role": row["role"], "status": "rejected"})
         return result

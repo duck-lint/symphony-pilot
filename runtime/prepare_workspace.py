@@ -43,6 +43,7 @@ class HarnessArtifactScopes:
 
     planner: tuple[str, ...] = ()
     archivist: tuple[str, ...] = ()
+    implementation_roots: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,8 +196,8 @@ def load_profile(path: pathlib.Path) -> Profile:
     if missing:
         raise PreparationError("profile", "missing profile fields: " + ",".join(missing))
     harness_artifacts = raw.get("harness_artifacts")
-    if not isinstance(harness_artifacts, dict) or set(harness_artifacts) != {"planner", "archivist"}:
-        raise PreparationError("profile", "harness_artifacts must define planner and archivist scopes")
+    if not isinstance(harness_artifacts, dict) or set(harness_artifacts) != {"planner", "archivist", "implementation_roots"}:
+        raise PreparationError("profile", "harness_artifacts must define planner, archivist, and implementation roots")
 
     def artifact_scopes(role: str) -> tuple[str, ...]:
         values = harness_artifacts.get(role)
@@ -215,11 +216,29 @@ def load_profile(path: pathlib.Path) -> Profile:
 
     planner_artifacts = artifact_scopes("planner")
     archivist_artifacts = artifact_scopes("archivist")
+    implementation_roots_raw = harness_artifacts.get("implementation_roots")
+    if not isinstance(implementation_roots_raw, list) or not implementation_roots_raw or len(implementation_roots_raw) > 32:
+        raise PreparationError("profile", "implementation_roots must be a bounded non-empty list")
+    implementation_roots: list[str] = []
+    for value in implementation_roots_raw:
+        if (not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or
+                "\x00" in value or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(value).parts) or
+                value == ".git" or value.startswith(".git/")):
+            raise PreparationError("profile", "implementation_roots contains an unsafe path")
+        implementation_roots.append(value.rstrip("/"))
+    if len(set(implementation_roots)) != len(implementation_roots):
+        raise PreparationError("profile", "implementation_roots contains duplicate paths")
     if any(
         left == right or left.startswith(right + "/") or right.startswith(left + "/")
         for left in planner_artifacts for right in archivist_artifacts
     ):
         raise PreparationError("profile", "planner and archivist harness-artifact scopes must be disjoint")
+    if any(
+        root == artifact or root.startswith(artifact + "/") or artifact.startswith(root + "/")
+        for root in implementation_roots
+        for artifact in (*planner_artifacts, *archivist_artifacts)
+    ):
+        raise PreparationError("profile", "implementation_roots may not overlap harness-artifact scopes")
     slug = str(raw["slug"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
         raise PreparationError("profile", "profile slug is not a safe identifier")
@@ -277,6 +296,7 @@ def load_profile(path: pathlib.Path) -> Profile:
         source_profile_path=path.resolve(),
         harness_artifacts=HarnessArtifactScopes(
             planner=planner_artifacts, archivist=archivist_artifacts,
+            implementation_roots=tuple(implementation_roots),
         ),
         storage_policy=storage_policy,
     )

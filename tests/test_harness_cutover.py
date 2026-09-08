@@ -10,8 +10,12 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "runtime"))
 
 from control_db import ControlPlaneDatabase, StateConflict
-from lifecycle import AllocationConflict, _next_role, _record_lifecycle_outcome, broker_writer_delta
+from lifecycle import (AllocationConflict, LifecycleError, _licensed_run,
+                       _next_role, _record_lifecycle_outcome, _writer_scopes,
+                       _working_tree_paths, broker_writer_delta,
+                       perform_mechanical_validation, reconcile_orphaned_executions)
 from prepare_workspace import load_profile
+from unittest.mock import patch
 
 
 SHA = "a" * 40
@@ -37,15 +41,16 @@ class HarnessCutoverTests(unittest.TestCase):
 
     def dispatch(self, role, write_scopes=()):
         registered = (
-            ("project-harness/plan",) if role == "PLANNER" else
-            ("project-harness/archive",) if role == "ARCHIVIST" else ()
+            ("harness/project-spec",) if role == "PLANNER" else
+            ("harness/implementations",) if role == "ARCHIVIST" else ()
         )
         return self.database.authorize_dispatch(
             self.task["id"], lifecycle_id=self.lifecycle["id"], working_round_id=self.round["id"],
             planning_attempt_id=self.attempt["id"], role=role, expected_starting_head=SHA,
             read_scopes=("project",), write_scopes=write_scopes,
             registered_artifact_scopes=registered,
-            protected_artifact_scopes=("project-harness/plan", "project-harness/archive"),
+            protected_artifact_scopes=("harness/project-spec", "harness/implementations"),
+            implementation_roots=("src",),
             created_at=TIME,
         )
 
@@ -95,19 +100,20 @@ class HarnessCutoverTests(unittest.TestCase):
                 self.task["id"], lifecycle_id=self.lifecycle["id"], working_round_id=self.round["id"],
                 planning_attempt_id=self.attempt["id"], role="REVIEWER", expected_starting_head=SHA,
                 read_scopes=("project",), write_scopes=("src",),
+                implementation_roots=("src",),
             )
         with self.assertRaises(StateConflict):
             self.database.record_execution_started(grant["dispatch"]["id"], self.evidence(grant, "PLANNER", status="running", phase="started"))
 
     def test_writer_grants_are_separate_and_git_is_denied(self):
-        planner = self.dispatch("PLANNER", ("project-harness/plan",))
-        self.assertEqual(planner["grant"]["write_scopes_json"], '["project-harness/plan"]')
+        planner = self.dispatch("PLANNER", ("harness/project-spec",))
+        self.assertEqual(planner["grant"]["write_scopes_json"], '["harness/project-spec"]')
         with self.assertRaises(StateConflict):
             self.dispatch("IMPLEMENTER", (".git",))
         with self.assertRaises(StateConflict):
-            self.dispatch("ARCHIVIST", ("project-harness/plan", "project-harness/archive"))
+            self.dispatch("ARCHIVIST", ("harness/project-spec", "harness/implementations"))
         with self.assertRaises(StateConflict):
-            self.dispatch("IMPLEMENTER", ("project-harness/plan",))
+            self.dispatch("IMPLEMENTER", ("harness/project-spec",))
 
     def test_human_disposition_is_required_before_another_lifecycle(self):
         self.database.connection.execute("UPDATE lifecycles SET state = 'NON_CONVERGED', terminal_outcome = 'NON_CONVERGED', ended_at = ? WHERE id = ?", (TIME, self.lifecycle["id"]))
@@ -139,7 +145,7 @@ class HarnessCutoverTests(unittest.TestCase):
         self.assertEqual(lifecycle["mechanical_acceptance"], "NOT_REACHED")
         with self.assertRaises(AllocationConflict):
             _next_role(self.database, self.task)
-        accepted = self.database.record_mechanical_validation(
+        accepted = self.database._record_mechanical_validation(
             self.lifecycle["id"], head_sha=SHA, passed=True,
             evidence={"validator": "pilot", "result": "pass"}, validated_at=TIME,
         )
@@ -181,7 +187,7 @@ class HarnessCutoverTests(unittest.TestCase):
         self.round = self.database.start_working_round(self.lifecycle["id"], started_at=TIME)
         self.attempt = self.database.start_planning_attempt(self.round["id"], started_at=TIME)
         for index in range(3):
-            planner = self.dispatch("PLANNER", ("project-harness/plan",))
+            planner = self.dispatch("PLANNER", ("harness/project-spec",))
             self._finish_execution(planner, "PLANNER", outcome="accepted", runtime_id=f"planner-{index}")
             reviewer = self.dispatch("REVIEWER")
             self._finish_execution(
@@ -197,9 +203,34 @@ class HarnessCutoverTests(unittest.TestCase):
         role, _, working, _ = _next_role(self.database, self.task)
         self.assertEqual(role, "ARCHIVIST")
         self.assertEqual(working["ordinal"], 8)
-        self.database.terminate_working_round_non_converged(self.round["id"], ended_at=TIME)
+        lifecycle = self.database.connection.execute(
+            "SELECT state, terminal_outcome FROM lifecycles WHERE id = ?", (self.lifecycle["id"],)
+        ).fetchone()
+        self.assertEqual(lifecycle["state"], "NON_CONVERGED")
+        self.assertEqual(lifecycle["terminal_outcome"], "NON_CONVERGED")
         with self.assertRaises(StateConflict):
             self.database.start_working_round(self.lifecycle["id"], started_at=TIME)
+
+    def test_non_converged_round_returns_through_pm_before_next_planner(self):
+        _record_lifecycle_outcome(
+            self.database, self.task, self.lifecycle, self.round,
+            "PROJECT-MANAGER", {"outcome": "no_convergence"}, SHA,
+        )
+        role, _, working, _ = _next_role(self.database, self.task)
+        self.assertEqual(role, "PROJECT-MANAGER")
+        self.assertEqual(working["id"], self.round["id"])
+        handoff = self.dispatch("PROJECT-MANAGER")
+        self._finish_execution(
+            handoff, "PROJECT-MANAGER", outcome="next_working_round",
+            runtime_id="pm-handoff",
+        )
+        _record_lifecycle_outcome(
+            self.database, self.task, self.lifecycle, self.round,
+            "PROJECT-MANAGER", {"outcome": "next_working_round"}, SHA,
+        )
+        role, _, working, _ = _next_role(self.database, self.task)
+        self.assertEqual(role, "PLANNER")
+        self.assertIsNone(working)
 
     def test_host_writer_broker_uses_and_verifies_symphony_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -231,12 +262,137 @@ class HarnessCutoverTests(unittest.TestCase):
                 "Symphony Agent\x00symphony@localhost\x00Symphony Agent\x00symphony@localhost",
             )
 
+    def test_implementer_proposal_is_narrowed_by_registered_roots(self):
+        profile = load_profile(
+            pathlib.Path(__file__).parents[1] / "projects" / "symphony-canary" / "profile.toml"
+        )
+        self.assertEqual(
+            _writer_scopes(profile, "IMPLEMENTER", {"proposed_implementation_paths": ["lib/canary.py"]}),
+            ["lib/canary.py"],
+        )
+        with self.assertRaises(LifecycleError):
+            _writer_scopes(profile, "IMPLEMENTER", {"proposed_implementation_paths": ["tests/test_canary.py"]})
+        with self.assertRaises(LifecycleError):
+            _writer_scopes(profile, "IMPLEMENTER", {"proposed_implementation_paths": ["lib", "harness"]})
+
+    def test_orphaned_running_execution_is_terminalized_without_success_license(self):
+        grant = self.dispatch("REVIEWER")
+        launch = self.evidence(grant, "REVIEWER", status="running", phase="started")
+        launch.pop("finished_at")
+        run = self.database.record_execution_started(grant["dispatch"]["id"], launch)
+        database_path = self.database.path
+        self.database.close()
+        with patch("lifecycle.control_database_path", return_value=database_path):
+            repaired = reconcile_orphaned_executions(
+                type("Profile", (), {"slug": "demo"})(), managed_runtime_stopped=True,
+            )
+        self.database = ControlPlaneDatabase.open(database_path)
+        orphan = self.database.read_role_run(run["id"])
+        self.assertEqual(repaired[0]["status"], "failed")
+        self.assertEqual(orphan["id"], run["id"])
+        self.assertEqual(orphan["status"], "failed")
+        projection = self.database.read_projection(self.task["id"])
+        self.assertIsNone(projection["active_execution"])
+        evidence = self.database.connection.execute(
+            "SELECT status FROM execution_evidence WHERE role_run_id = ?", (run["id"],)
+        ).fetchone()
+        self.assertEqual(evidence["status"], "failed")
+        with self.assertRaises(AllocationConflict):
+            _licensed_run(self.database, orphan)
+
+    def test_authorized_dispatch_orphan_reconciliation_does_not_invent_run(self):
+        grant = self.dispatch("REVIEWER")
+        database_path = self.database.path
+        self.database.close()
+        with patch("lifecycle.control_database_path", return_value=database_path):
+            repaired = reconcile_orphaned_executions(
+                type("Profile", (), {"slug": "demo"})(), managed_runtime_stopped=True,
+            )
+        self.database = ControlPlaneDatabase.open(database_path)
+        self.assertEqual(repaired[0]["status"], "rejected")
+        self.assertEqual(
+            self.database.connection.execute("SELECT COUNT(*) FROM role_runs").fetchone()[0], 0
+        )
+
+    def test_nul_porcelain_parses_both_rename_copy_paths_for_authorization(self):
+        result = type("GitResult", (), {"returncode": 0, "stdout": "R  old.txt\x00new.txt\x00C  source.txt\x00copy.txt\x00", "stderr": ""})()
+        with patch("lifecycle.run_git", return_value=result) as run_git:
+            self.assertEqual(
+                _working_tree_paths(pathlib.Path("unused")),
+                ["copy.txt", "new.txt", "old.txt", "source.txt"],
+            )
+        self.assertIn("-z", run_git.call_args.args)
+        with patch("lifecycle._working_tree_paths", return_value=["old.txt", "new.txt"]):
+            with self.assertRaises(LifecycleError):
+                broker_writer_delta(
+                    pathlib.Path("unused"), "PLANNER", ["old.txt", "new.txt"], ["new.txt"],
+                    expected_starting_head=SHA,
+                )
+
+    def test_mechanical_validation_computes_failure_and_records_evidence(self):
+        _record_lifecycle_outcome(
+            self.database, self.task, self.lifecycle, self.round,
+            "PROJECT-MANAGER", {"outcome": "converged"}, SHA,
+        )
+        facts = type("Facts", (), {"task_uuid": self.task["id"]})()
+        with patch("lifecycle.local_task_facts", return_value=(facts, {})), \
+             patch("lifecycle.control_database_path", return_value=self.database.path), \
+             patch("lifecycle._git", return_value=SHA), \
+             patch("lifecycle._working_tree_paths", return_value=[]), \
+             patch("lifecycle.verify_git_truth", return_value=SHA):
+            result = perform_mechanical_validation(object(), pathlib.Path("unused"), lifecycle_id=self.lifecycle["id"])
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["evidence"]["checks"]["required_lifecycle_executions_retained"])
+        lifecycle = self.database.connection.execute(
+            "SELECT mechanical_validation_status, mechanical_acceptance FROM lifecycles WHERE id = ?",
+            (self.lifecycle["id"],),
+        ).fetchone()
+        self.assertEqual(lifecycle["mechanical_validation_status"], "FAILED")
+        self.assertEqual(lifecycle["mechanical_acceptance"], "NOT_REACHED")
+
+    def test_mechanical_validation_computes_pass_before_final_acceptance(self):
+        pm = self.dispatch("PROJECT-MANAGER")
+        self._finish_execution(pm, "PROJECT-MANAGER", outcome="accepted", runtime_id="pm-pass")
+        planner = self.dispatch("PLANNER", ("harness/project-spec",))
+        self._finish_execution(planner, "PLANNER", outcome="accepted", runtime_id="planner-pass")
+        reviewer = self.dispatch("REVIEWER")
+        self._finish_execution(reviewer, "REVIEWER", outcome="accepted", verdict="accepted", runtime_id="reviewer-pass")
+        implementer = self.dispatch("IMPLEMENTER", ("src/module.py",))
+        self._finish_execution(implementer, "IMPLEMENTER", outcome="accepted", runtime_id="implementer-pass")
+        adversary = self.dispatch("ADVERSARY")
+        self._finish_execution(adversary, "ADVERSARY", outcome="adversary_pass", runtime_id="adversary-pass")
+        _record_lifecycle_outcome(
+            self.database, self.task, self.lifecycle, self.round,
+            "PROJECT-MANAGER", {"outcome": "converged"}, SHA,
+        )
+        facts = type("Facts", (), {"task_uuid": self.task["id"]})()
+        with patch("lifecycle.local_task_facts", return_value=(facts, {})), \
+             patch("lifecycle.control_database_path", return_value=self.database.path), \
+             patch("lifecycle._git", return_value=SHA), \
+             patch("lifecycle._working_tree_paths", return_value=[]), \
+             patch("lifecycle.verify_git_truth", return_value=SHA):
+            result = perform_mechanical_validation(object(), pathlib.Path("unused"), lifecycle_id=self.lifecycle["id"])
+        self.assertTrue(result["passed"])
+        self.assertTrue(all(result["evidence"]["checks"].values()))
+        lifecycle = self.database.connection.execute(
+            "SELECT mechanical_validation_status, mechanical_acceptance FROM lifecycles WHERE id = ?",
+            (self.lifecycle["id"],),
+        ).fetchone()
+        self.assertEqual(lifecycle["mechanical_validation_status"], "PASSED")
+        self.assertEqual(lifecycle["mechanical_acceptance"], "ACCEPTED")
+
     def test_registered_project_harness_artifact_scopes_are_loaded(self):
         profile = load_profile(
             pathlib.Path(__file__).parents[1] / "projects" / "symphony-canary" / "profile.toml"
         )
-        self.assertEqual(profile.harness_artifacts.planner, ("project-harness/plan", "project-harness/decision-memory"))
-        self.assertEqual(profile.harness_artifacts.archivist, ("project-harness/archive",))
+        self.assertEqual(profile.harness_artifacts.planner, ("harness/project-spec",))
+        self.assertEqual(profile.harness_artifacts.archivist, ("harness/implementations",))
+        self.assertEqual(profile.harness_artifacts.implementation_roots, ("lib",))
+        canary = pathlib.Path(__file__).resolve().parents[2] / "symphony-canary"
+        self.assertTrue((canary / "harness").is_dir())
+        self.assertTrue((canary / "lib").is_dir())
+        for relative in (*profile.harness_artifacts.planner, *profile.harness_artifacts.archivist, *profile.harness_artifacts.implementation_roots):
+            self.assertTrue((canary / relative).exists(), relative)
 
     def test_planner_packet_cannot_skip_reviewer(self):
         _record_lifecycle_outcome(

@@ -69,6 +69,7 @@ EVENT_TYPES = frozenset({
     "working_round_started",
     "working_round_converged",
     "working_round_non_converged",
+    "working_round_handoff_requested",
     "lifecycle_converged",
     "lifecycle_non_converged",
     "mechanical_validation_passed",
@@ -142,6 +143,13 @@ def _text(value: str, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be non-empty text")
     return value
+
+
+def _scope(value: str, field: str) -> str:
+    if (not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or
+            "\x00" in value or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(value).parts)):
+        raise ValueError(f"{field} must be a safe relative POSIX path")
+    return value.rstrip("/")
 
 
 def _project_slug(value: str) -> str:
@@ -393,6 +401,7 @@ MIGRATIONS = (
                     'execution_reconciled', 'finding_recorded',
                     'planning_correction_required', 'planning_accepted',
                     'working_round_started', 'working_round_converged', 'working_round_non_converged',
+                    'working_round_handoff_requested',
                     'lifecycle_converged', 'lifecycle_non_converged',
                     'mechanical_validation_passed', 'mechanical_validation_failed',
                     'lifecycle_terminated', 'human_disposition_recorded',
@@ -1677,7 +1686,7 @@ class ControlPlaneDatabase:
             self.connection.execute("INSERT INTO planning_attempts(id, task_id, lifecycle_id, working_round_id, ordinal, state, started_at, ended_at) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, NULL)", (attempt_id, current["task_id"], current["lifecycle_id"], working_round_id, ordinal, timestamp))
         return dict(self.connection.execute("SELECT * FROM planning_attempts WHERE id = ?", (attempt_id,)).fetchone())
 
-    def record_mechanical_validation(
+    def _record_mechanical_validation(
         self,
         lifecycle_id: str | uuid.UUID,
         *,
@@ -1686,7 +1695,7 @@ class ControlPlaneDatabase:
         evidence: dict[str, object],
         validated_at: str | None = None,
     ) -> dict[str, object]:
-        """Record the required Pilot-controlled validation after PM convergence."""
+        """Persist the result computed by ``perform_mechanical_validation``."""
         lifecycle_id = _uuid(lifecycle_id, "lifecycle_id")
         head_sha = _sha(head_sha, "head_sha", required=True)
         if not isinstance(passed, bool):
@@ -1741,6 +1750,7 @@ class ControlPlaneDatabase:
         write_scopes: Sequence[str],
         registered_artifact_scopes: Sequence[str] = (),
         protected_artifact_scopes: Sequence[str] = (),
+        implementation_roots: Sequence[str] = (),
         created_at: str | None = None,
     ) -> dict[str, object]:
         """Issue one exact grant; Runtime cannot add scope or choose a role."""
@@ -1754,6 +1764,7 @@ class ControlPlaneDatabase:
         write_scopes = tuple(_text(str(path), "write scope") for path in write_scopes)
         registered_artifact_scopes = tuple(_text(str(path), "registered artifact scope") for path in registered_artifact_scopes)
         protected_artifact_scopes = tuple(_text(str(path), "protected artifact scope") for path in protected_artifact_scopes)
+        implementation_roots = tuple(_scope(path, "implementation root") for path in implementation_roots)
         if role in {"PROJECT-MANAGER", "REVIEWER", "ADVERSARY"} and write_scopes:
             raise StateConflict(f"{role} is non-writing")
         if role in {"PLANNER", "IMPLEMENTER", "ARCHIVIST"} and not write_scopes:
@@ -1767,6 +1778,13 @@ class ControlPlaneDatabase:
             for path in write_scopes
         ):
             raise StateConflict(f"{role} grant exceeds registered project harness-artifact scopes")
+        if role == "IMPLEMENTER" and not implementation_roots:
+            raise StateConflict("IMPLEMENTER requires registered implementation roots")
+        if role == "IMPLEMENTER" and any(
+            not any(path == root or path.startswith(root + "/") for root in implementation_roots)
+            for path in write_scopes
+        ):
+            raise StateConflict("IMPLEMENTER grant exceeds registered implementation roots")
         if role == "IMPLEMENTER" and any(
             any(path == root or path.startswith(root + "/") for root in protected_artifact_scopes)
             for path in write_scopes
@@ -1861,6 +1879,63 @@ class ControlPlaneDatabase:
             )
             self.connection.execute("UPDATE role_dispatches SET status = 'CONSUMED', consumed_at = ? WHERE id = ?", (finished, dispatch_id))
             self._insert_event(str(dispatch["task_id"]), "execution_terminated", {"dispatch_id": dispatch_id, "role_run_id": retained["role_run_id"], "evidence_id": retained["id"], "role": dispatch["role"], "status": evidence["status"]}, role_run_id=retained["role_run_id"], occurred_at=finished)
+        return self.read_role_run(str(retained["role_run_id"]))
+
+    def record_orphaned_execution(
+        self,
+        dispatch_id: str | uuid.UUID,
+        *,
+        terminated_at: str | None = None,
+    ) -> dict[str, object]:
+        """Terminalize a retained launch after managed Runtime stop proof."""
+        dispatch_id = _uuid(dispatch_id, "dispatch_id")
+        finished = _timestamp(terminated_at, "terminated_at")
+        with self._transaction():
+            dispatch = _row(self.connection.execute(
+                "SELECT * FROM role_dispatches WHERE id = ?", (dispatch_id,)
+            ).fetchone())
+            if dispatch is None or dispatch["status"] != "RUNNING":
+                raise StateConflict("orphan reconciliation requires a running dispatch")
+            retained = _row(self.connection.execute(
+                "SELECT * FROM execution_evidence WHERE dispatch_id = ? AND status = 'running'",
+                (dispatch_id,),
+            ).fetchone())
+            if retained is None:
+                raise StateConflict("running dispatch has no retained launch evidence")
+            try:
+                evidence = json.loads(str(retained["receipt_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StateConflict("retained launch evidence is malformed") from exc
+            if not isinstance(evidence, dict):
+                raise StateConflict("retained launch evidence is not an object")
+            evidence = dict(evidence)
+            evidence.update({
+                "phase": "terminated", "status": "failed", "finished_at": finished,
+                "orphaned": True,
+                "summary": "managed Runtime stopped before terminal execution evidence",
+            })
+            self.connection.execute(
+                "UPDATE execution_evidence SET status = 'failed', finished_at = ?, receipt_json = ? WHERE id = ?",
+                (finished, _payload(evidence), retained["id"]),
+            )
+            self.connection.execute(
+                "UPDATE role_runs SET status = 'failed', finished_at = ?, result_summary = ? WHERE id = ?",
+                (finished, evidence["summary"], retained["role_run_id"]),
+            )
+            self.connection.execute(
+                "UPDATE role_dispatches SET status = 'REJECTED', consumed_at = ? WHERE id = ?",
+                (finished, dispatch_id),
+            )
+            self._insert_event(
+                str(dispatch["task_id"]), "execution_terminated",
+                {"dispatch_id": dispatch_id, "role_run_id": retained["role_run_id"], "evidence_id": retained["id"], "role": dispatch["role"], "status": "failed", "orphaned": True},
+                role_run_id=retained["role_run_id"], occurred_at=finished,
+            )
+            self._insert_event(
+                str(dispatch["task_id"]), "execution_reconciled",
+                {"dispatch_id": dispatch_id, "role_run_id": retained["role_run_id"], "orphaned": True},
+                role_run_id=retained["role_run_id"], occurred_at=finished,
+            )
         return self.read_role_run(str(retained["role_run_id"]))
 
     def read_role_run(self, run_id: str | uuid.UUID) -> dict[str, object]:
