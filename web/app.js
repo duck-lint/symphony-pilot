@@ -10,8 +10,10 @@ function renderReceipt(receipt,view){
   const runs=(view.role_runs||[]).slice().sort((a,b)=>String(a.started_at||"").localeCompare(String(b.started_at||"")));
   const roleRows=runs.map(run=>`<tr><td>${escapeHtml(run.role)}</td><td><span class="tag ${statusClass(run.status)}">${escapeHtml(run.status)}</span></td><td>${escapeHtml(run.working_round_number)}</td><td><code>${escapeHtml(shortSha(run.head_sha))}</code></td><td>${escapeHtml(run.result_summary||"—")}</td></tr>`).join("")||"<tr><td colspan=5>No retained role execution evidence.</td></tr>";
   const files=summary.files||[],commits=receipt.commits||[];
+  const active=view.active_execution;
+  const activeLabel=active?`${active.role} (${active.status})`:"—";
   return `<section class="receipt"><div class="receipt-heading"><div><span class="eyebrow">EXECUTION EVIDENCE</span><h3>Host-observed execution</h3><small>${escapeHtml(receipt.source||"unavailable")}</small></div><span class="publication ${task.published_head?"published":"local"}">${escapeHtml(task.published_head?"PUBLISHED":"LOCAL ONLY")}</span></div>
-    <div class="cards receipt-summary">${card("Task state",task.state)}${card("Workspace",workspace.wsl_path)}${card("Workspace HEAD",git.head)}${card("Accepted HEAD",task.current_head)}</div>
+    <div class="cards receipt-summary">${card("Task state",task.state)}${card("Expected role",view.expected_next_role)}${card("Active execution",activeLabel)}${card("Workspace",workspace.wsl_path)}${card("Workspace HEAD",git.head)}${card("Accepted HEAD",task.current_head)}</div>
     <h4>Lifecycle projection</h4><pre>${escapeHtml(JSON.stringify({lifecycle:view.lifecycle,working_rounds:view.working_rounds,planning_attempts:view.planning_attempts},null,2))}</pre>
     <h4>Role executions</h4><div class="receipt-table-wrap"><table><thead><tr><th>Role</th><th>Status</th><th>Working round</th><th>HEAD</th><th>Summary</th></tr></thead><tbody>${roleRows}</tbody></table></div>
     <h4>Writer deltas</h4><pre>${escapeHtml(JSON.stringify(view.writer_deltas||[],null,2))}</pre>

@@ -17,3 +17,7 @@ task_storage_bytes = 8589934592
 task_storage_inodes = 250000
 storage_emergency_reserve_bytes = 8589934592
 storage_emergency_reserve_inodes = 250000
+
+[harness_artifacts]
+planner = ["project-harness/plan", "project-harness/decision-memory"]
+archivist = ["project-harness/archive"]

@@ -3,7 +3,7 @@
   "title": "symphony-pilot project profile",
   "type": "object",
   "additionalProperties": false,
-  "required": ["slug", "repository", "git_remote", "secret_reference", "dashboard_port", "max_concurrent_agents", "poll_interval_ms", "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "storage_pool_bytes", "storage_allocatable_pool_bytes", "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes", "storage_emergency_reserve_inodes"],
+  "required": ["slug", "repository", "git_remote", "secret_reference", "dashboard_port", "max_concurrent_agents", "poll_interval_ms", "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "storage_pool_bytes", "storage_allocatable_pool_bytes", "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes", "storage_emergency_reserve_inodes", "harness_artifacts"],
   "properties": {
     "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
     "repository": {"type": "string"},
@@ -18,6 +18,15 @@
     "toolchain": {"type": ["string", "null"]},
     "prevent_host_sleep": {"type": "boolean"},
     "display_name": {"type": "string"},
+    "harness_artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planner", "archivist"],
+      "properties": {
+        "planner": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string"}},
+        "archivist": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string"}}
+      }
+    },
     "storage_pool_bytes": {"type": "integer", "minimum": 1},
     "storage_allocatable_pool_bytes": {"type": "integer", "minimum": 1},
     "task_storage_bytes": {"type": "integer", "minimum": 1},

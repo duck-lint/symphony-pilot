@@ -38,6 +38,14 @@ class PreparationError(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class HarnessArtifactScopes:
+    """Registered role domains; physical layout is project-owned."""
+
+    planner: tuple[str, ...] = ()
+    archivist: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
 class Profile:
     slug: str
     repository: str
@@ -57,6 +65,7 @@ class Profile:
     prevent_host_sleep: bool = False
     display_name: str = ""
     source_profile_path: pathlib.Path | None = None
+    harness_artifacts: HarnessArtifactScopes = dataclasses.field(default_factory=HarnessArtifactScopes)
     storage_policy: StoragePolicy = dataclasses.field(default_factory=StoragePolicy)
 
 
@@ -168,7 +177,7 @@ def load_profile(path: pathlib.Path) -> Profile:
         raw = tomllib.load(stream)
     allowed = {"slug", "repository", "git_remote", "secret_reference", "max_concurrent_agents", "poll_interval_ms",
                "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
-               "prevent_host_sleep", "display_name", "dashboard_port", "storage_pool_bytes",
+               "prevent_host_sleep", "display_name", "harness_artifacts", "dashboard_port", "storage_pool_bytes",
                "storage_allocatable_pool_bytes",
                "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes",
                "storage_emergency_reserve_inodes"}
@@ -181,10 +190,36 @@ def load_profile(path: pathlib.Path) -> Profile:
                 "codex_reasoning_effort", "storage_pool_bytes", "storage_allocatable_pool_bytes",
                 "task_storage_bytes",
                 "task_storage_inodes", "storage_emergency_reserve_bytes",
-                "storage_emergency_reserve_inodes"]
+                "storage_emergency_reserve_inodes", "harness_artifacts"]
     missing = [key for key in required if key not in raw]
     if missing:
         raise PreparationError("profile", "missing profile fields: " + ",".join(missing))
+    harness_artifacts = raw.get("harness_artifacts")
+    if not isinstance(harness_artifacts, dict) or set(harness_artifacts) != {"planner", "archivist"}:
+        raise PreparationError("profile", "harness_artifacts must define planner and archivist scopes")
+
+    def artifact_scopes(role: str) -> tuple[str, ...]:
+        values = harness_artifacts.get(role)
+        if not isinstance(values, list) or not values or len(values) > 32:
+            raise PreparationError("profile", f"harness_artifacts.{role} must be a bounded non-empty list")
+        result: list[str] = []
+        for value in values:
+            if (not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or
+                    "\x00" in value or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(value).parts) or
+                    value == ".git" or value.startswith(".git/")):
+                raise PreparationError("profile", f"harness_artifacts.{role} contains an unsafe path")
+            result.append(value.rstrip("/"))
+        if len(set(result)) != len(result):
+            raise PreparationError("profile", f"harness_artifacts.{role} contains duplicate paths")
+        return tuple(result)
+
+    planner_artifacts = artifact_scopes("planner")
+    archivist_artifacts = artifact_scopes("archivist")
+    if any(
+        left == right or left.startswith(right + "/") or right.startswith(left + "/")
+        for left in planner_artifacts for right in archivist_artifacts
+    ):
+        raise PreparationError("profile", "planner and archivist harness-artifact scopes must be disjoint")
     slug = str(raw["slug"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
         raise PreparationError("profile", "profile slug is not a safe identifier")
@@ -240,6 +275,9 @@ def load_profile(path: pathlib.Path) -> Profile:
         prevent_host_sleep=bool(raw.get("prevent_host_sleep", False)),
         display_name=str(raw.get("display_name", slug)),
         source_profile_path=path.resolve(),
+        harness_artifacts=HarnessArtifactScopes(
+            planner=planner_artifacts, archivist=archivist_artifacts,
+        ),
         storage_policy=storage_policy,
     )
     namespaces = project_namespaces(profile)

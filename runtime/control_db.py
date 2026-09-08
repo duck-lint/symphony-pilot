@@ -48,7 +48,7 @@ ROLE_NAMES = frozenset({
     "ADVERSARY",
     "ARCHIVIST",
 })
-ROLE_RUN_STATUSES = frozenset({"finished", "failed", "blocked"})
+ROLE_RUN_STATUSES = frozenset({"running", "finished", "failed", "blocked"})
 FINDING_SEVERITIES = frozenset({"info", "low", "medium", "high", "critical"})
 FINDING_STATUSES = frozenset({"open", "accepted", "rejected", "resolved"})
 BLOCKER_KINDS = frozenset({"human", "project", "infrastructure"})
@@ -59,6 +59,8 @@ EVENT_TYPES = frozenset({
     "queued",
     "lifecycle_started",
     "dispatch_authorized",
+    "execution_started",
+    "execution_terminated",
     "execution_observed",
     "execution_reconciled",
     "finding_recorded",
@@ -66,8 +68,11 @@ EVENT_TYPES = frozenset({
     "planning_accepted",
     "working_round_started",
     "working_round_converged",
+    "working_round_non_converged",
     "lifecycle_converged",
     "lifecycle_non_converged",
+    "mechanical_validation_passed",
+    "mechanical_validation_failed",
     "lifecycle_terminated",
     "human_disposition_recorded",
     "head_changed",
@@ -299,15 +304,14 @@ MIGRATIONS = (
                     head_sha IS NULL OR
                     (length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*')
                 ),
-                status TEXT NOT NULL CHECK (status IN ('finished', 'failed', 'blocked')),
+                status TEXT NOT NULL CHECK (status IN ('running', 'finished', 'failed', 'blocked')),
                 started_at TEXT NOT NULL CHECK (length(started_at) > 0),
                 finished_at TEXT,
                 result_summary TEXT,
                 UNIQUE (id, task_id),
                 UNIQUE (task_id, role, working_round_number, planning_attempt_id),
-                CHECK (
-                    finished_at IS NOT NULL
-                ),
+                CHECK ((status = 'running' AND finished_at IS NULL) OR
+                       (status IN ('finished', 'failed', 'blocked') AND finished_at IS NOT NULL)),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE RESTRICT
             )
             """,
@@ -384,11 +388,13 @@ MIGRATIONS = (
                 task_id TEXT NOT NULL,
                 event_type TEXT NOT NULL CHECK (event_type IN (
                     'task_created', 'queued', 'lifecycle_started',
-                    'dispatch_authorized', 'execution_observed',
+                    'dispatch_authorized', 'execution_started', 'execution_terminated',
+                    'execution_observed',
                     'execution_reconciled', 'finding_recorded',
                     'planning_correction_required', 'planning_accepted',
-                    'working_round_started', 'working_round_converged',
+                    'working_round_started', 'working_round_converged', 'working_round_non_converged',
                     'lifecycle_converged', 'lifecycle_non_converged',
+                    'mechanical_validation_passed', 'mechanical_validation_failed',
                     'lifecycle_terminated', 'human_disposition_recorded',
                     'head_changed', 'writer_delta_validated',
                     'host_commit_created', 'publication_started',
@@ -469,6 +475,13 @@ MIGRATIONS = (
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
                 state TEXT NOT NULL CHECK (state IN ('RUNNING', 'ACCEPTED', 'NON_CONVERGED')),
                 terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('SUCCESSFUL', 'NON_CONVERGED')),
+                convergence_status TEXT NOT NULL DEFAULT 'NOT_RECORDED' CHECK (convergence_status IN ('NOT_RECORDED', 'RECORDED')),
+                convergence_head TEXT,
+                convergence_at TEXT,
+                mechanical_validation_status TEXT NOT NULL DEFAULT 'NOT_RUN' CHECK (mechanical_validation_status IN ('NOT_RUN', 'PASSED', 'FAILED')),
+                mechanical_validation_head TEXT,
+                mechanical_validation_at TEXT,
+                mechanical_validation_evidence_json TEXT,
                 mechanical_acceptance TEXT NOT NULL DEFAULT 'NOT_REACHED' CHECK (mechanical_acceptance IN ('NOT_REACHED', 'ACCEPTED')),
                 mechanical_acceptance_head TEXT,
                 mechanical_acceptance_at TEXT,
@@ -479,8 +492,12 @@ MIGRATIONS = (
                 UNIQUE (task_id, ordinal),
                 CHECK ((state = 'RUNNING' AND terminal_outcome IS NULL AND ended_at IS NULL) OR
                        (state <> 'RUNNING' AND terminal_outcome IS NOT NULL AND ended_at IS NOT NULL)),
+                CHECK ((convergence_status = 'NOT_RECORDED' AND convergence_head IS NULL AND convergence_at IS NULL) OR
+                       (convergence_status = 'RECORDED' AND convergence_head IS NOT NULL AND convergence_at IS NOT NULL)),
+                CHECK ((mechanical_validation_status = 'NOT_RUN' AND mechanical_validation_head IS NULL AND mechanical_validation_at IS NULL AND mechanical_validation_evidence_json IS NULL) OR
+                       (mechanical_validation_status IN ('PASSED', 'FAILED') AND mechanical_validation_head IS NOT NULL AND mechanical_validation_at IS NOT NULL AND mechanical_validation_evidence_json IS NOT NULL AND json_valid(mechanical_validation_evidence_json))),
                 CHECK ((mechanical_acceptance = 'NOT_REACHED' AND mechanical_acceptance_head IS NULL AND mechanical_acceptance_at IS NULL) OR
-                       (mechanical_acceptance = 'ACCEPTED' AND mechanical_acceptance_head IS NOT NULL AND mechanical_acceptance_at IS NOT NULL)),
+                       (mechanical_acceptance = 'ACCEPTED' AND mechanical_acceptance_head IS NOT NULL AND mechanical_acceptance_at IS NOT NULL AND mechanical_validation_status = 'PASSED')),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE RESTRICT
             )
             """,
@@ -525,7 +542,7 @@ MIGRATIONS = (
                 working_round_id TEXT,
                 planning_attempt_id TEXT,
                 role TEXT NOT NULL CHECK (role IN ('PROJECT-MANAGER', 'PLANNER', 'IMPLEMENTER', 'REVIEWER', 'ADVERSARY', 'ARCHIVIST')),
-                status TEXT NOT NULL CHECK (status IN ('AUTHORIZED', 'CONSUMED', 'REJECTED')),
+                status TEXT NOT NULL CHECK (status IN ('AUTHORIZED', 'RUNNING', 'CONSUMED', 'REJECTED')),
                 expected_starting_head TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 consumed_at TEXT,
@@ -559,11 +576,15 @@ MIGRATIONS = (
                 role_run_id TEXT NOT NULL,
                 runtime_execution_id TEXT NOT NULL,
                 observed_role TEXT NOT NULL CHECK (observed_role IN ('PROJECT-MANAGER', 'PLANNER', 'IMPLEMENTER', 'REVIEWER', 'ADVERSARY', 'ARCHIVIST')),
+                status TEXT NOT NULL CHECK (status IN ('running', 'finished', 'failed', 'blocked')),
                 started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
+                finished_at TEXT,
                 receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
                 UNIQUE (id, task_id),
+                UNIQUE (runtime_execution_id, task_id),
                 UNIQUE (role_run_id, task_id),
+                CHECK ((status = 'running' AND finished_at IS NULL) OR
+                       (status IN ('finished', 'failed', 'blocked') AND finished_at IS NOT NULL)),
                 FOREIGN KEY (dispatch_id, task_id) REFERENCES role_dispatches(id, task_id) ON DELETE RESTRICT,
                 FOREIGN KEY (role_run_id, task_id) REFERENCES role_runs(id, task_id) ON DELETE RESTRICT,
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE RESTRICT
@@ -638,12 +659,12 @@ EXPECTED_TABLE_COLUMNS = {
         "task_id", "project_slug", "quota_id", "reserved_bytes", "reserved_inodes",
         "status", "created_at", "released_at",
     },
-    "lifecycles": {"id", "task_id", "ordinal", "state", "terminal_outcome", "mechanical_acceptance", "mechanical_acceptance_head", "mechanical_acceptance_at", "max_working_rounds", "started_at", "ended_at"},
+    "lifecycles": {"id", "task_id", "ordinal", "state", "terminal_outcome", "convergence_status", "convergence_head", "convergence_at", "mechanical_validation_status", "mechanical_validation_head", "mechanical_validation_at", "mechanical_validation_evidence_json", "mechanical_acceptance", "mechanical_acceptance_head", "mechanical_acceptance_at", "max_working_rounds", "started_at", "ended_at"},
     "working_rounds": {"id", "task_id", "lifecycle_id", "ordinal", "state", "max_planning_attempts", "started_at", "ended_at"},
     "planning_attempts": {"id", "task_id", "lifecycle_id", "working_round_id", "ordinal", "state", "started_at", "ended_at"},
     "role_dispatches": {"id", "task_id", "lifecycle_id", "working_round_id", "planning_attempt_id", "role", "status", "expected_starting_head", "created_at", "consumed_at"},
     "capability_grants": {"id", "task_id", "dispatch_id", "role", "read_scopes_json", "write_scopes_json", "issued_at"},
-    "execution_evidence": {"id", "task_id", "dispatch_id", "role_run_id", "runtime_execution_id", "observed_role", "started_at", "finished_at", "receipt_json"},
+    "execution_evidence": {"id", "task_id", "dispatch_id", "role_run_id", "runtime_execution_id", "observed_role", "status", "started_at", "finished_at", "receipt_json"},
     "writer_deltas": {"id", "task_id", "role_run_id", "capability_grant_id", "changed_paths_json", "authorization_status", "workspace_head", "commit_sha", "dirty", "observed_at"},
     "human_dispositions": {"id", "task_id", "lifecycle_id", "decision", "detail", "created_at"},
 }
@@ -686,7 +707,7 @@ EXPECTED_UNIQUE_INDEX_COLUMNS = {
     "planning_attempts": {("id",), ("id", "task_id"), ("working_round_id", "ordinal")},
     "role_dispatches": {("id",), ("id", "task_id")},
     "capability_grants": {("id",), ("id", "task_id"), ("dispatch_id", "task_id")},
-    "execution_evidence": {("id",), ("id", "task_id"), ("role_run_id", "task_id")},
+    "execution_evidence": {("id",), ("id", "task_id"), ("runtime_execution_id", "task_id"), ("role_run_id", "task_id")},
     "writer_deltas": {("id",), ("id", "task_id")},
     "human_dispositions": {("id",)},
 }
@@ -1621,6 +1642,27 @@ class ControlPlaneDatabase:
             self._insert_event(str(lifecycle["task_id"]), "working_round_started", {"lifecycle_id": lifecycle_id, "working_round_id": round_id, "ordinal": ordinal}, occurred_at=timestamp)
         return dict(self.connection.execute("SELECT * FROM working_rounds WHERE id = ?", (round_id,)).fetchone())
 
+    def terminate_working_round_non_converged(
+        self, working_round_id: str | uuid.UUID, *, ended_at: str | None = None,
+    ) -> dict[str, object]:
+        """Close a planning round that exhausted its bounded attempts."""
+        working_round_id = _uuid(working_round_id, "working_round_id")
+        timestamp = _timestamp(ended_at, "ended_at")
+        with self._transaction():
+            working = _row(self.connection.execute("SELECT * FROM working_rounds WHERE id = ?", (working_round_id,)).fetchone())
+            if working is None or working["state"] != "PLANNING":
+                raise StateConflict("only a planning round may terminate non-converged")
+            self.connection.execute(
+                "UPDATE working_rounds SET state = 'NON_CONVERGED', ended_at = ? WHERE id = ?",
+                (timestamp, working_round_id),
+            )
+            self._insert_event(
+                str(working["task_id"]), "working_round_non_converged",
+                {"lifecycle_id": working["lifecycle_id"], "working_round_id": working_round_id},
+                occurred_at=timestamp,
+            )
+        return dict(self.connection.execute("SELECT * FROM working_rounds WHERE id = ?", (working_round_id,)).fetchone())
+
     def start_planning_attempt(self, working_round_id: str | uuid.UUID, *, started_at: str | None = None) -> dict[str, object]:
         working_round_id = _uuid(working_round_id, "working_round_id")
         timestamp = _timestamp(started_at, "started_at")
@@ -1635,6 +1677,57 @@ class ControlPlaneDatabase:
             self.connection.execute("INSERT INTO planning_attempts(id, task_id, lifecycle_id, working_round_id, ordinal, state, started_at, ended_at) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, NULL)", (attempt_id, current["task_id"], current["lifecycle_id"], working_round_id, ordinal, timestamp))
         return dict(self.connection.execute("SELECT * FROM planning_attempts WHERE id = ?", (attempt_id,)).fetchone())
 
+    def record_mechanical_validation(
+        self,
+        lifecycle_id: str | uuid.UUID,
+        *,
+        head_sha: str,
+        passed: bool,
+        evidence: dict[str, object],
+        validated_at: str | None = None,
+    ) -> dict[str, object]:
+        """Record the required Pilot-controlled validation after PM convergence."""
+        lifecycle_id = _uuid(lifecycle_id, "lifecycle_id")
+        head_sha = _sha(head_sha, "head_sha", required=True)
+        if not isinstance(passed, bool):
+            raise ValueError("mechanical validation result must be boolean")
+        if not isinstance(evidence, dict) or not evidence:
+            raise ValueError("mechanical validation evidence must be a non-empty object")
+        timestamp = _timestamp(validated_at, "validated_at")
+        validation_status = "PASSED" if passed else "FAILED"
+        with self._transaction():
+            lifecycle = _row(self.connection.execute("SELECT * FROM lifecycles WHERE id = ?", (lifecycle_id,)).fetchone())
+            if lifecycle is None or lifecycle["state"] != "RUNNING":
+                raise StateConflict("mechanical validation requires a running lifecycle")
+            if lifecycle["convergence_status"] != "RECORDED" or lifecycle["convergence_head"] != head_sha:
+                raise StateConflict("mechanical validation requires the exact recorded convergence head")
+            task = self.read_task(str(lifecycle["task_id"]))
+            if task["current_head"] != head_sha:
+                raise StateConflict("mechanical validation head differs from the authoritative task head")
+            existing = lifecycle["mechanical_validation_status"]
+            if existing == "PASSED":
+                if not passed or lifecycle["mechanical_validation_head"] != head_sha:
+                    raise StateConflict("a passed mechanical validation cannot be rewritten")
+                return lifecycle
+            self.connection.execute(
+                "UPDATE lifecycles SET mechanical_validation_status = ?, mechanical_validation_head = ?, "
+                "mechanical_validation_at = ?, mechanical_validation_evidence_json = ?, "
+                "mechanical_acceptance = ?, mechanical_acceptance_head = ?, mechanical_acceptance_at = ? "
+                "WHERE id = ?",
+                (validation_status, head_sha, timestamp, _payload(evidence),
+                 "ACCEPTED" if passed else "NOT_REACHED", head_sha if passed else None,
+                 timestamp if passed else None, lifecycle_id),
+            )
+            self._insert_event(
+                str(lifecycle["task_id"]),
+                "mechanical_validation_passed" if passed else "mechanical_validation_failed",
+                {"lifecycle_id": lifecycle_id, "head_sha": head_sha, "evidence": evidence},
+                occurred_at=timestamp,
+            )
+            lifecycle = _row(self.connection.execute("SELECT * FROM lifecycles WHERE id = ?", (lifecycle_id,)).fetchone())
+        assert lifecycle is not None
+        return lifecycle
+
     def authorize_dispatch(
         self,
         task_id: str | uuid.UUID,
@@ -1646,6 +1739,8 @@ class ControlPlaneDatabase:
         expected_starting_head: str,
         read_scopes: Sequence[str],
         write_scopes: Sequence[str],
+        registered_artifact_scopes: Sequence[str] = (),
+        protected_artifact_scopes: Sequence[str] = (),
         created_at: str | None = None,
     ) -> dict[str, object]:
         """Issue one exact grant; Runtime cannot add scope or choose a role."""
@@ -1657,25 +1752,26 @@ class ControlPlaneDatabase:
         expected_starting_head = _sha(expected_starting_head, "expected_starting_head", required=True)
         read_scopes = tuple(_text(str(path), "read scope") for path in read_scopes)
         write_scopes = tuple(_text(str(path), "write scope") for path in write_scopes)
+        registered_artifact_scopes = tuple(_text(str(path), "registered artifact scope") for path in registered_artifact_scopes)
+        protected_artifact_scopes = tuple(_text(str(path), "protected artifact scope") for path in protected_artifact_scopes)
         if role in {"PROJECT-MANAGER", "REVIEWER", "ADVERSARY"} and write_scopes:
             raise StateConflict(f"{role} is non-writing")
         if role in {"PLANNER", "IMPLEMENTER", "ARCHIVIST"} and not write_scopes:
             raise StateConflict(f"{role} requires an explicit bounded writer grant")
         if any(path == ".git" or path.startswith(".git/") for path in (*read_scopes, *write_scopes)):
             raise StateConflict("role grants may not include Git metadata")
-        bounded_writer_roots = {
-            "PLANNER": (".symphony/plan", ".symphony/decision-memory"),
-            "ARCHIVIST": (".symphony/archive",),
-        }
-        if role in bounded_writer_roots and any(
-            not any(path == root or path.startswith(root + "/") for root in bounded_writer_roots[role])
+        if role in {"PLANNER", "ARCHIVIST"} and not registered_artifact_scopes:
+            raise StateConflict(f"{role} requires registered project harness-artifact scopes")
+        if role in {"PLANNER", "ARCHIVIST"} and any(
+            not any(path == root or path.startswith(root + "/") for root in registered_artifact_scopes)
             for path in write_scopes
         ):
-            raise StateConflict(f"{role} grant exceeds its bounded harness-artifact authority")
+            raise StateConflict(f"{role} grant exceeds registered project harness-artifact scopes")
         if role == "IMPLEMENTER" and any(
-            path == ".symphony" or path.startswith(".symphony/") for path in write_scopes
+            any(path == root or path.startswith(root + "/") for root in protected_artifact_scopes)
+            for path in write_scopes
         ):
-            raise StateConflict("IMPLEMENTER grant may not write Planner or Archivist harness artifacts")
+            raise StateConflict("IMPLEMENTER grant overlaps a registered Planner or Archivist artifact scope")
         timestamp = _timestamp(created_at, "created_at")
         dispatch_id, grant_id = str(uuid.uuid4()), str(uuid.uuid4())
         with self._transaction():
@@ -1685,40 +1781,87 @@ class ControlPlaneDatabase:
             self._insert_event(task_id, "dispatch_authorized", {"dispatch_id": dispatch_id, "grant_id": grant_id, "role": role}, occurred_at=timestamp)
         return {"dispatch": dict(self.connection.execute("SELECT * FROM role_dispatches WHERE id = ?", (dispatch_id,)).fetchone()), "grant": dict(self.connection.execute("SELECT * FROM capability_grants WHERE id = ?", (grant_id,)).fetchone())}
 
-    def record_execution_evidence(
+    def record_execution_started(
         self,
         dispatch_id: str | uuid.UUID,
         evidence: dict[str, object],
         *,
         role_run_id: str | uuid.UUID | None = None,
     ) -> dict[str, object]:
-        """Create a role run only from retained, identity-bound Runtime evidence."""
+        """Materialize an active role run only from retained launch evidence."""
         dispatch_id = _uuid(dispatch_id, "dispatch_id")
-        if not isinstance(evidence, dict) or not evidence.get("runtime_execution_id"):
-            raise StateConflict("retained Runtime execution evidence is required")
-        if evidence.get("status") not in ROLE_RUN_STATUSES:
-            raise StateConflict("retained Runtime execution status is not a role-run status")
         role_run_id = _uuid(role_run_id, "role_run_id")
-        evidence_id = str(uuid.uuid4())
-        timestamp = _timestamp(str(evidence.get("finished_at")), "finished_at")
+        if not isinstance(evidence, dict) or evidence.get("status") != "running" or not evidence.get("runtime_execution_id"):
+            raise StateConflict("retained running launch evidence is required")
         started = _timestamp(str(evidence.get("started_at")), "started_at")
+        evidence_id = str(uuid.uuid4())
         with self._transaction():
             dispatch = _row(self.connection.execute("SELECT * FROM role_dispatches WHERE id = ?", (dispatch_id,)).fetchone())
             if dispatch is None or dispatch["status"] != "AUTHORIZED":
-                raise StateConflict("dispatch is not authorized or has already been consumed")
+                raise StateConflict("dispatch is not authorized or has already started")
             observed_role = evidence.get("observed_role")
-            if observed_role != dispatch["role"] or evidence.get("task_id") != dispatch["task_id"]:
-                raise StateConflict("execution evidence is bound to a different role or task")
+            if (observed_role != dispatch["role"] or evidence.get("task_id") != dispatch["task_id"] or
+                    evidence.get("dispatch_id") != dispatch_id or
+                    evidence.get("starting_head") != dispatch["expected_starting_head"]):
+                raise StateConflict("launch evidence is bound to a different role, task, or dispatch")
             round_row = self.connection.execute("SELECT ordinal FROM working_rounds WHERE id = ?", (dispatch["working_round_id"],)).fetchone()
             grant_row = self.connection.execute("SELECT id FROM capability_grants WHERE dispatch_id = ?", (dispatch_id,)).fetchone()
             if grant_row is None:
                 raise StateConflict("dispatch has no capability grant")
-            self.connection.execute("INSERT INTO role_runs(id, task_id, role, working_round_number, lifecycle_id, working_round_id, planning_attempt_id, dispatch_id, execution_evidence_id, capability_grant_id, head_sha, status, started_at, finished_at, result_summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)", (role_run_id, dispatch["task_id"], dispatch["role"], int(round_row[0]) if round_row else 1, dispatch["lifecycle_id"], dispatch["working_round_id"], dispatch["planning_attempt_id"], dispatch_id, grant_row[0], _sha(str(evidence.get("head_sha")), "head_sha") if evidence.get("head_sha") else None, str(evidence.get("status", "finished")), started, timestamp, str(evidence.get("summary", ""))[:12000]))
-            self.connection.execute("INSERT INTO execution_evidence(id, task_id, dispatch_id, role_run_id, runtime_execution_id, observed_role, started_at, finished_at, receipt_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (evidence_id, dispatch["task_id"], dispatch_id, role_run_id, str(evidence["runtime_execution_id"]), observed_role, started, timestamp, _payload(evidence)))
-            self.connection.execute("UPDATE role_runs SET execution_evidence_id = ? WHERE id = ?", (evidence_id, role_run_id))
-            self.connection.execute("UPDATE role_dispatches SET status = 'CONSUMED', consumed_at = ? WHERE id = ?", (timestamp, dispatch_id))
-            self._insert_event(str(dispatch["task_id"]), "execution_observed", {"dispatch_id": dispatch_id, "role_run_id": role_run_id, "evidence_id": evidence_id, "role": observed_role}, role_run_id=role_run_id, occurred_at=timestamp)
+            self.connection.execute(
+                "INSERT INTO role_runs(id, task_id, role, working_round_number, lifecycle_id, working_round_id, planning_attempt_id, dispatch_id, execution_evidence_id, capability_grant_id, head_sha, status, started_at, finished_at, result_summary) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, NULL, NULL)",
+                (role_run_id, dispatch["task_id"], dispatch["role"], int(round_row[0]) if round_row else 1,
+                 dispatch["lifecycle_id"], dispatch["working_round_id"], dispatch["planning_attempt_id"],
+                 dispatch_id, evidence_id, grant_row[0], _sha(str(evidence.get("head_sha")), "head_sha") if evidence.get("head_sha") else None, started),
+            )
+            self.connection.execute(
+                "INSERT INTO execution_evidence(id, task_id, dispatch_id, role_run_id, runtime_execution_id, observed_role, status, started_at, finished_at, receipt_json) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, NULL, ?)",
+                (evidence_id, dispatch["task_id"], dispatch_id, role_run_id, str(evidence["runtime_execution_id"]), observed_role, started, _payload(evidence)),
+            )
+            self.connection.execute("UPDATE role_dispatches SET status = 'RUNNING' WHERE id = ?", (dispatch_id,))
+            self._insert_event(str(dispatch["task_id"]), "execution_started", {"dispatch_id": dispatch_id, "role_run_id": role_run_id, "evidence_id": evidence_id, "role": observed_role}, role_run_id=role_run_id, occurred_at=started)
         return self.read_role_run(role_run_id)
+
+    def record_execution_termination(
+        self,
+        dispatch_id: str | uuid.UUID,
+        evidence: dict[str, object],
+    ) -> dict[str, object]:
+        """Complete the same role run that Pilot previously observed starting."""
+        dispatch_id = _uuid(dispatch_id, "dispatch_id")
+        if not isinstance(evidence, dict) or evidence.get("status") not in {"finished", "failed", "blocked"}:
+            raise StateConflict("retained terminal execution evidence is required")
+        finished = _timestamp(str(evidence.get("finished_at")), "finished_at")
+        with self._transaction():
+            dispatch = _row(self.connection.execute("SELECT * FROM role_dispatches WHERE id = ?", (dispatch_id,)).fetchone())
+            if dispatch is None or dispatch["status"] != "RUNNING":
+                raise StateConflict("terminal evidence has no active Pilot execution")
+            retained = _row(self.connection.execute("SELECT * FROM execution_evidence WHERE dispatch_id = ? AND status = 'running'", (dispatch_id,)).fetchone())
+            if retained is None:
+                raise StateConflict("terminal evidence has no retained launch evidence")
+            try:
+                launch_evidence = json.loads(str(retained["receipt_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StateConflict("retained launch evidence is malformed") from exc
+            if (evidence.get("runtime_execution_id") != retained["runtime_execution_id"] or
+                    evidence.get("task_id") != dispatch["task_id"] or
+                    evidence.get("dispatch_id") != dispatch_id or
+                    evidence.get("observed_role") != dispatch["role"] or
+                    evidence.get("starting_head") != dispatch["expected_starting_head"] or
+                    evidence.get("started_at") != launch_evidence.get("started_at")):
+                raise StateConflict("terminal evidence is not bound to the retained launch")
+            self.connection.execute(
+                "UPDATE execution_evidence SET status = ?, finished_at = ?, receipt_json = ? WHERE id = ?",
+                (evidence["status"], finished, _payload(evidence), retained["id"]),
+            )
+            self.connection.execute(
+                "UPDATE role_runs SET status = ?, finished_at = ?, head_sha = ?, result_summary = ? WHERE id = ?",
+                (evidence["status"], finished, _sha(str(evidence.get("head_sha")), "head_sha", required=True), str(evidence.get("summary", ""))[:12000], retained["role_run_id"]),
+            )
+            self.connection.execute("UPDATE role_dispatches SET status = 'CONSUMED', consumed_at = ? WHERE id = ?", (finished, dispatch_id))
+            self._insert_event(str(dispatch["task_id"]), "execution_terminated", {"dispatch_id": dispatch_id, "role_run_id": retained["role_run_id"], "evidence_id": retained["id"], "role": dispatch["role"], "status": evidence["status"]}, role_run_id=retained["role_run_id"], occurred_at=finished)
+        return self.read_role_run(str(retained["role_run_id"]))
 
     def read_role_run(self, run_id: str | uuid.UUID) -> dict[str, object]:
         run_id = _uuid(run_id, "role_run_id")
@@ -2260,11 +2403,15 @@ class ControlPlaneDatabase:
         pending_dispatch = self.connection.execute(
             "SELECT * FROM role_dispatches WHERE task_id = ? AND status = 'AUTHORIZED' ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)
         ).fetchone()
+        active_execution = self.connection.execute(
+            "SELECT * FROM role_runs WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC, id DESC LIMIT 1", (task_id,)
+        ).fetchone()
         return {
             "task": self.read_task(task_id),
             "lifecycle": _row(lifecycle),
             "expected_next_role": pending_dispatch["role"] if pending_dispatch else None,
             "expected_dispatch": _row(pending_dispatch),
+            "active_execution": _row(active_execution),
             "lifecycles": [dict(row) for row in self.connection.execute("SELECT * FROM lifecycles WHERE task_id = ? ORDER BY ordinal", (task_id,)).fetchall()],
             "working_rounds": [dict(row) for row in self.connection.execute("SELECT * FROM working_rounds WHERE task_id = ? ORDER BY lifecycle_id, ordinal", (task_id,)).fetchall()],
             "planning_attempts": [dict(row) for row in self.connection.execute("SELECT * FROM planning_attempts WHERE task_id = ? ORDER BY lifecycle_id, working_round_id, ordinal", (task_id,)).fetchall()],

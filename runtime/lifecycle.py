@@ -130,7 +130,13 @@ def _git(workspace: pathlib.Path, *args: str) -> str:
 
 def _working_tree_paths(workspace: pathlib.Path) -> list[str]:
     """Return the exact host-observed changed paths, including untracked files."""
-    status = _git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+    result = run_git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        raise LifecycleError(f"Git status verification failed: {detail[:240]}")
+    # Preserve the porcelain status columns' leading spaces; ``str.strip``
+    # would shift the path one character to the right.
+    status = result.stdout.rstrip("\r\n")
     paths: list[str] = []
     for line in status.splitlines():
         if len(line) < 4:
@@ -174,10 +180,21 @@ def broker_writer_delta(
         result = run_git(workspace, "add", "--all", "--", *observed)
         if result.returncode:
             raise LifecycleError("host Git broker could not stage the exact writer delta")
-        result = run_git(workspace, "commit", "-m", f"Symphony: {role.lower()} authorized delta")
+        result = run_git(
+            workspace,
+            "-c", "user.name=Symphony Agent",
+            "-c", "user.email=symphony@localhost",
+            "commit", "-m", f"Symphony: {role.lower()} authorized delta",
+        )
         if result.returncode:
             raise LifecycleError("host Git broker could not create the writer commit")
     after = _git(workspace, "rev-parse", "HEAD")
+    if observed and after == before:
+        raise LifecycleError("host writer brokerage did not create a new commit")
+    if observed:
+        identity = _git(workspace, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", after).split("\x00")
+        if identity != ["Symphony Agent", "symphony@localhost", "Symphony Agent", "symphony@localhost"]:
+            raise LifecycleError("host writer commit identity is not the deterministic Symphony Agent")
     if _working_tree_paths(workspace):
         raise LifecycleError("workspace remains dirty after host writer brokerage")
     return {"changed_paths": observed, "workspace_head": after, "commit_sha": after if observed else None, "previous_head": before, "dirty": False}
@@ -211,6 +228,17 @@ def _latest_run(database: ControlPlaneDatabase, task_id: str, role: str | None =
 def _run_packet(database: ControlPlaneDatabase, run: dict[str, object] | None) -> dict[str, object]:
     if not run or not run.get("execution_evidence_id"):
         return {}
+    row = database.connection.execute(
+        "SELECT receipt_json FROM execution_evidence WHERE id = ?",
+        (run["execution_evidence_id"],),
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        evidence = json.loads(str(row[0]))
+        return evidence.get("result", {}) if isinstance(evidence, dict) and isinstance(evidence.get("result"), dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
 
 
 def _licensed_run(database: ControlPlaneDatabase, run: object) -> dict[str, object] | None:
@@ -226,14 +254,6 @@ def _licensed_run(database: ControlPlaneDatabase, run: object) -> dict[str, obje
         if delta is None or delta["authorization_status"] != "ACCEPTED":
             raise AllocationConflict("a writer execution without an accepted host delta cannot license the next transition")
     return run
-    row = database.connection.execute("SELECT receipt_json FROM execution_evidence WHERE id = ?", (run["execution_evidence_id"],)).fetchone()
-    if not row:
-        return {}
-    try:
-        evidence = json.loads(str(row[0]))
-        return evidence.get("result", {}) if isinstance(evidence, dict) and isinstance(evidence.get("result"), dict) else {}
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
 
 
 def _current_context(database: ControlPlaneDatabase, task_id: str) -> tuple[dict[str, object] | None, dict[str, object] | None, dict[str, object] | None]:
@@ -269,6 +289,8 @@ def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple
         packet = _run_packet(database, dict(reviewer))
         if packet.get("verdict") == "correction_required":
             if int(attempt["ordinal"]) >= 3:
+                if int(working["ordinal"]) >= 8:
+                    return "ARCHIVIST", lifecycle, working, attempt
                 return "PLANNER", lifecycle, None, None
             return "PLANNER", lifecycle, working, None
         if packet.get("verdict") not in {"accepted", "pass", "approved"}:
@@ -283,6 +305,8 @@ def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple
     if working["state"] == "ADVERSARIAL":
         return "PROJECT-MANAGER", lifecycle, working, attempt
     if working["state"] == "CONVERGED":
+        if lifecycle["mechanical_acceptance"] != "ACCEPTED":
+            raise AllocationConflict("PM convergence is recorded; Pilot mechanical validation is still required")
         return "ARCHIVIST", lifecycle, working, attempt
     if working["state"] == "NON_CONVERGED":
         if int(working["ordinal"]) >= 8:
@@ -291,11 +315,11 @@ def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple
     return None, lifecycle, working, attempt
 
 
-def _writer_scopes(role: str, packet: dict[str, object] | None) -> list[str]:
+def _writer_scopes(profile: Profile, role: str, packet: dict[str, object] | None) -> list[str]:
     if role == "PLANNER":
-        return [".symphony/plan", ".symphony/decision-memory"]
+        return list(profile.harness_artifacts.planner)
     if role == "ARCHIVIST":
-        return [".symphony/archive"]
+        return list(profile.harness_artifacts.archivist)
     if role == "IMPLEMENTER":
         paths = packet.get("authorized_write_paths") if isinstance(packet, dict) else None
         return _validate_relative_paths(paths)
@@ -327,7 +351,7 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
     try:
         with ControlPlaneDatabase.open(control_database_path(profile)) as database:
             task = database.read_task(facts.task_uuid)
-            if database.connection.execute("SELECT 1 FROM role_dispatches WHERE task_id = ? AND status = 'AUTHORIZED' LIMIT 1", (task["id"],)).fetchone():
+            if database.connection.execute("SELECT 1 FROM role_dispatches WHERE task_id = ? AND status IN ('AUTHORIZED', 'RUNNING') LIMIT 1", (task["id"],)).fetchone():
                 raise AllocationConflict("an authorized dispatch is awaiting Runtime evidence")
             role, lifecycle, working, attempt = _next_role(database, task)
             if role is None and lifecycle and lifecycle["state"] == "NON_CONVERGED":
@@ -347,20 +371,41 @@ def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, obje
             elif working is None:
                 prior = database.connection.execute("SELECT * FROM working_rounds WHERE lifecycle_id = ? ORDER BY ordinal DESC LIMIT 1", (lifecycle["id"],)).fetchone()
                 if prior is not None and prior["state"] == "PLANNING":
-                    database.connection.execute("UPDATE working_rounds SET state = 'NON_CONVERGED', ended_at = ? WHERE id = ?", (_now(), prior["id"]))
+                    database.terminate_working_round_non_converged(str(prior["id"]))
                 working = database.start_working_round(str(lifecycle["id"]))
                 attempt = database.start_planning_attempt(str(working["id"]))
             elif role == "PLANNER" and attempt is None:
                 attempt = database.start_planning_attempt(str(working["id"]))
+            if role == "ARCHIVIST" and working and working["state"] == "PLANNING":
+                if int(working["ordinal"]) != 8:
+                    raise AllocationConflict("Archivist is only eligible after a terminal lifecycle outcome")
+                ended_at = _now()
+                database.terminate_working_round_non_converged(str(working["id"]), ended_at=ended_at)
+                database._insert_event(
+                    str(task["id"]), "lifecycle_non_converged",
+                    {"lifecycle_id": lifecycle["id"], "working_round_id": working["id"], "reason": "planning_attempt_budget_exhausted"},
+                    occurred_at=ended_at,
+                )
+                working = dict(database.connection.execute("SELECT * FROM working_rounds WHERE id = ?", (working["id"],)).fetchone())
             previous = _latest_run(database, str(task["id"]), "PLANNER")
             previous_packet = _run_packet(database, previous)
+            writer_scopes = _writer_scopes(profile, role, previous_packet)
+            registered_scopes = (
+                list(profile.harness_artifacts.planner) if role == "PLANNER" else
+                list(profile.harness_artifacts.archivist) if role == "ARCHIVIST" else []
+            )
             grant = database.authorize_dispatch(
                 str(task["id"]), lifecycle_id=str(lifecycle["id"]),
                 working_round_id=str(working["id"]) if working else None,
                 planning_attempt_id=str(attempt["id"]) if attempt else None,
                 role=role, expected_starting_head=str(task["current_head"] or task["base_sha"]),
-                read_scopes=["project", ".symphony"],
-                write_scopes=_writer_scopes(role, previous_packet),
+                read_scopes=["project", "registered_harness_artifacts"],
+                write_scopes=writer_scopes,
+                registered_artifact_scopes=registered_scopes,
+                protected_artifact_scopes=(
+                    list(profile.harness_artifacts.planner) +
+                    list(profile.harness_artifacts.archivist)
+                ),
             )
             dispatch = grant["dispatch"]
             namespace = lifecycle_root(profile, str(task["identifier"]), str(dispatch["id"]))
@@ -405,18 +450,29 @@ def _read_execution(path: pathlib.Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise LifecycleError("Runtime execution evidence must be an object")
     required = {
-        "runtime_execution_id", "task_id", "dispatch_id", "observed_role", "status",
-        "started_at", "finished_at", "starting_head", "head_sha", "changed_paths", "dirty",
+        "phase", "runtime_execution_id", "task_id", "dispatch_id", "observed_role", "status",
+        "started_at", "starting_head", "head_sha", "changed_paths", "dirty",
     }
     if not required.issubset(value):
         raise LifecycleError("Runtime execution evidence is incomplete")
-    if value["status"] not in {"finished", "failed", "blocked", "cancelled"}:
+    if value["phase"] not in {"started", "terminated"}:
+        raise LifecycleError("Runtime execution evidence phase is invalid")
+    if value["phase"] == "started" and value["status"] != "running":
+        raise LifecycleError("started Runtime evidence must have running status")
+    if value["phase"] == "terminated" and value["status"] not in {"finished", "failed", "blocked", "cancelled"}:
         raise LifecycleError("Runtime execution status is invalid")
+    if value["phase"] == "started" and value.get("finished_at") is not None:
+        raise LifecycleError("started Runtime evidence cannot have terminal time")
+    if value["phase"] == "terminated":
+        if "finished_at" not in value:
+            raise LifecycleError("terminated Runtime evidence requires terminal time")
+        _timestamp(str(value["finished_at"]), "finished_at")
     _bounded_text(value["runtime_execution_id"], "runtime_execution_id", 256)
     if value["observed_role"] not in ROLES:
         raise LifecycleError("Runtime execution role is invalid")
     _timestamp(str(value["started_at"]), "started_at")
-    _timestamp(str(value["finished_at"]), "finished_at")
+    if value["phase"] == "terminated":
+        _timestamp(str(value["finished_at"]), "finished_at")
     if not SHA_RE.fullmatch(str(value["starting_head"])) or not SHA_RE.fullmatch(str(value["head_sha"])):
         raise LifecycleError("Runtime execution HEAD evidence is invalid")
     if not isinstance(value["changed_paths"], list) or len(value["changed_paths"]) > 4096:
@@ -460,7 +516,7 @@ def _record_lifecycle_outcome(
         database.connection.execute("UPDATE working_rounds SET state = 'ADVERSARIAL' WHERE id = ?", (working["id"],))
     elif role == "PROJECT-MANAGER" and outcome == "converged":
         database.connection.execute("UPDATE working_rounds SET state = 'CONVERGED', ended_at = ? WHERE id = ?", (_now(), working["id"]))
-        database.connection.execute("UPDATE lifecycles SET mechanical_acceptance = 'ACCEPTED', mechanical_acceptance_head = ?, mechanical_acceptance_at = ? WHERE id = ? AND state = 'RUNNING'", (actual_head, _now(), lifecycle["id"]))
+        database.connection.execute("UPDATE lifecycles SET convergence_status = 'RECORDED', convergence_head = ?, convergence_at = ? WHERE id = ? AND state = 'RUNNING'", (actual_head, _now(), lifecycle["id"]))
         database._insert_event(str(task["id"]), "working_round_converged", {"working_round_id": working["id"], "head_sha": actual_head})
         database._insert_event(str(task["id"]), "lifecycle_converged", {"lifecycle_id": lifecycle["id"], "head_sha": actual_head})
     elif role == "ARCHIVIST" and outcome in {"archive_complete", "archived"}:
@@ -480,24 +536,29 @@ def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
     facts, _ = local_task_facts(profile, workspace)
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
         task = database.read_task(facts.task_uuid)
-        row = database.connection.execute("SELECT * FROM role_dispatches WHERE task_id = ? AND status = 'AUTHORIZED' ORDER BY created_at DESC, id DESC LIMIT 1", (task["id"],)).fetchone()
+        row = database.connection.execute("SELECT * FROM role_dispatches WHERE task_id = ? AND status IN ('AUTHORIZED', 'RUNNING') ORDER BY created_at DESC, id DESC LIMIT 1", (task["id"],)).fetchone()
         if row is None:
             raise LifecycleError("no authorized Pilot dispatch is awaiting evidence")
         dispatch = dict(row)
         namespace = lifecycle_root(profile, str(task["identifier"]), str(dispatch["id"]))
         execution = _read_execution(namespace / "host" / "execution.json")
-        result = read_result(namespace / "outbox" / "result.json")
         if execution.get("task_id") != task["id"] or execution.get("dispatch_id") != dispatch["id"] or execution.get("observed_role") != dispatch["role"]:
             raise LifecycleError("Runtime evidence is not bound to the Pilot dispatch")
         if execution["starting_head"] != dispatch["expected_starting_head"]:
             raise LifecycleError("Runtime execution started from a different HEAD than the Pilot grant")
+        if execution["phase"] == "started":
+            with_start = dict(execution)
+            with_start["dispatch_id"] = dispatch["id"]
+            database.record_execution_started(str(dispatch["id"]), with_start)
+            return database.read_projection(str(task["id"]))
+        result = read_result(namespace / "outbox" / "result.json")
         if result.get("task_id") != task["id"] or result.get("dispatch_id") != dispatch["id"] or result.get("role") != dispatch["role"]:
             raise LifecycleError("role-authored result is not bound to the Pilot dispatch")
         evidence = dict(execution)
         evidence["result"] = result
         if evidence.get("status") == "cancelled":
             evidence["status"] = "failed"
-        run = database.record_execution_evidence(str(dispatch["id"]), evidence)
+        run = database.record_execution_termination(str(dispatch["id"]), evidence)
         lifecycle, working, _ = _current_context(database, str(task["id"]))
         actual_head = str(execution.get("head_sha") or task["current_head"] or task["base_sha"])
         changed_paths = execution["changed_paths"]
@@ -541,10 +602,6 @@ def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
             if kind not in {"human", "project", "infrastructure"}:
                 raise LifecycleError("blocked result has an invalid blocker kind")
             database.record_blocker(task_id=str(task["id"]), kind=str(kind), body=str(result.get("summary") or "role reported a blocker"))
-        if dispatch["role"] == "PROJECT-MANAGER" and result.get("outcome") == "converged":
-            observed_head = verify_git_truth(profile, workspace, task)
-            if observed_head != actual_head or _working_tree_paths(workspace):
-                raise LifecycleError("convergence requires clean mechanically validated workspace evidence")
         if lifecycle and working:
             _record_lifecycle_outcome(database, task, lifecycle, working, str(dispatch["role"]), result, actual_head)
         database.record_event(str(task["id"]), "execution_reconciled", {"role_run_id": run["id"], "dispatch_id": dispatch["id"]}, role_run_id=str(run["id"]))
@@ -556,7 +613,7 @@ def reconcile_orphaned_executions(profile: Profile, *, managed_runtime_stopped: 
     if not managed_runtime_stopped:
         raise LifecycleError("orphan reconciliation requires managed Runtime stop evidence")
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
-        rows = database.connection.execute("SELECT * FROM role_dispatches WHERE status = 'AUTHORIZED' AND task_id IN (SELECT id FROM tasks WHERE project_slug = ?)", (profile.slug,)).fetchall()
+        rows = database.connection.execute("SELECT * FROM role_dispatches WHERE status IN ('AUTHORIZED', 'RUNNING') AND task_id IN (SELECT id FROM tasks WHERE project_slug = ?)", (profile.slug,)).fetchall()
         result = []
         with database._transaction():
             for row in rows:
