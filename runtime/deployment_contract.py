@@ -1,4 +1,4 @@
-"""Bounded source/deployment compatibility identity.
+"""Bounded source/deployment identity.
 
 The deployment contains a snapshot of runtime hooks and policy, but lifecycle
 authority remains in the source checkout. This digest covers source modules
@@ -17,9 +17,6 @@ ROLE_POLICY_FILES = tuple(
     f"workflow/agents/{name}.toml"
     for name in ("adversary", "archivist", "implementer", "planner", "project-manager", "reviewer")
 )
-POLICY_FILES = ("workflow/architect_policy.md", *ROLE_POLICY_FILES)
-
-
 CONTRACT_FILES = (
     "scripts/deploy.py",
     "scripts/project.py",
@@ -54,7 +51,7 @@ CONTRACT_FILES = (
     "scripts/provision_storage_domain.sh",
     "scripts/provision_storage_vhdx.ps1",
     "scripts/recover_storage_after_boot.ps1",
-    *POLICY_FILES,
+    *ROLE_POLICY_FILES,
 )
 
 # Complete runtime snapshot for a Step-6 deployment. Publication remains

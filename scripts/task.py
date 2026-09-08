@@ -225,23 +225,29 @@ def resolve_blocker(args: argparse.Namespace) -> int:
     return 0
 
 
-def fail_attempt(args: argparse.Namespace) -> int:
-    from lifecycle import fail_attempt as fail_stale_attempt
-
-    profile = _profile(args.project)
-    selector_kind, selector = _task_selector(args.task)
-    with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
-        task = _read_project_task(database, profile, selector_kind, selector)
-    if not fail_stale_attempt(profile, str(task["id"]), detail="operator failed stale Architect attempt"):
-        raise TaskCommandError("the selected task has no single started Architect attempt")
-    _emit({"task_uuid": task["id"], "status": "failed", "blocker": "infrastructure"})
-    return 0
-
-
 def list_tasks(args: argparse.Namespace) -> int:
     profile = _profile(args.project)
     with ControlPlaneDatabase.open_readonly(default_database_path()) as database:
         _emit(database.list_tasks(project_slug=profile.slug))
+    return 0
+
+
+def dispose(args: argparse.Namespace) -> int:
+    """Record the human decision that may reopen a later lifecycle."""
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    if not UUID_RE.fullmatch(args.lifecycle):
+        raise TaskCommandError("--lifecycle must be a canonical lowercase UUID")
+    with ControlPlaneDatabase.open(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+        lifecycle = database.connection.execute(
+            "SELECT task_id FROM lifecycles WHERE id = ?", (args.lifecycle,)
+        ).fetchone()
+        if lifecycle is None or lifecycle["task_id"] != task["id"]:
+            raise TaskCommandError("lifecycle is not owned by the selected task")
+        _emit(database.record_human_disposition(
+            args.lifecycle, decision=args.decision, detail=args.detail,
+        ))
     return 0
 
 
@@ -299,11 +305,6 @@ def main(argv: list[str] | None = None) -> int:
     resolve_parser.add_argument("--blocker", required=True)
     resolve_parser.set_defaults(handler=resolve_blocker)
 
-    fail_parser = subparsers.add_parser("fail-attempt", help="fail the one stale Architect attempt")
-    fail_parser.add_argument("--project", required=True)
-    fail_parser.add_argument("--task", required=True)
-    fail_parser.set_defaults(handler=fail_attempt)
-
     show_parser = subparsers.add_parser("show", help="show one local task and its projection")
     show_parser.add_argument("--project", required=True)
     show_parser.add_argument("--task", required=True)
@@ -312,6 +313,19 @@ def main(argv: list[str] | None = None) -> int:
     list_parser = subparsers.add_parser("list", help="list local tasks for one project")
     list_parser.add_argument("--project", required=True)
     list_parser.set_defaults(handler=list_tasks)
+
+    dispose_parser = subparsers.add_parser(
+        "dispose", help="record human disposition for a non-converged lifecycle"
+    )
+    dispose_parser.add_argument("--project", required=True)
+    dispose_parser.add_argument("--task", required=True)
+    dispose_parser.add_argument("--lifecycle", required=True)
+    dispose_parser.add_argument(
+        "--decision", required=True,
+        choices=("START_ANOTHER_LIFECYCLE", "HOLD", "CLOSE_TASK"),
+    )
+    dispose_parser.add_argument("--detail", required=True)
+    dispose_parser.set_defaults(handler=dispose)
 
     bind_parser = subparsers.add_parser("bind-publication-key", help="bind the registered GitHub deploy key")
     bind_parser.add_argument("--project", required=True)

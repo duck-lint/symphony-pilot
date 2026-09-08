@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime"))
 from prepare_workspace import Profile, PreparationError, deployment_path, load_profile
 from deployment_contract import (DEPLOYED_OPERATOR_FILES, DEPLOYED_RUNTIME_FILES,
-                                 POLICY_FILES, ROLE_POLICY_FILES,
+                                 ROLE_POLICY_FILES,
                                  contract_digest, deployment_identity)
 from project_registry import resolve_project
 from render_workflow import render
@@ -75,13 +75,12 @@ def deploy(profile_path: pathlib.Path, destination: pathlib.Path | None, dry_run
             shutil.copy2(ROOT / relative, stage / relative)
         for relative in DEPLOYED_OPERATOR_FILES:
             shutil.copy2(ROOT / relative, stage / relative)
-        shutil.copy2(ROOT / POLICY_FILES[0], stage / POLICY_FILES[0])
         for relative in ROLE_POLICY_FILES:
             shutil.copy2(ROOT / relative, stage / relative)
         shutil.copy2(profile_path, stage / "profile.toml")
         (stage / "runtime/launch_codex.sh").chmod(0o755)
         workflow = stage / "projects" / profile.slug / "WORKFLOW.md"
-        workflow.write_text(render(profile, stage, stage / "workflow/architect_policy.md"), encoding="utf-8")
+        workflow.write_text(render(profile, stage), encoding="utf-8")
         files = {path.relative_to(stage).as_posix(): file_digest(path)
                  for path in stage.rglob("*") if path.is_file()}
         profile_sha256 = file_digest(stage / "profile.toml")

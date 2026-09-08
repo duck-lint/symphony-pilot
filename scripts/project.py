@@ -19,7 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLE_POLICY_NAMES = ("project-manager", "planner", "implementer", "reviewer", "adversary", "archivist")
 sys.path.insert(0, str(ROOT / "runtime"))
 from host_integration import AWAKE_STATE, establish_awake_guard, release_awake_guard, release_awake_guard_at
-from lifecycle import LifecycleError, reconcile_orphaned_architect_attempts
+from lifecycle import LifecycleError, reconcile_orphaned_executions
 from process_identity import capture, matches, read
 from prepare_workspace import (
     DASHBOARD_PORT_MAX,
@@ -148,22 +148,6 @@ def _safe_pid(profile):
     return int(identity["pid"]) if identity else None
 
 
-def _issue_id(entry):
-    if not isinstance(entry, dict):
-        return None
-    for key in ("issue_identifier", "issue_number", "identifier", "issue"):
-        value = entry.get(key)
-        if value is not None:
-            return str(value)
-    return None
-
-
-def _active_entries(view):
-    if not isinstance(view, dict):
-        return []
-    return list(view.get("running") or []) + list(view.get("retrying") or [])
-
-
 def _complete_process_stop(state_path, release=None):
     """Remove process bookkeeping only after stop, then reconcile host state."""
     state_path.unlink(missing_ok=True)
@@ -189,7 +173,7 @@ def _stop_process_at(state_path, identity, release=None, after_stopped=None):
             try:
                 after_stopped()
             except Exception as exc:
-                print(f"Symphony stopped, but orphaned Architect reconciliation failed: {exc}")
+                print(f"Symphony stopped, but orphaned execution reconciliation failed: {exc}")
                 return 1
         return _complete_process_stop(state_path, release)
     except (PermissionError, OSError) as exc:
@@ -205,7 +189,7 @@ def _stop_process_at(state_path, identity, release=None, after_stopped=None):
         try:
             after_stopped()
         except Exception as exc:
-            print(f"Symphony stopped, but orphaned Architect reconciliation failed: {exc}")
+            print(f"Symphony stopped, but orphaned execution reconciliation failed: {exc}")
             return 1
     return _complete_process_stop(state_path, release)
 
@@ -213,11 +197,11 @@ def _stop_process_at(state_path, identity, release=None, after_stopped=None):
 def _reconcile_after_managed_stop(profile, identity):
     if _identity_alive(identity):
         raise PreparationError("managed Runtime identity is still alive")
-    repaired = reconcile_orphaned_architect_attempts(profile, managed_runtime_stopped=True)
+    repaired = reconcile_orphaned_executions(profile, managed_runtime_stopped=True)
     for attempt in repaired:
         print(
-            f"Reconciled orphaned Architect attempt {attempt['identifier']} "
-            f"round {attempt['round']} as failed."
+            f"Rejected orphaned execution dispatch {attempt['dispatch_id']} "
+            f"for {attempt['role']}."
         )
 
 
@@ -338,7 +322,7 @@ def project_name(profile):
 
 
 def runtime_environment(root: pathlib.Path, workflow: pathlib.Path) -> dict[str, str]:
-    """Build Runtime's environment without retired tracker credentials."""
+    """Build Runtime's environment without retired scheduler credentials."""
     env = os.environ.copy()
     env["SYMPHONY_PROFILE"] = str(root / "profile.toml")
     env["SYMPHONY_WORKFLOW"] = str(workflow)
@@ -530,7 +514,7 @@ def stop(profile, force=False):
 
 
 def finish(profile):
-    """Drain one pilot issue, then perform the normal stop operation."""
+    """Drain active execution work, then perform the normal stop operation."""
     pid = _safe_pid(profile)
     if pid is None:
         return _report_stopped(profile, "STOPPED")
@@ -538,19 +522,12 @@ def finish(profile):
     if view is None:
         print("Cannot finish safely: authoritative Symphony runtime state is unavailable.")
         return 1
-    initial = {_issue_id(entry) for entry in _active_entries(view)} - {None}
-    if len(initial) > 1:
-        print("Cannot finish safely: more than one issue is active in the one-issue pilot.")
-        return 1
+    initial = bool((view.get("running") or []) or (view.get("retrying") or []))
     if initial:
-        print(f"{project_name(profile)} is finishing; current work will be allowed to finish before Symphony stops.")
+        print(f"{project_name(profile)} is finishing; current execution work will be allowed to finish before Symphony stops.")
     try:
         while True:
-            active = _active_entries(view)
-            current = {_issue_id(entry) for entry in active} - {None}
-            if len(current) > 1 or (initial and current and current != initial):
-                print("Cannot finish safely: a different or additional issue appeared while draining.")
-                return 1
+            active = list(view.get("running") or []) + list(view.get("retrying") or [])
             if not active:
                 break
             time.sleep(max(0.5, profile.poll_interval_ms / 1000))
@@ -576,19 +553,14 @@ def status(profile):
         running_entries = view.get("running") or []
         retrying_entries = view.get("retrying") or []
         state = str(view.get("state") or view.get("status") or "").lower()
-        issue = view.get("issue") or view.get("issue_number") or "?"
-        entries = blocked or running_entries or retrying_entries
-        if entries and isinstance(entries[0], dict):
-            issue = (entries[0].get("issue_identifier") or entries[0].get("issue_number")
-                     or entries[0].get("identifier") or issue)
         if blocked or "human" in state or "blocked" in state:
-            print(f"NEEDS YOU #{issue} - WORK SAFELY PAUSED")
+            print("NEEDS YOU - WORK SAFELY PAUSED")
         elif running_entries or retrying_entries:
-            print(f"WORKING ON #{issue} - DO NOT SHUT DOWN")
+            print("WORKING - DO NOT SHUT DOWN")
         elif "finish" in state or "drain" in state:
-            print(f"FINISHING #{issue} - DO NOT SHUT DOWN YET")
+            print("FINISHING - DO NOT SHUT DOWN YET")
         elif "work" in state or "run" in state:
-            print(f"WORKING ON #{issue} - DO NOT SHUT DOWN")
+            print("WORKING - DO NOT SHUT DOWN")
         else:
             print("IDLE - SAFE TO STOP")
     else:
@@ -668,7 +640,6 @@ REQUIRED_DEPLOYMENT_FILES = (
     "profile.toml",
     *DEPLOYED_RUNTIME_FILES,
     *DEPLOYED_OPERATOR_FILES,
-    "workflow/architect_policy.md",
     "projects/{slug}/WORKFLOW.md",
     "workflow/agents/project-manager.toml",
     "workflow/agents/planner.toml",

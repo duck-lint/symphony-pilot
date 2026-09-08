@@ -2,9 +2,8 @@
   "@context": "https://w3id.org/codemeta/3.1",
   "@type": "SoftwareSourceCode",
   "name": "symphony-pilot",
-  "description": "Trusted host control plane for running the project-owned symphony-runtime against issue-driven software projects with isolated workspaces, project profiles, deployment snapshots, credential boundaries, and operator lifecycle controls.",
+  "description": "Deterministic local control plane for project-owned symphony-runtime executions with isolated workspaces, project profiles, deployment snapshots, credential boundaries, and operator lifecycle controls.",
   "codeRepository": "https://github.com/duck-lint/symphony-pilot",
-  "issueTracker": "https://github.com/duck-lint/symphony-pilot/issues",
   "license": "https://spdx.org/licenses/Apache-2.0",
   "author": {
     "@id": "https://github.com/duck-lint",
@@ -26,7 +25,6 @@
     "Codex",
     "agent orchestration",
     "developer tooling",
-    "issue-driven automation",
     "WSL"
   ],
   "softwareRequirements": [

@@ -8,11 +8,9 @@ agent never provide paths, refs, repositories, or commands.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import pathlib
 import re
 import subprocess
-from typing import Any
 
 from workspace_boundary import WorkspaceBoundaryError, physical_directory, run_git, validate_repository
 
@@ -226,40 +224,3 @@ def missing_receipt(profile, task: dict[str, object]) -> dict[str, object]:
         "change_summary": {"files_changed": None, "insertions": None, "deletions": None, "files": []},
         "diff": {"unified_patch": "Workspace not currently present.", "truncated": False},
     }
-
-
-def persisted_receipt(events: list[dict[str, object]]) -> dict[str, object] | None:
-    """Read the immutable snapshot nested in a trusted lifecycle event."""
-    for event in reversed(events):
-        if event.get("event_type") != "validation_passed":
-            continue
-        try:
-            payload = json.loads(str(event["payload_json"]))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        value = payload.get("execution_receipt") if isinstance(payload, dict) else None
-        if isinstance(value, dict) and value.get("receipt_version") == RECEIPT_VERSION:
-            saved = dict(value)
-            saved["source"] = "persisted"
-            workspace = dict(saved.get("workspace") or {})
-            workspace["exists"] = False
-            workspace["clean"] = None
-            saved["workspace"] = workspace
-            return redact(saved)  # type: ignore[return-value]
-    return None
-
-
-def verify_persisted_receipt(database, task_id: str, event_id: str, receipt: dict[str, object]) -> None:
-    """Verify the just-written immutable event before reconciliation commits."""
-    row = database.connection.execute(
-        "SELECT payload_json FROM task_events WHERE id = ? AND task_id = ?",
-        (event_id, task_id),
-    ).fetchone()
-    if row is None:
-        raise ReceiptError("execution receipt event was not persisted")
-    try:
-        payload: Any = json.loads(row[0])
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ReceiptError("persisted execution receipt payload is malformed") from exc
-    if not isinstance(payload, dict) or payload.get("execution_receipt") != receipt:
-        raise ReceiptError("persisted execution receipt did not verify")

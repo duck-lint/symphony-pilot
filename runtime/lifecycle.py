@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Trusted lifecycle broker for one concrete role execution.
+"""Pilot-owned lifecycle routing and evidence reconciliation.
 
-The dispatch marker is host-authored. Runtime writes an execution receipt only
-after App Server has started a thread and when that thread reaches a terminal
-state. This module binds the role packet to that receipt and only then writes
-the SQLite ``role_runs`` row. A model claim cannot create an execution row.
+Pilot decides eligibility and issues exact grants. Runtime supplies retained
+execution evidence; a role name, packet, or expected position never creates a
+role run. This module contains no external scheduler ontology or
+legacy role topology.
 """
 from __future__ import annotations
 
@@ -17,37 +17,26 @@ import stat
 import uuid
 
 from control_db import ControlPlaneDatabase, ControlPlaneError, StateConflict
-from execution_receipts import ReceiptError, capture_live_receipt, verify_persisted_receipt
 from prepare_workspace import Profile, control_database_path, local_task_facts, require_physical_namespace
-from workspace_boundary import atomic_metadata_write, physical_directory, run_git
+from workspace_boundary import atomic_metadata_write, run_git
 
-RESULT_SCHEMA = "symphony-pilot-lifecycle-result/v1"
-WORKPAD_MARKER = "<!-- symphony-workpad:v1 -->"
-MAX_RESULT_BYTES = 128 * 1024
-MAX_WORKPAD_BYTES = 64 * 1024
-MAX_SUMMARY_BYTES = 12 * 1024
+RESULT_SCHEMA = "symphony-pilot-execution-result/v2"
 TASK_IDENTIFIER_RE = re.compile(r"^T-[0-9]{6}$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SECRET_MARKER_RE = re.compile(r"(?:gh[pousr]_|github_pat_|\bsk-[A-Za-z0-9]|BEGIN [A-Z ]*PRIVATE KEY|Bearer\s+)", re.I)
-ACTIVE_STATES = ("QUEUED", "PLANNED", "IMPLEMENTED", "REVIEW", "ADVERSARIAL_REVIEW", "FINAL_MECHANICAL_ACCEPTANCE")
-ALL_ROLES = {"ARCHITECT", "PROJECT-MANAGER", "PLANNER", "IMPLEMENTER", "REVIEWER", "ADVERSARY", "ARCHIVIST"}
-SPECIALIZED_ROLES = ALL_ROLES - {"ARCHITECT"}
-OUTCOMES = {"role_requested", "role_complete", "planning_complete", "implementation_complete", "review_approved", "adversary_pass", "validation_pass", "archive_complete", "correction_required", "blocked"}
-FINDING_CLASSES = {"licensed correction", "unresolved project decision", "infrastructure condition", "rejected"}
-BLOCKER_KINDS = {None, "human", "project", "infrastructure"}
-FINDING_FIELDS = {"role", "kind", "severity", "body", "classification", "blocker_kind"}
-ROLE_PACKET_FIELDS = {"role", "verdict", "summary", "head_sha", "findings"}
-RESULT_FIELDS = {"schema", "task_uuid", "identifier", "role_run_id", "role", "expected_state", "expected_workpad_version", "expected_starting_head", "workpad_body", "summary", "outcome", "packet", "findings", "requested_resolved_finding_ids", "authorized_write_paths"}
-MAX_AUTHORIZED_WRITE_PATHS = 32
+ROLES = frozenset({"PROJECT-MANAGER", "PLANNER", "IMPLEMENTER", "REVIEWER", "ADVERSARY", "ARCHIVIST"})
+WRITER_ROLES = frozenset({"PLANNER", "IMPLEMENTER", "ARCHIVIST"})
+MAX_RESULT_BYTES = 128 * 1024
+MAX_SUMMARY_BYTES = 12 * 1024
 
 
 class LifecycleError(ControlPlaneError):
-    """A lifecycle result or host lifecycle invariant is invalid."""
+    """A lifecycle packet, grant, or host invariant is invalid."""
 
 
 class AllocationConflict(LifecycleError):
-    """A task already has a pending execution or is not dispatchable."""
+    """A task already has a pending dispatch or is not eligible."""
 
 
 def _now() -> str:
@@ -56,42 +45,38 @@ def _now() -> str:
 
 def _bounded_text(value: object, field: str, maximum: int) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > maximum:
-        raise LifecycleError(f"lifecycle {field} is invalid or exceeds its bound")
+        raise LifecycleError(f"{field} is invalid or exceeds its bound")
     if any(ord(character) < 32 and character not in "\n\t" for character in value):
-        raise LifecycleError(f"lifecycle {field} contains control characters")
+        raise LifecycleError(f"{field} contains control characters")
     if SECRET_MARKER_RE.search(value):
-        raise LifecycleError(f"lifecycle {field} contains a credential marker")
+        raise LifecycleError(f"{field} contains a credential marker")
     return value
 
 
-def lifecycle_root(profile: Profile, identifier: str, run_id: str) -> pathlib.Path:
-    if not TASK_IDENTIFIER_RE.fullmatch(identifier) or not UUID_RE.fullmatch(run_id):
-        raise LifecycleError("lifecycle namespace identity is invalid")
+def lifecycle_root(profile: Profile, identifier: str, dispatch_id: str) -> pathlib.Path:
+    if not TASK_IDENTIFIER_RE.fullmatch(identifier) or not UUID_RE.fullmatch(dispatch_id):
+        raise LifecycleError("dispatch namespace identity is invalid")
     state_root = require_physical_namespace(profile.state_root)
     if state_root.is_symlink() or (state_root.exists() and not state_root.is_dir()):
         raise LifecycleError("lifecycle state root is unsafe")
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_root.chmod(0o700)
-    root = state_root / "lifecycle" / identifier / run_id
+    root = state_root / "lifecycle" / identifier / dispatch_id
     for directory in (state_root / "lifecycle", state_root / "lifecycle" / identifier, root):
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            raise LifecycleError("lifecycle namespace contains an unsafe path component")
+            raise LifecycleError("dispatch namespace contains an unsafe path component")
         directory.mkdir(mode=0o700, exist_ok=True)
         directory.chmod(0o700)
     for name in ("inbox", "outbox", "host"):
         directory = root / name
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            raise LifecycleError("lifecycle namespace contains an unsafe directory")
+            raise LifecycleError("dispatch namespace contains an unsafe directory")
         directory.mkdir(mode=0o700, exist_ok=True)
         directory.chmod(0o700)
     return root
 
 
-def _initial_workpad(task: dict[str, object]) -> str:
-    return "\n".join((WORKPAD_MARKER, "## Symphony Workpad", "", f"- Task: {task['identifier']}", f"- Objective: {task['objective']}", f"- Base: {task['base_ref']} @ {task['base_sha']}", f"- Branch: {task['branch']}", f"- Lifecycle state: {task['state']}", ""))
-
-
-def _read_host_json(path: pathlib.Path, label: str) -> object:
+def _read_json(path: pathlib.Path, label: str) -> object:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -114,7 +99,7 @@ def _read_host_json(path: pathlib.Path, label: str) -> object:
         raise LifecycleError(f"{label} is malformed UTF-8 JSON") from exc
 
 
-def _write_host_json(path: pathlib.Path, value: object) -> None:
+def _write_json(path: pathlib.Path, value: object) -> None:
     atomic_metadata_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
@@ -124,7 +109,7 @@ def _claim_dispatch(workspace: pathlib.Path) -> pathlib.Path:
         descriptor = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.close(descriptor)
     except FileExistsError as exc:
-        raise AllocationConflict("a role dispatch is already pending") from exc
+        raise AllocationConflict("a dispatch is already pending") from exc
     return claim
 
 
@@ -143,13 +128,67 @@ def _git(workspace: pathlib.Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _working_tree_paths(workspace: pathlib.Path) -> list[str]:
+    """Return the exact host-observed changed paths, including untracked files."""
+    status = _git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+    paths: list[str] = []
+    for line in status.splitlines():
+        if len(line) < 4:
+            raise LifecycleError("Git status output is malformed")
+        path = line[3:]
+        if " -> " in path:
+            paths.extend(path.split(" -> ", 1))
+        else:
+            paths.append(path)
+    return sorted(set(paths))
+
+
+def broker_writer_delta(
+    workspace: pathlib.Path,
+    role: str,
+    changed_paths: object,
+    write_scopes: object,
+    *,
+    expected_starting_head: str,
+) -> dict[str, object]:
+    """Stage and commit only the exact delta admitted by the Pilot grant.
+
+    This is host-side mechanics. It does not accept a model-supplied commit,
+    write Git metadata through the role sandbox, or expand a capability grant.
+    """
+    if role not in WRITER_ROLES or not isinstance(changed_paths, list) or not isinstance(write_scopes, list):
+        raise LifecycleError("writer brokerage requires a canonical writer and exact lists")
+    observed = _working_tree_paths(workspace)
+    supplied = sorted(set(str(path) for path in changed_paths))
+    if supplied != observed:
+        raise LifecycleError("Runtime changed-path report differs from host observation")
+    if any(path == ".git" or path.startswith(".git/") for path in observed):
+        raise LifecycleError("writer delta includes Git metadata")
+    unauthorized = [path for path in observed if not any(path == scope or path.startswith(str(scope).rstrip("/") + "/") for scope in write_scopes)]
+    if unauthorized:
+        raise LifecycleError("writer delta is outside the Pilot-issued capability grant")
+    before = _git(workspace, "rev-parse", "HEAD")
+    if before != expected_starting_head:
+        raise LifecycleError("writer workspace HEAD differs from the Pilot-issued starting HEAD")
+    if observed:
+        result = run_git(workspace, "add", "--all", "--", *observed)
+        if result.returncode:
+            raise LifecycleError("host Git broker could not stage the exact writer delta")
+        result = run_git(workspace, "commit", "-m", f"Symphony: {role.lower()} authorized delta")
+        if result.returncode:
+            raise LifecycleError("host Git broker could not create the writer commit")
+    after = _git(workspace, "rev-parse", "HEAD")
+    if _working_tree_paths(workspace):
+        raise LifecycleError("workspace remains dirty after host writer brokerage")
+    return {"changed_paths": observed, "workspace_head": after, "commit_sha": after if observed else None, "previous_head": before, "dirty": False}
+
+
 def verify_git_truth(profile: Profile, workspace: pathlib.Path, task: dict[str, object]) -> str:
+    """Verify repository identity and return workspace HEAD; dirty is observed, not hidden."""
     if _git(workspace, "remote", "get-url", "origin") != profile.git_remote:
         raise LifecycleError("workspace repository identity does not match the registered remote")
     if _git(workspace, "branch", "--show-current") != task["branch"]:
         raise LifecycleError("workspace branch is not the host-owned task branch")
-    if _git(workspace, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise LifecycleError("workspace is dirty after the role execution")
     head = _git(workspace, "rev-parse", "HEAD")
     if not SHA_RE.fullmatch(head):
         raise LifecycleError("workspace HEAD is not a commit SHA")
@@ -158,711 +197,369 @@ def verify_git_truth(profile: Profile, workspace: pathlib.Path, task: dict[str, 
     return head
 
 
-def _next_round(database: ControlPlaneDatabase, task_id: str, role: str) -> int:
-    row = database.connection.execute("SELECT COALESCE(MAX(round), 0) + 1 FROM role_runs WHERE task_id = ? AND role = ?", (task_id, role)).fetchone()
-    return int(row[0])
+def _latest_run(database: ControlPlaneDatabase, task_id: str, role: str | None = None) -> dict[str, object] | None:
+    query = "SELECT * FROM role_runs WHERE task_id = ?"
+    params: list[object] = [task_id]
+    if role:
+        query += " AND role = ?"
+        params.append(role)
+    query += " ORDER BY started_at DESC, id DESC LIMIT 1"
+    row = database.connection.execute(query, params).fetchone()
+    return dict(row) if row else None
 
 
-def _role_rows(database: ControlPlaneDatabase, task_id: str, role: str | None = None) -> list[dict[str, object]]:
-    if role is None:
-        rows = database.connection.execute("SELECT * FROM role_runs WHERE task_id = ? ORDER BY rowid", (task_id,)).fetchall()
-    else:
-        rows = database.connection.execute("SELECT * FROM role_runs WHERE task_id = ? AND role = ? ORDER BY round", (task_id, role)).fetchall()
-    return [dict(row) for row in rows]
+def _run_packet(database: ControlPlaneDatabase, run: dict[str, object] | None) -> dict[str, object]:
+    if not run or not run.get("execution_evidence_id"):
+        return {}
 
 
-def _latest_role(database: ControlPlaneDatabase, task_id: str, role: str) -> dict[str, object] | None:
-    rows = _role_rows(database, task_id, role)
-    return rows[-1] if rows else None
-
-
-def _latest_execution(database: ControlPlaneDatabase, task_id: str) -> dict[str, object] | None:
-    rows = _role_rows(database, task_id)
-    return rows[-1] if rows else None
-
-
-def _latest_architect_outcome(database: ControlPlaneDatabase, task_id: str) -> str | None:
-    row = database.connection.execute("SELECT payload_json FROM task_events WHERE task_id = ? AND event_type = 'role_finished' AND role_run_id IN (SELECT id FROM role_runs WHERE role = 'ARCHITECT') ORDER BY rowid DESC LIMIT 1", (task_id,)).fetchone()
-    if not row:
+def _licensed_run(database: ControlPlaneDatabase, run: object) -> dict[str, object] | None:
+    if not isinstance(run, dict):
         return None
+    if run.get("status") != "finished" or not run.get("execution_evidence_id"):
+        raise AllocationConflict("a non-finished execution cannot license the next lifecycle transition")
+    if run.get("role") in WRITER_ROLES:
+        delta = database.connection.execute(
+            "SELECT authorization_status FROM writer_deltas WHERE role_run_id = ? ORDER BY observed_at DESC, id DESC LIMIT 1",
+            (run["id"],),
+        ).fetchone()
+        if delta is None or delta["authorization_status"] != "ACCEPTED":
+            raise AllocationConflict("a writer execution without an accepted host delta cannot license the next transition")
+    return run
+    row = database.connection.execute("SELECT receipt_json FROM execution_evidence WHERE id = ?", (run["execution_evidence_id"],)).fetchone()
+    if not row:
+        return {}
     try:
-        payload = json.loads(row[0])
+        evidence = json.loads(str(row[0]))
+        return evidence.get("result", {}) if isinstance(evidence, dict) and isinstance(evidence.get("result"), dict) else {}
     except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    return str(payload.get("outcome")) if isinstance(payload, dict) and payload.get("outcome") else None
+        return {}
 
 
-def _latest_role_verdict(database: ControlPlaneDatabase, task_id: str, role: str) -> str | None:
-    row = database.connection.execute(
-        "SELECT payload_json FROM task_events WHERE task_id = ? AND event_type = 'role_finished' "
-        "AND role_run_id IN (SELECT id FROM role_runs WHERE role = ?) ORDER BY rowid DESC LIMIT 1",
-        (task_id, role),
-    ).fetchone()
-    if not row:
-        return None
-    try:
-        payload = json.loads(row[0])
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    return str(payload.get("verdict")) if isinstance(payload, dict) and payload.get("verdict") else None
+def _current_context(database: ControlPlaneDatabase, task_id: str) -> tuple[dict[str, object] | None, dict[str, object] | None, dict[str, object] | None]:
+    lifecycle = database.connection.execute("SELECT * FROM lifecycles WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1", (task_id,)).fetchone()
+    if not lifecycle:
+        return None, None, None
+    working = database.connection.execute("SELECT * FROM working_rounds WHERE lifecycle_id = ? ORDER BY ordinal DESC LIMIT 1", (lifecycle["id"],)).fetchone()
+    attempt = database.connection.execute("SELECT * FROM planning_attempts WHERE working_round_id = ? ORDER BY ordinal DESC LIMIT 1", (working["id"],)).fetchone() if working else None
+    return dict(lifecycle), dict(working) if working else None, dict(attempt) if attempt else None
 
 
-def _next_dispatch_role(database: ControlPlaneDatabase, task: dict[str, object]) -> str | None:
-    task_id = str(task["id"])
-    latest = _latest_execution(database, task_id)
-    if latest is None:
-        return "ARCHITECT"
-    if latest["role"] == "ARCHIVIST":
-        return None
-    if latest["role"] != "ARCHITECT":
-        return "ARCHITECT"
-    state = str(task["state"])
-    if state == "QUEUED":
-        if _latest_architect_outcome(database, task_id) == "correction_required":
-            return "PROJECT-MANAGER"
-        pm = _latest_role(database, task_id, "PROJECT-MANAGER")
-        if pm is None:
-            return "PROJECT-MANAGER"
-        planner = _latest_role(database, task_id, "PLANNER")
-        if planner is None or int(planner["round"]) < int(pm["round"]):
-            return "PLANNER"
-        return None
-    return {"PLANNED": "IMPLEMENTER", "IMPLEMENTED": "REVIEWER", "REVIEW": "ADVERSARY", "ADVERSARIAL_REVIEW": "ARCHITECT", "FINAL_MECHANICAL_ACCEPTANCE": "ARCHIVIST"}.get(state)
+def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple[str | None, dict[str, object] | None, dict[str, object] | None, dict[str, object] | None]:
+    lifecycle, working, attempt = _current_context(database, str(task["id"]))
+    if lifecycle is None:
+        return "PROJECT-MANAGER", None, None, None
+    if lifecycle["state"] != "RUNNING":
+        return None, lifecycle, working, attempt
+    if working is None:
+        pm = database.connection.execute("SELECT * FROM role_runs WHERE task_id = ? AND role = 'PROJECT-MANAGER' ORDER BY started_at DESC, id DESC LIMIT 1", (task["id"],)).fetchone()
+        _licensed_run(database, dict(pm) if pm else None)
+        return "PLANNER", lifecycle, None, None
+    if working["state"] == "PLANNING":
+        if attempt is None:
+            return "PLANNER", lifecycle, working, None
+        planner = database.connection.execute("SELECT * FROM role_runs WHERE planning_attempt_id = ? AND role = 'PLANNER' ORDER BY started_at DESC LIMIT 1", (attempt["id"],)).fetchone()
+        if planner is None:
+            return "PLANNER", lifecycle, working, attempt
+        _licensed_run(database, dict(planner))
+        reviewer = database.connection.execute("SELECT * FROM role_runs WHERE planning_attempt_id = ? AND role = 'REVIEWER' ORDER BY started_at DESC LIMIT 1", (attempt["id"],)).fetchone()
+        if reviewer is None:
+            return "REVIEWER", lifecycle, working, attempt
+        _licensed_run(database, dict(reviewer))
+        packet = _run_packet(database, dict(reviewer))
+        if packet.get("verdict") == "correction_required":
+            if int(attempt["ordinal"]) >= 3:
+                return "PLANNER", lifecycle, None, None
+            return "PLANNER", lifecycle, working, None
+        if packet.get("verdict") not in {"accepted", "pass", "approved"}:
+            raise AllocationConflict("Reviewer evidence does not license implementation")
+        return "IMPLEMENTER", lifecycle, working, attempt
+    if working["state"] == "IMPLEMENTING":
+        implementer = database.connection.execute("SELECT * FROM role_runs WHERE working_round_id = ? AND role = 'IMPLEMENTER' ORDER BY started_at DESC LIMIT 1", (working["id"],)).fetchone()
+        if implementer is None:
+            return "IMPLEMENTER", lifecycle, working, attempt
+        _licensed_run(database, dict(implementer))
+        return "ADVERSARY", lifecycle, working, attempt
+    if working["state"] == "ADVERSARIAL":
+        return "PROJECT-MANAGER", lifecycle, working, attempt
+    if working["state"] == "CONVERGED":
+        return "ARCHIVIST", lifecycle, working, attempt
+    if working["state"] == "NON_CONVERGED":
+        if int(working["ordinal"]) >= 8:
+            return "ARCHIVIST", lifecycle, working, attempt
+        return "PLANNER", lifecycle, None, None
+    return None, lifecycle, working, attempt
 
 
-def _packet(database: ControlPlaneDatabase, task: dict[str, object], run_id: str, role: str) -> dict[str, object]:
-    workpad = database.read_workpad(str(task["id"]))
-    if workpad is None:
-        database.connection.execute(
-            "INSERT INTO workpads(task_id, body, version, updated_at) VALUES (?, ?, 1, ?)",
-            (task["id"], _initial_workpad(task), _now()),
-        )
-        workpad = database.read_workpad(str(task["id"]))
-    open_findings = database.connection.execute("SELECT id, kind, severity, body, status, licensed_correction_round FROM findings WHERE task_id = ? AND status IN ('open', 'accepted', 'licensed') ORDER BY rowid", (task["id"],)).fetchall()
-    blockers = database.connection.execute("SELECT kind, body FROM blockers WHERE task_id = ? AND status = 'open' ORDER BY created_at, id", (task["id"],)).fetchall()
-    return {"schema": "symphony-pilot-lifecycle-input/v2", "task_uuid": task["id"], "identifier": task["identifier"], "title": task["title"], "objective": task["objective"], "current_state": task["state"], "next_expected_action": role, "base_ref": task["base_ref"], "base_sha": task["base_sha"], "branch": task["branch"], "selected_head": task["current_head"] or task["base_sha"], "workpad": {"body": workpad["body"], "version": workpad["version"]}, "open_findings": [dict(row) for row in open_findings], "licensed_finding_ids": [str(row["id"]) for row in open_findings if row["status"] == "licensed"], "open_blockers": [dict(row) for row in blockers], "role": role, "role_run_id": run_id}
+def _writer_scopes(role: str, packet: dict[str, object] | None) -> list[str]:
+    if role == "PLANNER":
+        return [".symphony/plan", ".symphony/decision-memory"]
+    if role == "ARCHIVIST":
+        return [".symphony/archive"]
+    if role == "IMPLEMENTER":
+        paths = packet.get("authorized_write_paths") if isinstance(packet, dict) else None
+        return _validate_relative_paths(paths)
+    return []
 
 
-def _latest_architect_authorized_paths(database: ControlPlaneDatabase, task_id: str) -> list[str]:
-    row = database.connection.execute(
-        "SELECT payload_json FROM task_events WHERE task_id = ? AND event_type = 'role_finished' "
-        "AND role_run_id IN (SELECT id FROM role_runs WHERE role = 'ARCHITECT') "
-        "ORDER BY rowid DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if not row:
-        raise LifecycleError("Implementer dispatch has no Architect-authorized write seam")
-    try:
-        payload = json.loads(row[0])
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise LifecycleError("latest Architect routing evidence is malformed") from exc
-    paths = payload.get("authorized_write_paths") if isinstance(payload, dict) else None
-    if not isinstance(paths, list) or not paths:
-        raise LifecycleError("Implementer dispatch has no Architect-authorized write seam")
-    return paths
-
-
-def _resolve_authorized_write_roots(workspace: pathlib.Path, paths: object) -> list[str]:
-    if not isinstance(paths, list) or not 0 < len(paths) <= MAX_AUTHORIZED_WRITE_PATHS:
-        raise LifecycleError("authorized implementation seam is invalid")
-    root = physical_directory(workspace).resolve()
-    resolved: list[str] = []
+def _validate_relative_paths(paths: object) -> list[str]:
+    if not isinstance(paths, list) or not paths or len(paths) > 32:
+        raise LifecycleError("write scope must be a non-empty bounded list")
+    result: list[str] = []
     for value in paths:
-        if not isinstance(value, str) or not value.strip():
-            raise LifecycleError("authorized implementation seam contains an invalid path")
-        candidate_text = value.replace("\\", "/")
-        candidate_path = pathlib.PurePath(value)
-        windows_path = pathlib.PureWindowsPath(value)
-        if candidate_path.is_absolute() or windows_path.is_absolute() or ":" in candidate_text:
-            raise LifecycleError("authorized implementation seam must be repository-relative")
-        parts = pathlib.PurePosixPath(candidate_text).parts
-        if not parts or any(part in {"", ".", ".."} for part in parts):
-            raise LifecycleError("authorized implementation seam contains traversal")
-        candidate = root.joinpath(*parts).resolve(strict=False)
-        try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise LifecycleError("authorized implementation seam escapes the task checkout") from exc
-        current = root
-        for part in parts:
-            current /= part
-            if current.is_symlink():
-                raise LifecycleError("authorized implementation seam contains a symlink")
-        if candidate == root or not candidate.exists() or not (candidate.is_file() or candidate.is_dir()):
-            raise LifecycleError("authorized implementation seam must name an existing file or directory below the task checkout")
-        resolved.append(str(candidate))
-    return list(dict.fromkeys(resolved))
-
-
-def _working_tree_paths(workspace: pathlib.Path) -> list[str]:
-    result = run_git(workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-    if result.returncode:
-        raise LifecycleError("unable to inspect the Implementer working-tree delta")
-    records = result.stdout.split("\0")
-    paths: list[str] = []
-    index = 0
-    while index < len(records):
-        record = records[index]
-        index += 1
-        if not record:
-            continue
-        if len(record) < 4 or record[2] != " ":
-            raise LifecycleError("Git returned a malformed working-tree status")
-        status = record[:2]
-        paths.append(record[3:])
-        if "R" in status or "C" in status:
-            if index >= len(records) or not records[index]:
-                raise LifecycleError("Git returned an incomplete rename status")
-            paths.append(records[index])
-            index += 1
-    return paths
-
-
-def _path_is_authorized(
-    workspace: pathlib.Path,
-    path: str,
-    authorized_roots: list[tuple[pathlib.Path, str]],
-) -> bool:
-    relative = pathlib.PurePosixPath(path.replace("\\", "/"))
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-        return False
-    candidate = (workspace / pathlib.Path(*relative.parts)).resolve(strict=False)
-    for authorized, kind in authorized_roots:
-        if candidate == authorized or kind == "directory" and candidate.is_relative_to(authorized):
-            return True
-    return False
-
-
-def _commit_implementer_delta(workspace: pathlib.Path, marker: dict[str, object]) -> str:
-    if marker.get("dispatch_role") != "IMPLEMENTER":
-        return _git(workspace, "rev-parse", "HEAD")
-    raw_roots = marker.get("target_writable_roots")
-    if not isinstance(raw_roots, list) or not raw_roots or any(not isinstance(path, str) for path in raw_roots):
-        raise LifecycleError("Implementer dispatch has no host-resolved writable seam")
-    raw_kinds = marker.get("target_writable_root_kinds")
-    if not isinstance(raw_kinds, list) or len(raw_kinds) != len(raw_roots) or any(kind not in {"file", "directory"} for kind in raw_kinds):
-        raise LifecycleError("Implementer dispatch writable seam types are malformed")
-    authorized_roots = [
-        (pathlib.Path(path).resolve(strict=False), str(kind))
-        for path, kind in zip(raw_roots, raw_kinds)
-    ]
-    changed_paths = _working_tree_paths(workspace)
-    if not changed_paths:
-        raise LifecycleError("Implementer produced no project-content changes")
-    if any(not _path_is_authorized(workspace, path, authorized_roots) for path in changed_paths):
-        raise LifecycleError("Implementer changed a project path outside the authorized seam")
-    if run_git(workspace, "add", "--", *changed_paths).returncode:
-        raise LifecycleError("host could not stage the authorized Implementer delta")
-    commit = run_git(
-        workspace,
-        "-c", "user.name=Symphony Agent",
-        "-c", "user.email=symphony@localhost",
-        "commit", "-m", "Symphony: implement authorized seam",
-    )
-    if commit.returncode:
-        detail = (commit.stderr or commit.stdout).strip().replace("\n", " ")
-        raise LifecycleError(f"host could not commit the authorized Implementer delta: {detail[:240]}")
-    head = _git(workspace, "rev-parse", "HEAD")
-    identity = _git(workspace, "show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce", head)
-    if identity != "Symphony Agent\x1fsymphony@localhost\x1fSymphony Agent\x1fsymphony@localhost":
-        raise LifecycleError("host Implementer commit identity is not the Symphony identity")
-    if _git(workspace, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise LifecycleError("authorized Implementer commit left the workspace dirty")
-    return head
-
-
-def _record_infrastructure_blocker(profile: Profile, task_id: str, detail: str) -> None:
-    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
-        with database._transaction():
-            blocker_id = str(uuid.uuid4())
-            timestamp = _now()
-            database.connection.execute("INSERT INTO blockers(id, task_id, kind, body, status, created_at, resolved_at) VALUES (?, ?, 'infrastructure', ?, 'open', ?, NULL)", (blocker_id, task_id, detail[:MAX_SUMMARY_BYTES], timestamp))
-            database._insert_event(task_id, "infrastructure_blocked", {"blocker_id": blocker_id, "kind": "infrastructure"})
+        if not isinstance(value, str) or not value or "\\" in value or value.startswith("/"):
+            raise LifecycleError("write scope contains an unsafe path")
+        parts = pathlib.PurePosixPath(value).parts
+        if not parts or any(part in {"", ".", ".."} for part in parts) or value == ".git" or value.startswith(".git/"):
+            raise LifecycleError("write scope contains Git metadata or traversal")
+        if SECRET_MARKER_RE.search(value):
+            raise LifecycleError("write scope contains secret-shaped text")
+        result.append(value.rstrip("/"))
+    if len(set(result)) != len(result):
+        raise LifecycleError("write scope contains duplicates")
+    return result
 
 
 def prepare_attempt(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
-    """Prepare one host-selected dispatch without creating a role_run."""
-    workspace = physical_directory(workspace)
+    """Create one Pilot dispatch and exact grant for the next eligible role."""
     facts, _ = local_task_facts(profile, workspace)
-    if facts.branch != _git(workspace, "branch", "--show-current"):
-        raise LifecycleError("workspace is not on the host-owned task branch")
-    claim = _claim_dispatch(workspace)
-    marker_path = workspace / ".git" / "symphony-preparation.json"
-    try:
-        old_marker = _read_host_json(marker_path, "preparation marker")
-    except LifecycleError:
-        old_marker = {}
+    _claim_dispatch(workspace)
     try:
         with ControlPlaneDatabase.open(control_database_path(profile)) as database:
-            with database._transaction():
-                task = database.read_task(facts.task_uuid)
-                if task["project_slug"] != profile.slug or task["identifier"] != facts.identifier:
-                    raise AllocationConflict("task identity is not project-scoped")
-                if task["state"] not in ACTIVE_STATES:
-                    raise AllocationConflict(f"task state is not active: {task['state']}")
-                if database.connection.execute("SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (facts.task_uuid,)).fetchone():
-                    raise AllocationConflict("task has an open blocker")
-                role = _next_dispatch_role(database, task)
-                if role is None:
-                    raise AllocationConflict("task has no eligible role dispatch")
-                run_id = str(uuid.uuid4())
-                packet = _packet(database, task, run_id, role)
-                round_number = _next_round(database, facts.task_uuid, role)
-                authorized_write_paths = (
-                    _latest_architect_authorized_paths(database, facts.task_uuid)
-                    if role == "IMPLEMENTER" else []
-                )
-        namespace = lifecycle_root(profile, facts.identifier, run_id)
-        outbox = namespace / "outbox"
-        result_writable_root = str(outbox)
-        target_writable_roots: list[str] = []
-        target_writable_root_kinds: list[str] = []
-        if role == "IMPLEMENTER":
-            target_writable_roots = _resolve_authorized_write_roots(workspace, authorized_write_paths)
-            target_writable_root_kinds = [
-                "directory" if pathlib.Path(path).is_dir() else "file"
-                for path in target_writable_roots
-            ]
-        packet["authorized_write_paths"] = authorized_write_paths
-        packet["dispatch"] = {
-            "role": role,
-            "role_run_id": run_id,
-            "round": round_number,
-            "lifecycle_namespace": str(namespace),
-            "result_path": str(outbox / "result.json"),
-            "result_writable_root": result_writable_root,
-            "target_writable_roots": target_writable_roots,
-            "target_writable_root_kinds": target_writable_root_kinds,
-        }
-        _write_host_json(namespace / "inbox" / "lifecycle.json", packet)
-        marker = old_marker if isinstance(old_marker, dict) else {}
-        marker.update({
-            "dispatch_role": role,
-            "role_run_id": run_id,
-            "role_round": round_number,
-            "lifecycle_namespace": str(namespace),
-            "lifecycle_packet": "inbox/lifecycle.json",
-            "dispatch_state": "pending",
-            "task_uuid": facts.task_uuid,
-            "identifier": facts.identifier,
-            "selected_head": facts.selected_head,
-            "result_writable_root": result_writable_root,
-            "target_writable_roots": target_writable_roots,
-            "target_writable_root_kinds": target_writable_root_kinds,
-            "authorized_write_paths": authorized_write_paths,
-        })
-        _write_host_json(marker_path, marker)
-        return {"task": task, "run": {"id": run_id, "role": role, "round": round_number, "status": "pending"}, "packet": packet, "namespace": str(namespace)}
-    except Exception:
+            task = database.read_task(facts.task_uuid)
+            if database.connection.execute("SELECT 1 FROM role_dispatches WHERE task_id = ? AND status = 'AUTHORIZED' LIMIT 1", (task["id"],)).fetchone():
+                raise AllocationConflict("an authorized dispatch is awaiting Runtime evidence")
+            role, lifecycle, working, attempt = _next_role(database, task)
+            if role is None and lifecycle and lifecycle["state"] == "NON_CONVERGED":
+                disposition = database.connection.execute(
+                    "SELECT decision FROM human_dispositions WHERE lifecycle_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (lifecycle["id"],),
+                ).fetchone()
+                if disposition and disposition["decision"] == "START_ANOTHER_LIFECYCLE":
+                    lifecycle = database.create_lifecycle(str(task["id"]))
+                    working = None
+                    attempt = None
+                    role = "PROJECT-MANAGER"
+            if role is None:
+                raise AllocationConflict("task has no eligible dispatch")
+            if lifecycle is None:
+                lifecycle = database.create_lifecycle(str(task["id"]))
+            elif working is None:
+                prior = database.connection.execute("SELECT * FROM working_rounds WHERE lifecycle_id = ? ORDER BY ordinal DESC LIMIT 1", (lifecycle["id"],)).fetchone()
+                if prior is not None and prior["state"] == "PLANNING":
+                    database.connection.execute("UPDATE working_rounds SET state = 'NON_CONVERGED', ended_at = ? WHERE id = ?", (_now(), prior["id"]))
+                working = database.start_working_round(str(lifecycle["id"]))
+                attempt = database.start_planning_attempt(str(working["id"]))
+            elif role == "PLANNER" and attempt is None:
+                attempt = database.start_planning_attempt(str(working["id"]))
+            previous = _latest_run(database, str(task["id"]), "PLANNER")
+            previous_packet = _run_packet(database, previous)
+            grant = database.authorize_dispatch(
+                str(task["id"]), lifecycle_id=str(lifecycle["id"]),
+                working_round_id=str(working["id"]) if working else None,
+                planning_attempt_id=str(attempt["id"]) if attempt else None,
+                role=role, expected_starting_head=str(task["current_head"] or task["base_sha"]),
+                read_scopes=["project", ".symphony"],
+                write_scopes=_writer_scopes(role, previous_packet),
+            )
+            dispatch = grant["dispatch"]
+            namespace = lifecycle_root(profile, str(task["identifier"]), str(dispatch["id"]))
+            packet = {
+                "schema": "symphony-pilot-dispatch/v1",
+                "task_id": task["id"], "identifier": task["identifier"],
+                "lifecycle_id": lifecycle["id"],
+                "working_round_id": working["id"] if working else None,
+                "planning_attempt_id": attempt["id"] if attempt else None,
+                "dispatch_id": dispatch["id"], "role": role,
+                "expected_starting_head": dispatch["expected_starting_head"],
+                "capability_grant": grant["grant"],
+            }
+            _write_json(namespace / "inbox" / "dispatch.json", packet)
+            marker = {**packet, "namespace": str(namespace), "result_path": str(namespace / "outbox" / "result.json"), "execution_path": str(namespace / "host" / "execution.json")}
+            _write_json(namespace / "host" / "dispatch.json", marker)
+            return marker
+    finally:
         _release_dispatch_claim(workspace)
-        raise
 
 
 def read_result(path: pathlib.Path) -> dict[str, object]:
-    value = _read_host_json(path, "lifecycle result")
-    if not isinstance(value, dict) or set(value) != RESULT_FIELDS:
-        raise LifecycleError("lifecycle result fields are invalid")
-    if value["schema"] != RESULT_SCHEMA:
-        raise LifecycleError("lifecycle result schema is invalid")
-    for field in ("task_uuid", "role_run_id"):
-        if not isinstance(value[field], str) or not UUID_RE.fullmatch(value[field]):
-            raise LifecycleError(f"lifecycle {field} is invalid")
-    if not isinstance(value["identifier"], str) or not TASK_IDENTIFIER_RE.fullmatch(value["identifier"]):
-        raise LifecycleError("lifecycle identifier is invalid")
-    if value["role"] not in ALL_ROLES or value["expected_state"] not in ACTIVE_STATES:
-        raise LifecycleError("lifecycle role or expected state is invalid")
-    if not isinstance(value["expected_workpad_version"], int) or isinstance(value["expected_workpad_version"], bool) or value["expected_workpad_version"] < 1:
-        raise LifecycleError("lifecycle workpad version is invalid")
-    if not isinstance(value["expected_starting_head"], str) or not SHA_RE.fullmatch(value["expected_starting_head"]):
-        raise LifecycleError("lifecycle starting HEAD is invalid")
-    _bounded_text(value["workpad_body"], "workpad_body", MAX_WORKPAD_BYTES)
-    _bounded_text(value["summary"], "summary", MAX_SUMMARY_BYTES)
-    authorized_write_paths = value["authorized_write_paths"]
-    if not isinstance(authorized_write_paths, list) or len(authorized_write_paths) > MAX_AUTHORIZED_WRITE_PATHS:
-        raise LifecycleError("authorized implementation seam is invalid")
-    if any(not isinstance(path, str) or not path.strip() for path in authorized_write_paths):
-        raise LifecycleError("authorized implementation seam contains an invalid path")
-    if value["outcome"] not in OUTCOMES or not isinstance(value["findings"], list) or not isinstance(value["requested_resolved_finding_ids"], list):
-        raise LifecycleError("lifecycle outcome or lists are invalid")
-    for finding_id in value["requested_resolved_finding_ids"]:
-        if not isinstance(finding_id, str) or not UUID_RE.fullmatch(finding_id):
-            raise LifecycleError("lifecycle requested finding identity is invalid")
-
-    def validate_finding(finding: object, expected_role: str) -> None:
-        if not isinstance(finding, dict) or set(finding) != FINDING_FIELDS or finding["role"] != expected_role:
-            raise LifecycleError("lifecycle finding provenance is invalid")
-        if finding["severity"] not in {"info", "low", "medium", "high", "critical"} or finding["classification"] not in FINDING_CLASSES or finding["blocker_kind"] not in BLOCKER_KINDS:
-            raise LifecycleError("lifecycle finding fields are invalid")
-        expected = {"licensed correction": None, "rejected": None, "unresolved project decision": {"human", "project"}, "infrastructure condition": {"infrastructure"}}[finding["classification"]]
-        if (expected is None and finding["blocker_kind"] is not None) or (isinstance(expected, set) and finding["blocker_kind"] not in expected):
-            raise LifecycleError("lifecycle finding blocker kind is invalid")
-        _bounded_text(finding["kind"], "finding kind", 256)
-        _bounded_text(finding["body"], "finding body", MAX_SUMMARY_BYTES)
-
-    if value["role"] == "ARCHITECT":
-        if value["packet"] is not None:
-            raise LifecycleError("Architect cannot author a specialized role packet")
-        if value["outcome"] == "planning_complete" and not authorized_write_paths:
-            raise LifecycleError("planning completion requires an explicit implementation seam")
-        if value["outcome"] != "planning_complete" and authorized_write_paths:
-            raise LifecycleError("only planning completion may authorize an implementation seam")
-        for finding in value["findings"]:
-            validate_finding(finding, "ARCHITECT")
-    else:
-        if authorized_write_paths:
-            raise LifecycleError("only Architect may authorize an implementation seam")
-        packet = value["packet"]
-        if not isinstance(packet, dict) or set(packet) != ROLE_PACKET_FIELDS or packet["role"] != value["role"]:
-            raise LifecycleError("specialized packet does not match dispatched role")
-        if value["findings"]:
-            raise LifecycleError("specialized role cannot author Architect findings")
-        _bounded_text(packet["summary"], "role summary", MAX_SUMMARY_BYTES)
-        if packet["head_sha"] is not None and (not isinstance(packet["head_sha"], str) or not SHA_RE.fullmatch(packet["head_sha"])):
-            raise LifecycleError("specialized role HEAD is invalid")
-        if packet["verdict"] not in {"APPROVE", "PASS", "COMPLETE", "FINDINGS", "BLOCKED"} or not isinstance(packet["findings"], list):
-            raise LifecycleError("specialized packet fields are invalid")
-        for finding in packet["findings"]:
-            validate_finding(finding, value["role"])
+    value = _read_json(path, "execution result")
+    if not isinstance(value, dict) or set(value) - {"schema", "task_id", "dispatch_id", "role", "summary", "verdict", "authorized_write_paths", "findings", "outcome", "blocker_kind"}:
+        raise LifecycleError("execution result fields are invalid")
+    if value.get("schema") != RESULT_SCHEMA:
+        raise LifecycleError("execution result schema is invalid")
+    for field in ("task_id", "dispatch_id", "role"):
+        if not isinstance(value.get(field), str) or not UUID_RE.fullmatch(str(value[field])):
+            raise LifecycleError(f"execution result {field} is invalid")
+    if value["role"] not in ROLES:
+        raise LifecycleError("execution result role is invalid")
+    if value.get("summary") is not None:
+        _bounded_text(value["summary"], "summary", MAX_SUMMARY_BYTES)
+    if "authorized_write_paths" in value:
+        _validate_relative_paths(value["authorized_write_paths"])
     return value
 
 
-def _materialize_started_run(database: ControlPlaneDatabase, task: dict[str, object], marker: dict[str, object], receipt: dict[str, object]) -> dict[str, object]:
-    run_id, role, round_number = str(marker["role_run_id"]), str(marker["dispatch_role"]), int(marker["role_round"])
-    existing = database.connection.execute("SELECT * FROM role_runs WHERE id = ?", (run_id,)).fetchone()
-    if existing is not None:
-        run = dict(existing)
-        if run["task_id"] != task["id"] or run["role"] != role or run["round"] != round_number:
-            raise StateConflict("execution receipt is bound to a different role run")
-        return run
-    started_at = receipt.get("started_at")
-    if not isinstance(started_at, str) or not started_at:
-        raise LifecycleError("execution receipt has no successful start time")
-    database.connection.execute("INSERT INTO role_runs(id, task_id, role, round, head_sha, status, started_at, finished_at, result_summary) VALUES (?, ?, ?, ?, ?, 'started', ?, NULL, NULL)", (run_id, task["id"], role, round_number, task["current_head"] or task["base_sha"], started_at))
-    database._insert_event(task["id"], "role_started", {"role": role, "round": round_number, "session_id": receipt.get("session_id"), "thread_id": receipt.get("thread_id"), "turn_id": receipt.get("turn_id")}, role_run_id=run_id, occurred_at=started_at)
-    return database.read_role_run(run_id)
+def _read_execution(path: pathlib.Path) -> dict[str, object]:
+    value = _read_json(path, "Runtime execution evidence")
+    if not isinstance(value, dict):
+        raise LifecycleError("Runtime execution evidence must be an object")
+    required = {
+        "runtime_execution_id", "task_id", "dispatch_id", "observed_role", "status",
+        "started_at", "finished_at", "starting_head", "head_sha", "changed_paths", "dirty",
+    }
+    if not required.issubset(value):
+        raise LifecycleError("Runtime execution evidence is incomplete")
+    if value["status"] not in {"finished", "failed", "blocked", "cancelled"}:
+        raise LifecycleError("Runtime execution status is invalid")
+    _bounded_text(value["runtime_execution_id"], "runtime_execution_id", 256)
+    if value["observed_role"] not in ROLES:
+        raise LifecycleError("Runtime execution role is invalid")
+    _timestamp(str(value["started_at"]), "started_at")
+    _timestamp(str(value["finished_at"]), "finished_at")
+    if not SHA_RE.fullmatch(str(value["starting_head"])) or not SHA_RE.fullmatch(str(value["head_sha"])):
+        raise LifecycleError("Runtime execution HEAD evidence is invalid")
+    if not isinstance(value["changed_paths"], list) or len(value["changed_paths"]) > 4096:
+        raise LifecycleError("Runtime changed-path evidence is invalid")
+    for changed_path in value["changed_paths"]:
+        if (not isinstance(changed_path, str) or not changed_path or "\\" in changed_path or
+                changed_path.startswith("/") or "\x00" in changed_path or
+                any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(changed_path).parts)):
+            raise LifecycleError("Runtime changed-path evidence contains an unsafe path")
+    if value["changed_paths"] != sorted(set(value["changed_paths"])):
+        raise LifecycleError("Runtime changed-path evidence must be sorted and unique")
+    if not isinstance(value["dirty"], bool):
+        raise LifecycleError("Runtime dirty evidence is invalid")
+    if value.get("commit_sha") is not None and not SHA_RE.fullmatch(str(value["commit_sha"])):
+        raise LifecycleError("Runtime commit evidence is invalid")
+    return value
 
 
-def _finish_run(database: ControlPlaneDatabase, run: dict[str, object], receipt: dict[str, object], status: str, summary: str, head: str, outcome: str | None = None, verdict: str | None = None, authorized_write_paths: list[str] | None = None) -> None:
-    finished_at = receipt.get("finished_at") or _now()
-    database.connection.execute("UPDATE role_runs SET status = ?, finished_at = ?, result_summary = ?, head_sha = ? WHERE id = ? AND status = 'started'", (status, finished_at, summary, head, run["id"]))
-    if database.connection.execute("SELECT changes()").fetchone()[0] != 1:
-        raise StateConflict("role run is no longer started")
-    payload = {"role": run["role"], "round": run["round"], "status": status}
-    if outcome is not None:
-        payload["outcome"] = outcome
-    if verdict is not None:
-        payload["verdict"] = verdict
-    if authorized_write_paths is not None:
-        payload["authorized_write_paths"] = authorized_write_paths
-    database._insert_event(run["task_id"], "role_finished", payload, role_run_id=run["id"], occurred_at=finished_at)
-
-
-def _insert_finding(database: ControlPlaneDatabase, task: dict[str, object], run: dict[str, object], finding: dict[str, object]) -> None:
-    classification = finding["classification"]
-    status = "licensed" if classification == "licensed correction" else ("rejected" if classification == "rejected" else "open")
-    correction_round = _next_round(database, str(task["id"]), "IMPLEMENTER") if status == "licensed" else None
-    finding_id = str(uuid.uuid4())
-    database.connection.execute("INSERT INTO findings(id, task_id, role_run_id, kind, severity, body, status, licensed_correction_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (finding_id, task["id"], run["id"], finding["kind"], finding["severity"], finding["body"], status, correction_round))
-    database._insert_event(task["id"], "finding_recorded", {"finding_id": finding_id, "role": run["role"], "classification": classification}, role_run_id=run["id"])
-    if finding["blocker_kind"] in {"human", "project", "infrastructure"}:
-        blocker_id = str(uuid.uuid4())
-        database.connection.execute("INSERT INTO blockers(id, task_id, kind, body, status, created_at, resolved_at) VALUES (?, ?, ?, ?, 'open', ?, NULL)", (blocker_id, task["id"], finding["blocker_kind"], finding["body"], _now()))
-        database._insert_event(task["id"], "infrastructure_blocked" if finding["blocker_kind"] == "infrastructure" else "human_blocked", {"blocker_id": blocker_id, "kind": finding["blocker_kind"]})
-
-
-def _expected_specialized_role(database: ControlPlaneDatabase, task: dict[str, object], current_run: dict[str, object] | None = None) -> str | None:
-    task_id = str(task["id"])
-    if task["state"] == "QUEUED":
-        pm, planner = _latest_role(database, task_id, "PROJECT-MANAGER"), _latest_role(database, task_id, "PLANNER")
-        if current_run is not None:
-            if pm is not None and pm["id"] == current_run["id"]:
-                pm = _role_rows(database, task_id, "PROJECT-MANAGER")[-2] if len(_role_rows(database, task_id, "PROJECT-MANAGER")) > 1 else None
-            if planner is not None and planner["id"] == current_run["id"]:
-                planner = _role_rows(database, task_id, "PLANNER")[-2] if len(_role_rows(database, task_id, "PLANNER")) > 1 else None
-            if current_run["role"] == "PROJECT-MANAGER" and int(current_run["round"]) > int(pm["round"] if pm else 0):
-                return "PROJECT-MANAGER"
-        if pm is None:
-            return "PROJECT-MANAGER"
-        if planner is None or int(planner["round"]) < int(pm["round"]):
-            return "PLANNER"
-        return None
-    return {"PLANNED": "IMPLEMENTER", "IMPLEMENTED": "REVIEWER", "REVIEW": "ADVERSARY", "FINAL_MECHANICAL_ACCEPTANCE": "ARCHIVIST"}.get(str(task["state"]))
-
-
-def _transition(database: ControlPlaneDatabase, task: dict[str, object], new_state: str) -> None:
-    database.connection.execute("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ? AND state = ?", (new_state, _now(), task["id"], task["state"]))
-    if database.connection.execute("SELECT changes()").fetchone()[0] != 1:
-        raise StateConflict("task state changed during lifecycle reconciliation")
-
-
-def _validate_reconciliation_binding(
+def _record_lifecycle_outcome(
     database: ControlPlaneDatabase,
     task: dict[str, object],
+    lifecycle: dict[str, object],
+    working: dict[str, object],
+    role: str,
     result: dict[str, object],
-    run: dict[str, object],
-) -> tuple[dict[str, object], str, str, dict[str, object] | None]:
-    """Validate result binding before a host commit can be attempted.
-
-    This seam performs no lifecycle mutation. It only establishes that the
-    packet belongs to the current dispatch and is legal for the eligible role.
-    """
-    if str(result["task_uuid"]) != str(task["id"]) or task["identifier"] != result["identifier"] or task["state"] != result["expected_state"]:
-        raise StateConflict("lifecycle result identity or expected state is stale")
-    workpad = database.read_workpad(str(task["id"]))
-    if workpad is None or workpad["version"] != result["expected_workpad_version"]:
-        raise StateConflict("lifecycle workpad version is stale")
-    selected_head = str(task["current_head"] or task["base_sha"])
-    if selected_head != result["expected_starting_head"]:
-        raise StateConflict("lifecycle starting HEAD is stale")
-    role = str(result["role"])
-    if role != run["role"] or str(result["role_run_id"]) != run["id"]:
-        raise StateConflict("lifecycle result is not bound to the dispatched execution")
-
-    packet = result["packet"]
-    if role == "ARCHITECT":
-        return workpad, selected_head, role, None
-
-    if _expected_specialized_role(database, task, run) != role:
-        raise LifecycleError("specialized role is not eligible in the current lifecycle state")
-    expected_verdict = {"PROJECT-MANAGER": "APPROVE", "PLANNER": "COMPLETE", "IMPLEMENTER": "COMPLETE", "REVIEWER": "APPROVE", "ADVERSARY": "PASS", "ARCHIVIST": "COMPLETE"}[role]
-    if result["outcome"] not in {"role_complete", "archive_complete", "blocked"} or (result["outcome"] == "archive_complete" and role != "ARCHIVIST"):
-        raise LifecycleError("specialized role returned an invalid lifecycle outcome")
-    if result["outcome"] == "blocked" and packet["verdict"] != "BLOCKED":
-        raise LifecycleError("blocked specialized execution must return a BLOCKED packet")
-    allowed_verdicts = {expected_verdict}
-    if role in {"REVIEWER", "ADVERSARY"}:
-        allowed_verdicts.add("FINDINGS")
-    if result["outcome"] != "blocked" and packet["verdict"] not in allowed_verdicts:
-        raise LifecycleError("specialized role verdict is not licensed")
-    if role == "IMPLEMENTER" and packet["head_sha"] is not None:
-        raise LifecycleError("Implementer packet must not predict the host-created commit HEAD")
-    if result["workpad_body"] != workpad["body"]:
-        raise LifecycleError("specialized role attempted to author the lifecycle workpad")
-    return workpad, selected_head, role, packet
-
-
-def _reconcile(database: ControlPlaneDatabase, task: dict[str, object], result: dict[str, object], run: dict[str, object], receipt: dict[str, object], actual_head: str, profile: Profile) -> dict[str, object]:
-    workpad, selected_head, role, packet = _validate_reconciliation_binding(database, task, result, run)
-    state = str(task["state"])
-    if role == "ARCHITECT":
-        if actual_head != selected_head:
-            raise LifecycleError("read-only Architect execution changed Git HEAD")
-        allowed = {"QUEUED": {"role_requested", "planning_complete", "correction_required", "blocked"}, "PLANNED": {"implementation_complete", "blocked"}, "IMPLEMENTED": {"review_approved", "correction_required", "blocked"}, "REVIEW": {"adversary_pass", "correction_required", "blocked"}, "ADVERSARIAL_REVIEW": {"validation_pass", "correction_required", "blocked"}}.get(state, set())
-        if result["outcome"] not in allowed:
-            raise LifecycleError("Architect outcome is impossible for the current state")
-        if result["outcome"] == "role_requested" and _next_dispatch_role(database, task) not in {"PROJECT-MANAGER", "PLANNER"}:
-            raise LifecycleError("Architect requested a role that is not eligible")
-        if result["outcome"] == "planning_complete":
-            pm, planner = _latest_role(database, str(task["id"]), "PROJECT-MANAGER"), _latest_role(database, str(task["id"]), "PLANNER")
-            if pm is None or planner is None or int(pm["round"]) != int(planner["round"]):
-                raise LifecycleError("planning cannot advance without one real PM and Planner round")
-            _transition(database, task, "PLANNED")
-        elif result["outcome"] == "implementation_complete":
-            if _latest_role(database, str(task["id"]), "IMPLEMENTER") is None:
-                raise LifecycleError("implementation cannot advance without a real Implementer run")
-            _transition(database, task, "IMPLEMENTED")
-        elif result["outcome"] == "review_approved":
-            reviewer = _latest_role(database, str(task["id"]), "REVIEWER")
-            if reviewer is None or _latest_role_verdict(database, str(task["id"]), "REVIEWER") != "APPROVE":
-                raise LifecycleError("review approval has no real Reviewer execution")
-            _transition(database, task, "REVIEW")
-            database._insert_event(task["id"], "review_accepted", {"head_sha": actual_head}, role_run_id=reviewer["id"])
-        elif result["outcome"] == "adversary_pass":
-            adversary = _latest_role(database, str(task["id"]), "ADVERSARY")
-            if adversary is None or _latest_role_verdict(database, str(task["id"]), "ADVERSARY") != "PASS":
-                raise LifecycleError("adversary approval has no real Adversary execution")
-            _transition(database, task, "ADVERSARIAL_REVIEW")
-            database._insert_event(task["id"], "adversary_accepted", {"head_sha": actual_head}, role_run_id=adversary["id"])
-        elif result["outcome"] == "validation_pass":
-            live_receipt = capture_live_receipt(profile, task)
-            event_id = database._insert_event(task["id"], "validation_passed", {"head_sha": actual_head, "execution_receipt": live_receipt}, role_run_id=run["id"])
-            verify_persisted_receipt(database, str(task["id"]), event_id, live_receipt)
-            _transition(database, task, "FINAL_MECHANICAL_ACCEPTANCE")
-        elif result["outcome"] == "correction_required":
-            specialized_evidence = database.connection.execute("SELECT 1 FROM findings WHERE task_id = ? AND status = 'licensed' LIMIT 1", (task["id"],)).fetchone()
-            if state == "ADVERSARIAL_REVIEW" and not any(f["classification"] == "licensed correction" for f in result["findings"]):
-                specialized_evidence = None
-            if not specialized_evidence and not any(f["classification"] == "licensed correction" for f in result["findings"]):
-                raise LifecycleError("correction requires a licensed finding from the actual review or Architect execution")
-            _transition(database, task, "QUEUED")
-        for finding in result["findings"]:
-            _insert_finding(database, task, run, finding)
-    else:
-        if role == "IMPLEMENTER" and result["outcome"] != "blocked" and actual_head == selected_head:
-            raise LifecycleError("Implementer did not produce a new committed HEAD")
-        if role != "IMPLEMENTER" and actual_head != selected_head:
-            raise LifecycleError("read-only specialized role changed Git HEAD")
-        if packet["head_sha"] not in (None, actual_head):
-            raise LifecycleError("specialized packet HEAD does not match trusted Git HEAD")
-        for finding in packet["findings"]:
-            _insert_finding(database, task, run, finding)
-        if result["requested_resolved_finding_ids"] and role != "IMPLEMENTER":
-            raise LifecycleError("only Implementer may request correction resolution")
-        for finding_id in result["requested_resolved_finding_ids"]:
-            database.connection.execute("UPDATE findings SET status = 'resolved', licensed_correction_round = NULL WHERE id = ? AND task_id = ? AND status = 'licensed'", (finding_id, task["id"]))
-            if database.connection.execute("SELECT changes()").fetchone()[0] != 1:
-                raise LifecycleError("requested finding resolution is not licensed")
-        if role == "IMPLEMENTER" and result["outcome"] != "blocked":
-            database.connection.execute("UPDATE tasks SET current_head = ?, updated_at = ? WHERE id = ?", (actual_head, _now(), task["id"]))
-        if role == "ARCHIVIST" and result["outcome"] == "archive_complete" and not database.connection.execute("SELECT 1 FROM task_events WHERE task_id = ? AND event_type = 'validation_passed' LIMIT 1", (task["id"],)).fetchone():
-            raise LifecycleError("Archivist cannot run before final mechanical acceptance")
-    status = "blocked" if result["outcome"] == "blocked" else "finished"
-    _finish_run(
-        database, run, receipt, status, str(result["summary"]), actual_head,
-        str(result["outcome"]), packet.get("verdict") if isinstance(packet, dict) else None,
-        result["authorized_write_paths"],
-    )
-    if role == "ARCHITECT" and result["workpad_body"] != workpad["body"]:
-        if not str(result["workpad_body"]).startswith(WORKPAD_MARKER):
-            raise LifecycleError("workpad body must preserve its marker")
-        database.connection.execute("UPDATE workpads SET body = ?, version = version + 1, updated_at = ? WHERE task_id = ? AND version = ?", (result["workpad_body"], _now(), task["id"], workpad["version"]))
-        if database.connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateConflict("workpad compare-and-set failed")
-    return database.read_task(str(task["id"]))
-
-
-def _dispatch_receipt(profile: Profile, marker: dict[str, object]) -> dict[str, object]:
-    namespace = lifecycle_root(profile, str(marker["identifier"]), str(marker["role_run_id"]))
-    receipt = _read_host_json(namespace / "host" / "execution.json", "execution receipt")
-    if (
-        not isinstance(receipt, dict)
-        or receipt.get("role") != marker.get("dispatch_role")
-        or receipt.get("role_run_id") != marker.get("role_run_id")
-        or receipt.get("status") not in {"started", "finished", "failed"}
-        or not isinstance(receipt.get("started_at"), str)
-    ):
-        raise LifecycleError("execution receipt is not bound to the host dispatch")
-    return receipt
-
-
-def _observed_head(workspace: pathlib.Path, task: dict[str, object]) -> str:
-    try:
-        result = run_git(workspace, "rev-parse", "HEAD")
-    except Exception:
-        return str(task["current_head"] or task["base_sha"])
-    head = result.stdout.strip()
-    if result.returncode == 0 and SHA_RE.fullmatch(head):
-        return head
-    return str(task["current_head"] or task["base_sha"])
-
-
-def _record_failed_execution(
-    database: ControlPlaneDatabase,
-    task: dict[str, object],
-    marker: dict[str, object],
-    receipt: dict[str, object],
-    detail: str,
-    head: str,
+    actual_head: str,
 ) -> None:
-    run = _materialize_started_run(database, task, marker, receipt)
-    if run["status"] == "started":
-        _finish_run(database, run, receipt, "failed", detail[:MAX_SUMMARY_BYTES], head)
-    blocker_id = str(uuid.uuid4())
-    database.connection.execute(
-        "INSERT INTO blockers(id, task_id, kind, body, status, created_at, resolved_at) VALUES (?, ?, 'infrastructure', ?, 'open', ?, NULL)",
-        (blocker_id, task["id"], detail[:MAX_SUMMARY_BYTES], _now()),
-    )
-    database._insert_event(task["id"], "infrastructure_blocked", {"blocker_id": blocker_id, "kind": "infrastructure"})
+    outcome = result.get("outcome")
+    if role == "REVIEWER" and outcome == "correction_required":
+        attempt = database.connection.execute("SELECT id FROM planning_attempts WHERE working_round_id = ? ORDER BY ordinal DESC LIMIT 1", (working["id"],)).fetchone()
+        if attempt:
+            database.connection.execute("UPDATE planning_attempts SET state = 'CORRECTION_REQUIRED', ended_at = ? WHERE id = ? AND state = 'OPEN'", (_now(), attempt[0]))
+        database._insert_event(str(task["id"]), "planning_correction_required", {"working_round_id": working["id"]})
+    elif role == "REVIEWER" and outcome in {"plan_accepted", "accepted"}:
+        attempt = database.connection.execute("SELECT id FROM planning_attempts WHERE working_round_id = ? ORDER BY ordinal DESC LIMIT 1", (working["id"],)).fetchone()
+        if attempt:
+            database.connection.execute("UPDATE planning_attempts SET state = 'ACCEPTED', ended_at = ? WHERE id = ?", (_now(), attempt[0]))
+        database.connection.execute("UPDATE working_rounds SET state = 'IMPLEMENTING' WHERE id = ?", (working["id"],))
+        database._insert_event(str(task["id"]), "planning_accepted", {"working_round_id": working["id"], "head_sha": actual_head})
+    elif role == "ADVERSARY" and outcome in {"adversary_pass", "adversary_passed"}:
+        database.connection.execute("UPDATE working_rounds SET state = 'ADVERSARIAL' WHERE id = ?", (working["id"],))
+    elif role == "PROJECT-MANAGER" and outcome == "converged":
+        database.connection.execute("UPDATE working_rounds SET state = 'CONVERGED', ended_at = ? WHERE id = ?", (_now(), working["id"]))
+        database.connection.execute("UPDATE lifecycles SET mechanical_acceptance = 'ACCEPTED', mechanical_acceptance_head = ?, mechanical_acceptance_at = ? WHERE id = ? AND state = 'RUNNING'", (actual_head, _now(), lifecycle["id"]))
+        database._insert_event(str(task["id"]), "working_round_converged", {"working_round_id": working["id"], "head_sha": actual_head})
+        database._insert_event(str(task["id"]), "lifecycle_converged", {"lifecycle_id": lifecycle["id"], "head_sha": actual_head})
+    elif role == "ARCHIVIST" and outcome in {"archive_complete", "archived"}:
+        non_converged = database.connection.execute("SELECT 1 FROM working_rounds WHERE lifecycle_id = ? AND state = 'NON_CONVERGED' AND ordinal = 8", (lifecycle["id"],)).fetchone()
+        terminal_state = "NON_CONVERGED" if non_converged else "ACCEPTED"
+        terminal_outcome = "NON_CONVERGED" if non_converged else "SUCCESSFUL"
+        database.connection.execute("UPDATE lifecycles SET state = ?, terminal_outcome = ?, ended_at = ? WHERE id = ? AND state = 'RUNNING'", (terminal_state, terminal_outcome, _now(), lifecycle["id"]))
+        database.connection.execute("UPDATE tasks SET state = 'TERMINATED', current_head = ?, updated_at = ? WHERE id = ?", (actual_head, _now(), task["id"]))
+        database._insert_event(str(task["id"]), "lifecycle_terminated", {"lifecycle_id": lifecycle["id"], "terminal_outcome": terminal_outcome, "head_sha": actual_head})
+    elif role == "PROJECT-MANAGER" and outcome in {"no_convergence", "non_converged"}:
+        database.connection.execute("UPDATE working_rounds SET state = 'NON_CONVERGED', ended_at = ? WHERE id = ?", (_now(), working["id"]))
+        database._insert_event(str(task["id"]), "lifecycle_non_converged", {"lifecycle_id": lifecycle["id"], "working_round_id": working["id"]})
 
 
 def reconcile(profile: Profile, workspace: pathlib.Path) -> dict[str, object]:
-    workspace = physical_directory(workspace)
-    physical_directory(workspace / ".git")
+    """Bind retained Runtime evidence, then apply one accepted Pilot transition."""
     facts, _ = local_task_facts(profile, workspace)
-    marker = _read_host_json(workspace / ".git" / "symphony-preparation.json", "preparation marker")
-    if not isinstance(marker, dict) or marker.get("role_run_id") is None or marker.get("dispatch_role") is None:
-        raise LifecycleError("preparation marker has no role dispatch identity")
-    receipt = _dispatch_receipt(profile, marker)
-    namespace = lifecycle_root(profile, facts.identifier, str(marker["role_run_id"]))
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
         task = database.read_task(facts.task_uuid)
-        if receipt["status"] != "finished":
-            with database._transaction():
-                _record_failed_execution(
-                    database, task, marker, receipt,
-                    "Codex execution did not reach a successful terminal result",
-                    _observed_head(workspace, task),
-                )
-            _release_dispatch_claim(workspace)
-            return task
-        with database._transaction():
-            run = _materialize_started_run(database, task, marker, receipt)
-        try:
-            result = read_result(namespace / "outbox" / "result.json")
-            # Bind and validate the packet before any Implementer delta can
-            # become a host-authored commit.
-            _validate_reconciliation_binding(database, task, result, run)
-            if marker.get("dispatch_role") == "IMPLEMENTER" and result["outcome"] != "blocked":
-                _commit_implementer_delta(workspace, marker)
-            actual_head = verify_git_truth(profile, workspace, task)
-            if result["role"] == "ARCHITECT" and result["outcome"] == "planning_complete":
-                _resolve_authorized_write_roots(workspace, result["authorized_write_paths"])
-            with database._transaction():
-                reconciled = _reconcile(database, task, result, run, receipt, actual_head, profile)
-                _release_dispatch_claim(workspace)
-                return reconciled
-        except Exception:
-            with database._transaction():
-                current = database.read_role_run(str(marker["role_run_id"]))
-                if current["status"] == "started":
-                    _finish_run(
-                        database, current, receipt, "failed", "invalid lifecycle packet",
-                        _observed_head(workspace, task),
-                    )
-                blocker_id = str(uuid.uuid4())
-                database.connection.execute("INSERT INTO blockers(id, task_id, kind, body, status, created_at, resolved_at) VALUES (?, ?, 'infrastructure', ?, 'open', ?, NULL)", (blocker_id, task["id"], "role packet rejected", _now()))
-                database._insert_event(task["id"], "infrastructure_blocked", {"blocker_id": blocker_id, "kind": "infrastructure"})
-            _release_dispatch_claim(workspace)
-            raise
+        row = database.connection.execute("SELECT * FROM role_dispatches WHERE task_id = ? AND status = 'AUTHORIZED' ORDER BY created_at DESC, id DESC LIMIT 1", (task["id"],)).fetchone()
+        if row is None:
+            raise LifecycleError("no authorized Pilot dispatch is awaiting evidence")
+        dispatch = dict(row)
+        namespace = lifecycle_root(profile, str(task["identifier"]), str(dispatch["id"]))
+        execution = _read_execution(namespace / "host" / "execution.json")
+        result = read_result(namespace / "outbox" / "result.json")
+        if execution.get("task_id") != task["id"] or execution.get("dispatch_id") != dispatch["id"] or execution.get("observed_role") != dispatch["role"]:
+            raise LifecycleError("Runtime evidence is not bound to the Pilot dispatch")
+        if execution["starting_head"] != dispatch["expected_starting_head"]:
+            raise LifecycleError("Runtime execution started from a different HEAD than the Pilot grant")
+        if result.get("task_id") != task["id"] or result.get("dispatch_id") != dispatch["id"] or result.get("role") != dispatch["role"]:
+            raise LifecycleError("role-authored result is not bound to the Pilot dispatch")
+        evidence = dict(execution)
+        evidence["result"] = result
+        if evidence.get("status") == "cancelled":
+            evidence["status"] = "failed"
+        run = database.record_execution_evidence(str(dispatch["id"]), evidence)
+        lifecycle, working, _ = _current_context(database, str(task["id"]))
+        actual_head = str(execution.get("head_sha") or task["current_head"] or task["base_sha"])
+        changed_paths = execution["changed_paths"]
+        host_changed_paths = _working_tree_paths(workspace)
+        if changed_paths != host_changed_paths:
+            raise LifecycleError("Runtime changed-path evidence differs from host observation")
+        if dispatch["role"] in WRITER_ROLES:
+            grant = database.connection.execute("SELECT write_scopes_json FROM capability_grants WHERE id = ?", (run["capability_grant_id"],)).fetchone()
+            scopes = json.loads(grant[0]) if grant else []
+            if execution.get("commit_sha"):
+                raise LifecycleError("Runtime must not create a role commit")
+            if execution["status"] != "finished":
+                database.record_writer_delta(str(run["id"]), changed_paths=changed_paths, workspace_head=_git(workspace, "rev-parse", "HEAD"), authorization_status="REJECTED", dirty=bool(host_changed_paths))
+                if result.get("outcome") == "blocked":
+                    kind = result.get("blocker_kind", "project")
+                    if kind not in {"human", "project", "infrastructure"}:
+                        raise LifecycleError("blocked result has an invalid blocker kind")
+                    database.record_blocker(task_id=str(task["id"]), kind=str(kind), body=str(result.get("summary") or "role reported a blocker"))
+                return database.read_projection(str(task["id"]))
+            try:
+                brokered = broker_writer_delta(workspace, dispatch["role"], changed_paths, scopes, expected_starting_head=str(dispatch["expected_starting_head"]))
+            except LifecycleError as exc:
+                database.record_writer_delta(str(run["id"]), changed_paths=changed_paths, workspace_head=_git(workspace, "rev-parse", "HEAD"), authorization_status="REJECTED", dirty=bool(host_changed_paths))
+                raise exc
+            commit_sha = brokered.get("commit_sha")
+            database.record_writer_delta(str(run["id"]), changed_paths=brokered["changed_paths"], workspace_head=str(brokered["workspace_head"]), authorization_status="ACCEPTED", dirty=False, commit_sha=commit_sha)
+            if commit_sha:
+                database.update_heads(str(task["id"]), current_head=str(commit_sha))
+            actual_head = str(brokered["workspace_head"])
+        elif host_changed_paths:
+            raise LifecycleError("non-writing role produced a workspace delta")
+        if execution["status"] != "finished":
+            if result.get("outcome") == "blocked":
+                kind = result.get("blocker_kind", "project")
+                if kind not in {"human", "project", "infrastructure"}:
+                    raise LifecycleError("blocked result has an invalid blocker kind")
+                database.record_blocker(task_id=str(task["id"]), kind=str(kind), body=str(result.get("summary") or "role reported a blocker"))
+            return database.read_projection(str(task["id"]))
+        if result.get("outcome") == "blocked":
+            kind = result.get("blocker_kind", "project")
+            if kind not in {"human", "project", "infrastructure"}:
+                raise LifecycleError("blocked result has an invalid blocker kind")
+            database.record_blocker(task_id=str(task["id"]), kind=str(kind), body=str(result.get("summary") or "role reported a blocker"))
+        if dispatch["role"] == "PROJECT-MANAGER" and result.get("outcome") == "converged":
+            observed_head = verify_git_truth(profile, workspace, task)
+            if observed_head != actual_head or _working_tree_paths(workspace):
+                raise LifecycleError("convergence requires clean mechanically validated workspace evidence")
+        if lifecycle and working:
+            _record_lifecycle_outcome(database, task, lifecycle, working, str(dispatch["role"]), result, actual_head)
+        database.record_event(str(task["id"]), "execution_reconciled", {"role_run_id": run["id"], "dispatch_id": dispatch["id"]}, role_run_id=str(run["id"]))
+        return database.read_projection(str(task["id"]))
 
 
-def fail_attempt_for_workspace(profile: Profile, workspace: pathlib.Path, detail: str) -> None:
-    workspace = physical_directory(workspace)
-    marker_path = workspace / ".git" / "symphony-preparation.json"
-    try:
-        marker = _read_host_json(marker_path, "preparation marker")
-    except LifecycleError:
-        facts, _ = local_task_facts(profile, workspace)
-        _record_infrastructure_blocker(profile, facts.task_uuid, detail)
-        _release_dispatch_claim(workspace)
-        return
-    if not isinstance(marker, dict) or not marker.get("role_run_id"):
-        facts, _ = local_task_facts(profile, workspace)
-        _record_infrastructure_blocker(profile, facts.task_uuid, detail)
-        _release_dispatch_claim(workspace)
-        return
-    task_id = marker.get("task_uuid")
-    if not isinstance(task_id, str) or not UUID_RE.fullmatch(task_id):
-        facts, _ = local_task_facts(profile, workspace)
-        task_id = facts.task_uuid
-    try:
-        receipt = _dispatch_receipt(profile, marker)
-    except LifecycleError:
-        receipt = None
+def reconcile_orphaned_executions(profile: Profile, *, managed_runtime_stopped: bool) -> list[dict[str, object]]:
+    """Reject incomplete dispatches only after managed Runtime stop proof."""
+    if not managed_runtime_stopped:
+        raise LifecycleError("orphan reconciliation requires managed Runtime stop evidence")
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
-        task = database.read_task(task_id)
-        with database._transaction():
-            if receipt is not None and isinstance(receipt.get("started_at"), str):
-                _record_failed_execution(
-                    database, task, marker, receipt, detail,
-                    _observed_head(workspace, task),
-                )
-            else:
-                blocker_id = str(uuid.uuid4())
-                database.connection.execute("INSERT INTO blockers(id, task_id, kind, body, status, created_at, resolved_at) VALUES (?, ?, 'infrastructure', ?, 'open', ?, NULL)", (blocker_id, task["id"], detail[:MAX_SUMMARY_BYTES], _now()))
-                database._insert_event(task["id"], "infrastructure_blocked", {"blocker_id": blocker_id, "kind": "infrastructure"})
-    _release_dispatch_claim(workspace)
-
-
-def reconcile_orphaned_architect_attempts(profile: Profile, *, managed_runtime_stopped: bool) -> list[dict[str, object]]:
-    if managed_runtime_stopped is not True:
-        raise LifecycleError("orphan reconciliation requires a stopped managed Runtime")
-    repaired = []
-    with ControlPlaneDatabase.open(control_database_path(profile)) as database:
-        rows = database.connection.execute("SELECT role_runs.*, tasks.current_head, tasks.base_sha FROM role_runs JOIN tasks ON tasks.id = role_runs.task_id WHERE tasks.project_slug = ? AND role_runs.status = 'started' ORDER BY role_runs.started_at, role_runs.id", (profile.slug,)).fetchall()
+        rows = database.connection.execute("SELECT * FROM role_dispatches WHERE status = 'AUTHORIZED' AND task_id IN (SELECT id FROM tasks WHERE project_slug = ?)", (profile.slug,)).fetchall()
+        result = []
         with database._transaction():
             for row in rows:
-                run = dict(row)
-                _finish_run(database, run, {"finished_at": _now()}, "failed", "Managed Runtime stopped before role attempt reconciled.", str(run["current_head"] or run["base_sha"]))
-                repaired.append({"task_id": str(run["task_id"]), "role_run_id": str(run["id"]), "role": run["role"], "round": int(run["round"])})
-    return repaired
+                database.connection.execute("UPDATE role_dispatches SET status = 'REJECTED', consumed_at = ? WHERE id = ?", (_now(), row["id"]))
+                result.append({"dispatch_id": row["id"], "task_id": row["task_id"], "role": row["role"], "status": "rejected"})
+        return result

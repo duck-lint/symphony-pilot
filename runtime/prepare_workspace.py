@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare one disposable local-task workspace before an architect attempt.
+"""Prepare the task workspace before one Pilot-authorized dispatch.
 
 This module owns execution state only. Project semantics remain in the target
 repository and are never inferred here.
@@ -46,22 +46,16 @@ class Profile:
     state_root: pathlib.PurePath
     log_root: pathlib.PurePath
     secret_reference: str
-    trusted_dispatchers: tuple[str, ...]
-    dispatch_labels: tuple[str, ...]
-    blocked_label: str
     service_identity: str
     dashboard_port: int | None
     max_concurrent_agents: int
-    max_turns: int
     poll_interval_ms: int
     max_retry_backoff_ms: int
     codex_model: str
     codex_reasoning_effort: str
     toolchain: str | None
     prevent_host_sleep: bool = False
-    notifications_enabled: bool = False
     display_name: str = ""
-    notification_backend: str = "windows-toast"
     source_profile_path: pathlib.Path | None = None
     storage_policy: StoragePolicy = dataclasses.field(default_factory=StoragePolicy)
 
@@ -172,19 +166,17 @@ def load_profile(path: pathlib.Path) -> Profile:
 
     with path.open("rb") as stream:
         raw = tomllib.load(stream)
-    allowed = {"slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels",
-               "blocked_label", "max_concurrent_agents", "max_turns", "poll_interval_ms",
+    allowed = {"slug", "repository", "git_remote", "secret_reference", "max_concurrent_agents", "poll_interval_ms",
                "max_retry_backoff_ms", "codex_model", "codex_reasoning_effort", "toolchain",
-               "prevent_host_sleep", "notifications_enabled", "display_name",
-               "notification_backend", "dashboard_port", "storage_pool_bytes",
+               "prevent_host_sleep", "display_name", "dashboard_port", "storage_pool_bytes",
                "storage_allocatable_pool_bytes",
                "task_storage_bytes", "task_storage_inodes", "storage_emergency_reserve_bytes",
                "storage_emergency_reserve_inodes"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise PreparationError("profile", "unsupported profile fields: " + ",".join(unknown))
-    required = ["slug", "repository", "git_remote", "secret_reference", "trusted_dispatchers", "dispatch_labels", "blocked_label",
-                "max_concurrent_agents", "max_turns", "dashboard_port",
+    required = ["slug", "repository", "git_remote", "secret_reference",
+                "max_concurrent_agents", "dashboard_port",
                 "poll_interval_ms", "max_retry_backoff_ms", "codex_model",
                 "codex_reasoning_effort", "storage_pool_bytes", "storage_allocatable_pool_bytes",
                 "task_storage_bytes",
@@ -196,8 +188,8 @@ def load_profile(path: pathlib.Path) -> Profile:
     slug = str(raw["slug"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", slug):
         raise PreparationError("profile", "profile slug is not a safe identifier")
-    for key in ("repository", "git_remote", "secret_reference", "blocked_label",
-                "display_name", "notification_backend"):
+    for key in ("repository", "git_remote", "secret_reference",
+                "display_name"):
         if any(character in str(raw.get(key, "")) for character in ("\n", "\r", "\0")):
             raise PreparationError("profile", f"profile field {key} contains control characters")
     if re.search(r"://[^/\s]+@|(?:token|password|secret|private[_-]?key)\s*[:=]", str(raw["git_remote"]), re.I):
@@ -210,17 +202,6 @@ def load_profile(path: pathlib.Path) -> Profile:
         raise PreparationError("profile", "profiles may contain only secret_reference, not credential values")
     if int(raw["max_concurrent_agents"]) != 1:
         raise PreparationError("profile", "the pilot permits exactly one concurrent agent")
-    if not raw["dispatch_labels"]:
-        raise PreparationError("profile", "at least one dispatch label is required")
-    if not isinstance(raw["trusted_dispatchers"], list):
-        raise PreparationError("profile", "trusted_dispatchers must be a list")
-    if not isinstance(raw["dispatch_labels"], list):
-        raise PreparationError("profile", "dispatch_labels must be a list")
-    dispatchers = tuple(str(actor) for actor in raw["trusted_dispatchers"])
-    if not dispatchers or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", actor) for actor in dispatchers):
-        raise PreparationError("profile", "trusted_dispatchers must contain valid non-empty GitHub logins")
-    if len(set(dispatchers)) != len(dispatchers):
-        raise PreparationError("profile", "trusted_dispatchers must not contain duplicates")
     dashboard_port = int(raw["dashboard_port"])
     if not DASHBOARD_PORT_MIN <= dashboard_port <= DASHBOARD_PORT_MAX:
         raise PreparationError(
@@ -229,8 +210,6 @@ def load_profile(path: pathlib.Path) -> Profile:
         )
     if not isinstance(raw.get("prevent_host_sleep", False), bool):
         raise PreparationError("profile", "prevent_host_sleep must be boolean")
-    if not isinstance(raw.get("notifications_enabled", False), bool):
-        raise PreparationError("profile", "notifications_enabled must be boolean")
     try:
         storage_policy = StoragePolicy(
             pool_bytes=raw["storage_pool_bytes"],
@@ -250,22 +229,16 @@ def load_profile(path: pathlib.Path) -> Profile:
         state_root=pathlib.PurePosixPath(),
         log_root=pathlib.PurePosixPath(),
         secret_reference=str(raw["secret_reference"]),
-        trusted_dispatchers=dispatchers,
-        dispatch_labels=tuple(str(label) for label in raw["dispatch_labels"]),
-        blocked_label=str(raw["blocked_label"]),
         service_identity=f"symphony-pilot-{slug}",
         dashboard_port=dashboard_port,
         max_concurrent_agents=int(raw["max_concurrent_agents"]),
-        max_turns=int(raw["max_turns"]),
         poll_interval_ms=int(raw["poll_interval_ms"]),
         max_retry_backoff_ms=int(raw["max_retry_backoff_ms"]),
         codex_model=str(raw["codex_model"]),
         codex_reasoning_effort=str(raw["codex_reasoning_effort"]),
         toolchain=str(raw["toolchain"]) if raw.get("toolchain") else None,
         prevent_host_sleep=bool(raw.get("prevent_host_sleep", False)),
-        notifications_enabled=bool(raw.get("notifications_enabled", False)),
         display_name=str(raw.get("display_name", slug)),
-        notification_backend=str(raw.get("notification_backend", "windows-toast")),
         source_profile_path=path.resolve(),
         storage_policy=storage_policy,
     )
@@ -452,9 +425,9 @@ def marker(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts, too
 
 def record_blocker(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts,
                    kind: str, detail: str) -> None:
-    # Blockers are now rows in the same host authority the Runtime adapter
-    # reads. A repeated preparation failure is intentionally not deduplicated
-    # here; Step 6 owns richer lifecycle reconciliation.
+    # Blockers are rows in the same host authority the Runtime adapter reads.
+    # Preparation records an observation; lifecycle classification remains in
+    # the Pilot reconciliation path.
     from control_db import ControlPlaneDatabase
 
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
@@ -554,8 +527,8 @@ def _prepare(profile: Profile, workspace: pathlib.Path, facts: LocalTaskFacts) -
                     )
             else:
                 if facts.published_head is not None or step7_publication_applies(profile, facts.task_uuid):
-                    # Step 7 owns any published-active continuation contract.
-                    # Step 6 has no fallback or implicit interpretation for it.
+                    # Publication is a separate host contract. Preparation has
+                    # no fallback or implicit interpretation for it.
                     raise PreparationError(
                         "publication_state",
                         "published task state requires the Step-7 preparation contract",

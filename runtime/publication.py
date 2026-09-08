@@ -337,9 +337,9 @@ def _publish_task_locked(profile: Profile, task_id: str, *, database_path: pathl
                 publication = database.read_publication(task["id"])
                 if publication and publication["publication_status"] == "published":
                     return {"task": task, "publication": publication, "idempotent": True}
-            if (task["state"] != "FINAL_MECHANICAL_ACCEPTANCE" or not task["current_head"] or
-                    database.connection.execute("SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)).fetchone() or
-                    database.connection.execute("SELECT 1 FROM role_runs WHERE task_id = ? AND role = 'ARCHITECT' AND status = 'started' LIMIT 1", (task["id"],)).fetchone()):
+            lifecycle = database.connection.execute("SELECT state FROM lifecycles WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1", (task["id"],)).fetchone()
+            if (not lifecycle or lifecycle["state"] != "ACCEPTED" or not task["current_head"] or
+                    database.connection.execute("SELECT 1 FROM blockers WHERE task_id = ? AND status = 'open' LIMIT 1", (task["id"],)).fetchone()):
                 raise StateConflict("task is not eligible for publication")
             # From this point the exact task identity and publication
             # eligibility are known. Any handled failure must leave a durable

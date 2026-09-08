@@ -24,7 +24,6 @@ from execution_receipts import (
     WorkspaceMissing,
     capture_live_receipt,
     missing_receipt,
-    persisted_receipt,
     redact,
 )
 from prepare_workspace import deployment_path, project_namespaces
@@ -63,6 +62,26 @@ def _read_json_file(path: pathlib.Path) -> object | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
+
+
+def _persisted_execution_receipt(projection: dict[str, object]) -> dict[str, object] | None:
+    """Project retained Runtime evidence without treating a role packet as proof."""
+    for row in reversed(projection.get("execution_evidence", [])):  # type: ignore[union-attr]
+        if not isinstance(row, dict):
+            continue
+        try:
+            value = json.loads(str(row["receipt_json"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            value = dict(value)
+            value["source"] = "persisted"
+            workspace = dict(value.get("workspace") or {})
+            workspace["exists"] = False
+            workspace["clean"] = None
+            value["workspace"] = workspace
+            return redact(value)  # type: ignore[return-value]
+    return None
 
 
 @dataclass
@@ -120,14 +139,14 @@ class HostControlApplication:
         try:
             return redact(capture_live_receipt(profile, task))  # type: ignore[arg-type,return-value]
         except WorkspaceMissing:
-            saved = persisted_receipt(projection["events"])  # type: ignore[arg-type]
+            saved = _persisted_execution_receipt(projection)
             if saved is not None:
                 return saved
             return redact(missing_receipt(profile, task))  # type: ignore[arg-type,return-value]
         except ReceiptBoundaryError as exc:
             raise ApiError(409, "workspace_boundary", str(exc)) from exc
         except ReceiptError as exc:
-            saved = persisted_receipt(projection["events"])  # type: ignore[arg-type]
+            saved = _persisted_execution_receipt(projection)
             if saved is not None:
                 return saved
             raise ApiError(409, "workspace_untrusted", str(exc)) from exc
