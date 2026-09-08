@@ -27,8 +27,8 @@ corresponding packet.
 
 The existing loopback surface is read-only and operator-supervised. Browser
 input does not select repositories, roots, database paths, refs, processes,
-credentials, commands, files, Git operations, or network destinations. Queue
-and lifecycle mutation remain trusted host operations. The current supervised
+credentials, commands, files, Git operations, or network destinations. 
+Queue and lifecycle mutation remain Pilot-controlled host operations. The current supervised
 substrate is evidence of operation, not proof that the frozen fresh-specialist
 lifecycle is live.
 
