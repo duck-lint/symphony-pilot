@@ -435,6 +435,8 @@ def _next_role(database: ControlPlaneDatabase, task: dict[str, object]) -> tuple
         return None, lifecycle, working, attempt
     if working is None:
         pm = database.connection.execute("SELECT * FROM role_runs WHERE task_id = ? AND role = 'PROJECT-MANAGER' ORDER BY started_at DESC, id DESC LIMIT 1", (task["id"],)).fetchone()
+        if pm is None:
+            return "PROJECT-MANAGER", lifecycle, None, None
         _licensed_run(database, dict(pm) if pm else None)
         return "PLANNER", lifecycle, None, None
     if working["state"] == "PLANNING":
@@ -565,7 +567,7 @@ def issue_next_dispatch(profile: Profile, task_id: str | None = None) -> dict[st
             raise AllocationConflict("task has no eligible dispatch")
         if lifecycle is None:
             lifecycle = database.create_lifecycle(str(task["id"]))
-        elif working is None:
+        elif working is None and role != "PROJECT-MANAGER":
             prior = database.connection.execute("SELECT * FROM working_rounds WHERE lifecycle_id = ? ORDER BY ordinal DESC LIMIT 1", (lifecycle["id"],)).fetchone()
             if prior is not None and prior["state"] == "PLANNING":
                 database.terminate_working_round_non_converged(str(prior["id"]))
@@ -885,7 +887,7 @@ def _reconcile_once(profile: Profile, workspace: pathlib.Path, *, task_id: str |
 
 
 def reconcile_orphaned_executions(profile: Profile, *, managed_runtime_stopped: bool) -> list[dict[str, object]]:
-    """Reject incomplete dispatches only after managed Runtime stop proof."""
+    """Reconcile only executions that actually started after managed stop proof."""
     if not managed_runtime_stopped:
         raise LifecycleError("orphan reconciliation requires managed Runtime stop evidence")
     with ControlPlaneDatabase.open(control_database_path(profile)) as database:
@@ -896,7 +898,5 @@ def reconcile_orphaned_executions(profile: Profile, *, managed_runtime_stopped: 
                 run = database.record_orphaned_execution(str(row["id"]))
                 result.append({"dispatch_id": row["id"], "task_id": row["task_id"], "role": row["role"], "role_run_id": run["id"], "status": "failed"})
                 continue
-            with database._transaction():
-                database.connection.execute("UPDATE role_dispatches SET status = 'REJECTED', consumed_at = ? WHERE id = ?", (_now(), row["id"]))
-                result.append({"dispatch_id": row["id"], "task_id": row["task_id"], "role": row["role"], "status": "rejected"})
+            result.append({"dispatch_id": row["id"], "task_id": row["task_id"], "role": row["role"], "status": "preserved"})
         return result

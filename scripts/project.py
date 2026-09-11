@@ -199,10 +199,16 @@ def _reconcile_after_managed_stop(profile, identity):
         raise PreparationError("managed Runtime identity is still alive")
     repaired = reconcile_orphaned_executions(profile, managed_runtime_stopped=True)
     for attempt in repaired:
-        print(
-            f"Rejected orphaned execution dispatch {attempt['dispatch_id']} "
-            f"for {attempt['role']}."
-        )
+        if attempt["status"] == "failed":
+            print(
+                f"Rejected orphaned execution dispatch {attempt['dispatch_id']} "
+                f"for {attempt['role']}."
+            )
+        elif attempt["status"] == "preserved":
+            print(
+                f"Preserved authorized dispatch {attempt['dispatch_id']} "
+                f"for {attempt['role']}."
+            )
 
 
 def _stop_process(profile, identity):

@@ -186,6 +186,41 @@ def queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def resume(args: argparse.Namespace) -> int:
+    """Resume one active running lifecycle through Pilot role derivation."""
+    profile = _profile(args.project)
+    selector_kind, selector = _task_selector(args.task)
+    with ControlPlaneDatabase.open(default_database_path()) as database:
+        task = _read_project_task(database, profile, selector_kind, selector)
+        if task["state"] != "ACTIVE":
+            raise StateConflict("resume requires an ACTIVE task")
+        lifecycles = database.connection.execute(
+            "SELECT * FROM lifecycles WHERE task_id = ? AND state = 'RUNNING' ORDER BY ordinal DESC, id DESC",
+            (task["id"],),
+        ).fetchall()
+        if len(lifecycles) != 1:
+            raise StateConflict("resume requires exactly one running lifecycle")
+        pending = database.connection.execute(
+            "SELECT 1 FROM role_dispatches WHERE task_id = ? AND status IN ('AUTHORIZED', 'RUNNING') LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        if pending is not None:
+            raise StateConflict("resume requires no authorized or running dispatch")
+        active = database.connection.execute(
+            "SELECT 1 FROM role_runs WHERE task_id = ? AND status = 'running' LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        if active is not None:
+            raise StateConflict("resume requires no active execution")
+        lifecycle = dict(lifecycles[0])
+        if lifecycle["task_id"] != task["id"]:
+            raise StateConflict("running lifecycle is not owned by the selected task")
+    from lifecycle import issue_next_dispatch
+    dispatch = issue_next_dispatch(profile, str(task["id"]))
+    _emit(dispatch)
+    return 0
+
+
 def show(args: argparse.Namespace) -> int:
     profile = _profile(args.project)
     selector_kind, selector = _task_selector(args.task)
@@ -320,6 +355,13 @@ def main(argv: list[str] | None = None) -> int:
     queue_parser.add_argument("--project", required=True)
     queue_parser.add_argument("--task", required=True)
     queue_parser.set_defaults(handler=queue)
+
+    resume_parser = subparsers.add_parser(
+        "resume", help="issue the lifecycle-derived next dispatch for an active task"
+    )
+    resume_parser.add_argument("--project", required=True)
+    resume_parser.add_argument("--task", required=True)
+    resume_parser.set_defaults(handler=resume)
 
     blockers_parser = subparsers.add_parser("blockers", help="inspect open blockers for one task")
     blockers_parser.add_argument("--project", required=True)

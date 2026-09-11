@@ -8,6 +8,7 @@ import unittest
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "runtime"))
+sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "scripts"))
 
 from control_db import ControlPlaneDatabase, StateConflict
 from lifecycle import (AllocationConflict, LifecycleError, _handoff_inputs, _licensed_run,
@@ -16,6 +17,7 @@ from lifecycle import (AllocationConflict, LifecycleError, _handoff_inputs, _lic
                        issue_next_dispatch, perform_mechanical_validation,
                        reconcile_orphaned_executions)
 from prepare_workspace import load_profile
+import task as task_commands
 from unittest.mock import patch
 
 
@@ -346,7 +348,7 @@ class HarnessCutoverTests(unittest.TestCase):
         with self.assertRaises(AllocationConflict):
             _licensed_run(self.database, orphan)
 
-    def test_authorized_dispatch_orphan_reconciliation_does_not_invent_run(self):
+    def test_authorized_dispatch_survives_managed_stop_without_reissue(self):
         grant = self.dispatch("REVIEWER")
         database_path = self.database.path
         self.database.close()
@@ -355,9 +357,67 @@ class HarnessCutoverTests(unittest.TestCase):
                 type("Profile", (), {"slug": "demo"})(), managed_runtime_stopped=True,
             )
         self.database = ControlPlaneDatabase.open(database_path)
-        self.assertEqual(repaired[0]["status"], "rejected")
+        self.assertEqual(repaired[0]["status"], "preserved")
+        dispatch = self.database.connection.execute(
+            "SELECT status, consumed_at FROM role_dispatches WHERE id = ?",
+            (grant["dispatch"]["id"],),
+        ).fetchone()
+        self.assertEqual(dispatch["status"], "AUTHORIZED")
+        self.assertIsNone(dispatch["consumed_at"])
         self.assertEqual(
             self.database.connection.execute("SELECT COUNT(*) FROM role_runs").fetchone()[0], 0
+        )
+        self.assertEqual(
+            self.database.connection.execute("SELECT COUNT(*) FROM role_dispatches").fetchone()[0], 1
+        )
+
+    def test_resume_issues_the_lifecycle_derived_initial_pm_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = pathlib.Path(directory) / "control.sqlite3"
+            database = ControlPlaneDatabase.open(database_path)
+            task = database.create_task(
+                project_slug="demo", title="Recoverable task", objective="Objective",
+                base_ref="main", base_sha=SHA, current_head=SHA, created_at=TIME,
+            )
+            database.queue_task(task["id"], project_slug="demo")
+            lifecycle = database.create_lifecycle(task["id"], started_at=TIME)
+            database.close()
+            profile = type("Profile", (), {
+                "slug": "demo", "state_root": pathlib.Path(directory) / "state",
+                "harness_artifacts": type("Artifacts", (), {
+                    "planner": ("harness/project-spec",),
+                    "archivist": ("harness/implementations",),
+                    "implementation_roots": ("src",),
+                })(),
+            })()
+            args = type("Args", (), {"project": "demo", "task": task["identifier"]})()
+            with patch("task.default_database_path", return_value=database_path), \
+                    patch("task._profile", return_value=profile), \
+                    patch("lifecycle.control_database_path", return_value=database_path), \
+                    patch("task._emit"):
+                self.assertEqual(task_commands.resume(args), 0)
+            with ControlPlaneDatabase.open(database_path) as database:
+                dispatch = database.connection.execute(
+                    "SELECT role, lifecycle_id, working_round_id, planning_attempt_id, status "
+                    "FROM role_dispatches WHERE task_id = ?",
+                    (task["id"],),
+                ).fetchone()
+                self.assertEqual(dispatch["role"], "PROJECT-MANAGER")
+                self.assertEqual(dispatch["lifecycle_id"], lifecycle["id"])
+                self.assertIsNone(dispatch["working_round_id"])
+                self.assertIsNone(dispatch["planning_attempt_id"])
+                self.assertEqual(dispatch["status"], "AUTHORIZED")
+
+    def test_resume_refuses_a_task_with_pending_dispatch(self):
+        self.dispatch("REVIEWER")
+        profile = type("Profile", (), {"slug": "demo"})()
+        args = type("Args", (), {"project": "demo", "task": self.task["identifier"]})()
+        with patch("task.default_database_path", return_value=self.database.path), \
+                patch("task._profile", return_value=profile):
+            with self.assertRaises(StateConflict):
+                task_commands.resume(args)
+        self.assertEqual(
+            self.database.connection.execute("SELECT COUNT(*) FROM role_dispatches").fetchone()[0], 1
         )
 
     def test_nul_porcelain_parses_both_rename_copy_paths_for_authorization(self):
